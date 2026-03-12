@@ -115,22 +115,17 @@ jobs:
             patchelf
       - run: cargo check --workspace
 
-  # ── Tests (3 platforms) ────────────────────────────────────────────────────────────
-  test:
-    name: Test / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+  # ── Tests (separate jobs to save Linux minutes) ─────────────────────────────────────
+  test-ubuntu:
+    name: Test / Ubuntu
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-${{ matrix.os }}-${{ hashFiles('**/Cargo.lock') }}
-      - name: Install Tauri system deps (Linux)
-        if: runner.os == 'Linux'
+          key: test-ubuntu-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install Tauri system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -139,5 +134,26 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf
-      # Tests that need a display (Tauri) are skipped in headless CI via cfg
+      - run: cargo test --workspace
+
+  test-macos:
+    name: Test / macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-macos-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo test --workspace
+
+  test-windows:
+    name: Test / Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-windows-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo test --workspace
