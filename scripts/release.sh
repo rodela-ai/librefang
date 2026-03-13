@@ -44,6 +44,10 @@ if [[ "$confirm" =~ ^[Nn] ]]; then
     exit 0
 fi
 
+# Ensure we're on main and up to date
+git checkout main
+git pull --rebase origin main
+
 # Update version in Cargo.toml
 sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
 rm -f Cargo.toml.bak
