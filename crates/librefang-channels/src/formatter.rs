@@ -8,6 +8,7 @@
 use librefang_types::config::OutputFormat;
 
 /// Format a message for a specific channel output format.
+#[inline]
 pub fn format_for_channel(text: &str, format: OutputFormat) -> String {
     match format {
         OutputFormat::Markdown => text.to_string(),
@@ -19,6 +20,7 @@ pub fn format_for_channel(text: &str, format: OutputFormat) -> String {
 
 /// Format a message for WeCom, using a stronger plain-text conversion to avoid
 /// leaking Markdown syntax into enterprise chat replies.
+#[inline]
 pub fn format_for_wecom(text: &str, format: OutputFormat) -> String {
     match format {
         OutputFormat::PlainText => markdown_to_wecom_plain(text),
@@ -217,13 +219,13 @@ fn render_inline_markdown(text: &str) -> String {
 
     // Italic: *text* → <i>text</i> (single star only)
     let mut out = String::with_capacity(result.len());
-    let chars: Vec<char> = result.chars().collect();
-    let mut i = 0;
     let mut in_italic = false;
-    while i < chars.len() {
-        if chars[i] == '*'
-            && (i == 0 || chars[i - 1] != '*')
-            && (i + 1 >= chars.len() || chars[i + 1] != '*')
+    let mut prev_char = '\0';
+    let bytes = result.as_bytes();
+    for (i, ch) in result.char_indices() {
+        if ch == '*'
+            && prev_char != '*'
+            && (i + ch.len_utf8() >= bytes.len() || bytes[i + ch.len_utf8()] != b'*')
         {
             if in_italic {
                 out.push_str("</i>");
@@ -232,9 +234,9 @@ fn render_inline_markdown(text: &str) -> String {
             }
             in_italic = !in_italic;
         } else {
-            out.push(chars[i]);
+            out.push(ch);
         }
-        i += 1;
+        prev_char = ch;
     }
 
     out
@@ -460,15 +462,18 @@ fn strip_inline_markdown(mut text: String) -> String {
     text = text.replace('`', "");
 
     let mut out = String::with_capacity(text.len());
-    let chars: Vec<char> = text.chars().collect();
-    for (i, &ch) in chars.iter().enumerate() {
+    let mut prev_char = '\0';
+    let bytes = text.as_bytes();
+    for (i, ch) in text.char_indices() {
         if ch == '*'
-            && (i == 0 || chars[i - 1] != '*')
-            && (i + 1 >= chars.len() || chars[i + 1] != '*')
+            && prev_char != '*'
+            && (i + ch.len_utf8() >= bytes.len() || bytes[i + ch.len_utf8()] != b'*')
         {
+            prev_char = ch;
             continue;
         }
         out.push(ch);
+        prev_char = ch;
     }
     out
 }
@@ -536,17 +541,20 @@ fn markdown_to_plain(text: &str) -> String {
     result = result.replace("**", "");
 
     // Remove italic markers (single *)
-    // Simple approach: remove isolated *
+    // Simple approach: remove isolated * without collecting into Vec<char>
     let mut out = String::with_capacity(result.len());
-    let chars: Vec<char> = result.chars().collect();
-    for (i, &ch) in chars.iter().enumerate() {
+    let mut prev_char = '\0';
+    let bytes = result.as_bytes();
+    for (i, ch) in result.char_indices() {
         if ch == '*'
-            && (i == 0 || chars[i - 1] != '*')
-            && (i + 1 >= chars.len() || chars[i + 1] != '*')
+            && prev_char != '*'
+            && (i + ch.len_utf8() >= bytes.len() || bytes[i + ch.len_utf8()] != b'*')
         {
+            prev_char = ch;
             continue;
         }
         out.push(ch);
+        prev_char = ch;
     }
     result = out;
 
