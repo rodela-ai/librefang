@@ -585,7 +585,7 @@ fn api_v1_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/integrations/{id}",
-            axum::routing::delete(routes::remove_integration),
+            axum::routing::get(routes::get_integration).delete(routes::remove_integration),
         )
         .route(
             "/integrations/{id}/reconnect",
