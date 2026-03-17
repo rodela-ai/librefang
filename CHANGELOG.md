@@ -16,10 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - SDK publish fixes + Bluesky notification + auto Dev.to article (#562) (@houko)
 - YAML syntax error in Bluesky notification workflow (#563) (@houko)
+- Add missing discovered_model_info field in ProbeResult test (#565) (@houko)
 
 ### Other
 
 - V0.5.5-20260317 (#559) (@houko)
+
 
 ## [0.5.5] - 2026-03-17
 
