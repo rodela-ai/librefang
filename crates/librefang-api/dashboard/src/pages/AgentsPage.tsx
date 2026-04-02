@@ -33,6 +33,10 @@ export function AgentsPage() {
   const [showPrompts, setShowPrompts] = useState(false);
   const [editingMaxTokens, setEditingMaxTokens] = useState(false);
   const [maxTokensInput, setMaxTokensInput] = useState("");
+  const [editingModel, setEditingModel] = useState(false);
+  const [modelInput, setModelInput] = useState("");
+  const [editingProvider, setEditingProvider] = useState(false);
+  const [providerInput, setProviderInput] = useState("");
   const queryClient = useQueryClient();
   const spawnMutation = useMutation({
     mutationFn: spawnAgent,
@@ -40,7 +44,7 @@ export function AgentsPage() {
   });
 
   const patchAgentConfigMutation = useMutation({
-    mutationFn: ({ agentId, config }: { agentId: string; config: { max_tokens?: number } }) =>
+    mutationFn: ({ agentId, config }: { agentId: string; config: { provider?: string, model?: string, max_tokens?: number } }) =>
       patchAgentConfig(agentId, config),
     onSuccess: (_, { agentId }) => {
       queryClient.invalidateQueries({ queryKey: ["agents"] });
@@ -206,8 +210,70 @@ export function AgentsPage() {
                     {t("agents.model")}
                   </h4>
                   <div className="p-4 rounded-xl bg-main/50 border border-border-subtle/50 space-y-2.5 text-xs">
-                    <div className="flex justify-between items-center"><span className="text-text-dim">{t("agents.provider")}</span><span className="font-black text-brand">{detailAgent.model.provider}</span></div>
-                    <div className="flex justify-between items-center"><span className="text-text-dim">{t("agents.model")}</span><span className="font-black">{detailAgent.model.model}</span></div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-text-dim">{t("agents.provider")}</span>
+                      {editingProvider ? (
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="text"
+                            value={providerInput}
+                            onChange={e => setProviderInput(e.target.value)}
+                            onKeyDown={e => {
+                              if (e.key === "Enter" && providerInput.trim()) patchAgentConfigMutation.mutate({ agentId: detailAgent.id, config: { provider: providerInput.trim(), model: detailAgent.model.model } });
+                              if (e.key === "Escape") { setEditingProvider(false); setProviderInput(""); }
+                            }}
+                            className="w-32 px-2 py-0.5 rounded bg-main border border-border-subtle text-xs font-mono focus:outline-none focus:border-brand"
+                            autoFocus
+                          />
+                          <button
+                            onClick={() => { if (providerInput.trim()) patchAgentConfigMutation.mutate({ agentId: detailAgent.id, config: { provider: providerInput.trim(), model: detailAgent.model.model } }); }}
+                            disabled={patchAgentConfigMutation.isPending || !providerInput.trim()}
+                            className="p-0.5 rounded hover:bg-success/10 text-success disabled:opacity-50"
+                          ><Check className="w-3 h-3" /></button>
+                          <button onClick={() => { setEditingProvider(false); setProviderInput(""); }} className="p-0.5 rounded hover:bg-main text-text-dim">
+                            <X className="w-3 h-3" />
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => { setEditingProvider(true); setProviderInput(detailAgent.model.provider || ""); }}
+                          className="font-black hover:text-brand transition-colors cursor-pointer"
+                          title="Click to edit"
+                        >{detailAgent.model.provider || "—"}</button>
+                      )}
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-text-dim">{t("agents.model")}</span>
+                      {editingModel ? (
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="text"
+                            value={modelInput}
+                            onChange={e => setModelInput(e.target.value)}
+                            onKeyDown={e => {
+                              if (e.key === "Enter" && modelInput.trim()) patchAgentConfigMutation.mutate({ agentId: detailAgent.id, config: { model: modelInput.trim() } });
+                              if (e.key === "Escape") { setEditingModel(false); setModelInput(""); }
+                            }}
+                            className="w-40 px-2 py-0.5 rounded bg-main border border-border-subtle text-xs font-mono focus:outline-none focus:border-brand"
+                            autoFocus
+                          />
+                          <button
+                            onClick={() => { if (modelInput.trim()) patchAgentConfigMutation.mutate({ agentId: detailAgent.id, config: { model: modelInput.trim() } }); }}
+                            disabled={patchAgentConfigMutation.isPending || !modelInput.trim()}
+                            className="p-0.5 rounded hover:bg-success/10 text-success disabled:opacity-50"
+                          ><Check className="w-3 h-3" /></button>
+                          <button onClick={() => { setEditingModel(false); setModelInput(""); }} className="p-0.5 rounded hover:bg-main text-text-dim">
+                            <X className="w-3 h-3" />
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => { setEditingModel(true); setModelInput(detailAgent.model.model || ""); }}
+                          className="font-black hover:text-brand transition-colors cursor-pointer"
+                          title="Click to edit"
+                        >{detailAgent.model.model || "—"}</button>
+                      )}
+                    </div>
                     <div className="flex justify-between items-center">
                       <span className="text-text-dim">{t("agents.max_tokens") || "Max Tokens"}</span>
                       {editingMaxTokens ? (
