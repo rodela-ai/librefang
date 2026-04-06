@@ -6385,15 +6385,13 @@ system_prompt = "You are a helpful assistant."
                 continue;
             }
 
-            // Inherit kernel defaults when hand declares "default" provider/model
+            // Inherit kernel defaults when hand declares "default" provider/model.
+            // When provider is "default", api_key_env and base_url MUST also be
+            // overridden — a base template might have set them for a different provider.
             if manifest.model.provider == "default" {
                 manifest.model.provider = cfg.default_model.provider.clone();
-                if manifest.model.api_key_env.is_none() {
-                    manifest.model.api_key_env = Some(cfg.default_model.api_key_env.clone());
-                }
-                if manifest.model.base_url.is_none() {
-                    manifest.model.base_url = cfg.default_model.base_url.clone();
-                }
+                manifest.model.api_key_env = Some(cfg.default_model.api_key_env.clone());
+                manifest.model.base_url = cfg.default_model.base_url.clone();
             }
             if manifest.model.model == "default" {
                 manifest.model.model = cfg.default_model.model.clone();
