@@ -32,7 +32,7 @@ use librefang_runtime::routing::ModelRouter;
 use librefang_runtime::sandbox::{SandboxConfig, WasmSandbox};
 use librefang_runtime::tool_runner::builtin_tool_definitions;
 use librefang_types::agent::*;
-use librefang_types::capability::Capability;
+use librefang_types::capability::{glob_matches, Capability};
 use librefang_types::config::{AuthProfile, KernelConfig};
 use librefang_types::error::LibreFangError;
 use librefang_types::event::*;
@@ -2602,9 +2602,17 @@ impl LibreFangKernel {
                         info!(agent = %name, "Agent disabled in config — starting as Suspended");
                     }
 
-                    // Inherit kernel exec_policy for agents that lack one
+                    // Inherit kernel exec_policy for agents that lack one.
+                    // Promote to Full when shell_exec is declared in capabilities.
                     if restored_entry.manifest.exec_policy.is_none() {
-                        restored_entry.manifest.exec_policy = Some(cfg.exec_policy.clone());
+                        if restored_entry.manifest.capabilities.tools.iter().any(|t| t == "shell_exec" || t == "*") {
+                            restored_entry.manifest.exec_policy = Some(librefang_types::config::ExecPolicy {
+                                mode: librefang_types::config::ExecSecurityMode::Full,
+                                ..cfg.exec_policy.clone()
+                            });
+                        } else {
+                            restored_entry.manifest.exec_policy = Some(cfg.exec_policy.clone());
+                        }
                     }
 
                     // Apply global budget defaults to restored agents
@@ -2823,11 +2831,20 @@ system_prompt = "You are a helpful assistant."
             .create_session(agent_id)
             .map_err(KernelError::LibreFang)?;
 
-        // Inherit kernel exec_policy as fallback if agent manifest doesn't have one
+        // Inherit kernel exec_policy as fallback if agent manifest doesn't have one.
+        // Exception: if the agent declares shell_exec in capabilities.tools, promote
+        // to Full mode so the tool actually works rather than silently being blocked.
         let cfg = self.config.load();
         let mut manifest = manifest;
         if manifest.exec_policy.is_none() {
-            manifest.exec_policy = Some(cfg.exec_policy.clone());
+            if manifest.capabilities.tools.iter().any(|t| t == "shell_exec" || t == "*") {
+                manifest.exec_policy = Some(librefang_types::config::ExecPolicy {
+                    mode: librefang_types::config::ExecSecurityMode::Full,
+                    ..cfg.exec_policy.clone()
+                });
+            } else {
+                manifest.exec_policy = Some(cfg.exec_policy.clone());
+            }
         }
         info!(agent = %name, id = %agent_id, exec_mode = ?manifest.exec_policy.as_ref().map(|p| &p.mode), "Agent exec_policy resolved");
 
@@ -8846,7 +8863,7 @@ system_prompt = "You are a helpful assistant."
             // Agent declares specific tools — only include matching builtins
             all_builtins
                 .into_iter()
-                .filter(|t| declared_tools.iter().any(|d| d == &t.name))
+                .filter(|t| declared_tools.iter().any(|d| glob_matches(d, &t.name)))
                 .collect()
         } else {
             // No specific tools declared — fall back to profile or all builtins
@@ -8882,7 +8899,7 @@ system_prompt = "You are a helpful assistant."
         };
         for skill_tool in skill_tools {
             // If agent declares specific tools, only include matching skill tools
-            if !tools_unrestricted && !declared_tools.iter().any(|d| d == &skill_tool.name) {
+            if !tools_unrestricted && !declared_tools.iter().any(|d| glob_matches(d, &skill_tool.name)) {
                 continue;
             }
             all_tools.push(ToolDefinition {
@@ -8925,7 +8942,7 @@ system_prompt = "You are a helpful assistant."
             };
             for t in mcp_candidates {
                 // If agent declares specific tools, only include matching MCP tools
-                if !tools_unrestricted && !declared_tools.iter().any(|d| d == &t.name) {
+                if !tools_unrestricted && !declared_tools.iter().any(|d| glob_matches(d, &t.name)) {
                     continue;
                 }
                 all_tools.push(t);
