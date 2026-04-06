@@ -1676,4 +1676,117 @@ metrics = []
         assert!(worker.base.is_none());
         assert_eq!(worker.manifest.name, "worker-agent");
     }
+
+    #[test]
+    fn deep_merge_preserves_base_fields_and_overrides_hand_fields() {
+        use toml::Value;
+
+        let mut base = toml::from_str::<Value>(
+            r#"
+            name = "base-agent"
+            description = "Base description"
+            [model]
+            provider = "anthropic"
+            model = "claude"
+            max_tokens = 4096
+            system_prompt = "Base prompt"
+            api_key_env = "BASE_KEY"
+            [capabilities]
+            network = ["api.example.com"]
+            shell = ["cargo *"]
+            tools = ["file_read"]
+            "#,
+        )
+        .unwrap();
+
+        let overlay = toml::from_str::<Value>(
+            r#"
+            name = "hand-agent"
+            [model]
+            max_tokens = 8192
+            system_prompt = "Hand prompt"
+            [capabilities]
+            shell = ["npm *", "git *"]
+            "#,
+        )
+        .unwrap();
+
+        super::deep_merge_toml(&mut base, &overlay);
+
+        let table = base.as_table().unwrap();
+        // Hand overrides
+        assert_eq!(table["name"].as_str().unwrap(), "hand-agent");
+        let model = table["model"].as_table().unwrap();
+        assert_eq!(model["max_tokens"].as_integer().unwrap(), 8192);
+        assert_eq!(model["system_prompt"].as_str().unwrap(), "Hand prompt");
+        // Base preserved (not in hand overlay)
+        assert_eq!(table["description"].as_str().unwrap(), "Base description");
+        assert_eq!(model["provider"].as_str().unwrap(), "anthropic");
+        assert_eq!(model["model"].as_str().unwrap(), "claude");
+        assert_eq!(model["api_key_env"].as_str().unwrap(), "BASE_KEY");
+        // Capabilities: shell replaced by hand, network preserved from base
+        let caps = table["capabilities"].as_table().unwrap();
+        let shell: Vec<&str> = caps["shell"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(shell, vec!["npm *", "git *"]); // hand wins
+        let network: Vec<&str> = caps["network"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(network, vec!["api.example.com"]); // base preserved
+    }
+
+    #[test]
+    fn base_template_name_override() {
+        // When hand sets name, it should override the base template's name
+        let agents_dir = tempfile::tempdir().unwrap();
+        let template_dir = agents_dir.path().join("my-template");
+        std::fs::create_dir_all(&template_dir).unwrap();
+        std::fs::write(
+            template_dir.join("agent.toml"),
+            r#"
+name = "template-name"
+description = "Template desc"
+module = "builtin:chat"
+
+[model]
+provider = "default"
+model = "default"
+system_prompt = "Template prompt"
+"#,
+        )
+        .unwrap();
+
+        let hand_toml = r#"
+id = "name-test"
+name = "Name Test"
+description = "Test name override"
+category = "content"
+tools = []
+
+[agents.main]
+coordinator = true
+base = "my-template"
+name = "custom-name"
+description = "Custom description"
+
+[agents.main.model]
+system_prompt = "Custom prompt"
+
+[dashboard]
+metrics = []
+"#;
+        let def = parse_hand_definition(hand_toml, Some(agents_dir.path())).unwrap();
+        let agent = &def.agents["main"];
+        assert_eq!(agent.manifest.name, "custom-name");
+        assert_eq!(agent.manifest.description, "Custom description");
+        assert_eq!(agent.manifest.model.system_prompt, "Custom prompt");
+        assert_eq!(agent.manifest.module, "builtin:chat"); // from base
+    }
 }
