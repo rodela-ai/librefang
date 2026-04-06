@@ -6413,9 +6413,11 @@ system_prompt = "You are a helpful assistant."
             ]);
             manifest.is_hand = true;
 
-            // Skills: hand-level non-empty = allowlist (restrict to these);
-            // agent-level can further restrict within that.
-            // Empty hand-level + non-empty agent-level = agent decides.
+            // Skills merge semantics:
+            //   hand skills = []  (empty)     → no restriction, agent keeps its own list
+            //   hand skills = ["a", "b"]      → allowlist; agent list is intersected
+            //   hand skills = ["a"] + agent [] → agent gets hand's list
+            //   hand skills = ["a"] + agent ["a","c"] → agent gets ["a"] (intersection)
             if !def.skills.is_empty() {
                 if manifest.skills.is_empty() {
                     // Agent has no preference → use hand allowlist
