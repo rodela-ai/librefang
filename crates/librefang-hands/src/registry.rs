@@ -19,6 +19,17 @@ struct HandTomlWrapper {
     hand: HandDefinition,
 }
 
+/// Resolve the agents registry directory from a home directory.
+/// Returns `Some(path)` if `{home_dir}/registry/agents/` exists and is a directory.
+fn resolve_agents_dir(home_dir: &Path) -> Option<std::path::PathBuf> {
+    let dir = home_dir.join("registry").join("agents");
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
 /// Parse a HAND.toml into a HandDefinition with its skill content attached.
 ///
 /// Accepts both formats:
@@ -354,12 +365,8 @@ impl HandRegistry {
     /// Load hand definitions from disk. Returns (added, updated) counts.
     pub fn reload_from_disk(&self, home_dir: &std::path::Path) -> (usize, usize) {
         let fresh = scan_hands_dir(home_dir);
-        let agents_dir = home_dir.join("registry").join("agents");
-        let agents_dir_opt = if agents_dir.is_dir() {
-            Some(agents_dir.as_path())
-        } else {
-            None
-        };
+        let agents_dir = resolve_agents_dir(home_dir);
+        let agents_dir_opt = agents_dir.as_deref();
         let mut added = 0usize;
         let mut updated = 0usize;
         for (id, toml_content, skill_content, agent_skill_content) in fresh {
@@ -401,17 +408,12 @@ impl HandRegistry {
 
         let agent_skill_content = scan_agent_skill_files(path);
 
-        let agents_dir = home_dir.join("registry").join("agents");
-        let agents_dir_opt = if agents_dir.is_dir() {
-            Some(agents_dir.as_path())
-        } else {
-            None
-        };
+        let agents_dir = resolve_agents_dir(home_dir);
         let def = parse_hand_toml_with_agents_dir(
             &toml_content,
             &skill_content,
             agent_skill_content,
-            agents_dir_opt,
+            agents_dir.as_deref(),
         )?;
 
         if self.definitions.contains_key(&def.id) {
@@ -428,15 +430,34 @@ impl HandRegistry {
 
     /// Install a hand from raw TOML + skill content (for API-based installs).
     ///
-    /// NOTE: `base` template references in agent entries are **not** resolved
-    /// here because this path has no access to the agents registry directory.
-    /// Use `install_from_path` or `install_from_content_persisted` when base
-    /// template resolution is needed.
+    /// Hands that use `base` template references in agent entries will be
+    /// **rejected** because this path has no access to the agents registry
+    /// directory. Use `install_from_path` or `install_from_content_persisted`
+    /// when base template resolution is needed.
     pub fn install_from_content(
         &self,
         toml_content: &str,
         skill_content: &str,
     ) -> HandResult<HandDefinition> {
+        // Reject hands that use `base` template references — they cannot be
+        // resolved without the agents registry directory.
+        if let Ok(raw) = toml::from_str::<toml::Value>(toml_content) {
+            let agents_table = raw
+                .get("agents")
+                .or_else(|| raw.get("hand").and_then(|h| h.get("agents")));
+            if let Some(toml::Value::Table(agents)) = agents_table {
+                for (role, entry) in agents {
+                    if entry.get("base").and_then(|v| v.as_str()).is_some() {
+                        return Err(HandError::Config(format!(
+                            "Agent '{role}' uses `base` template reference which cannot be \
+                             resolved via content install. Use install_from_path or \
+                             install_from_content_persisted instead."
+                        )));
+                    }
+                }
+            }
+        }
+
         let def = parse_hand_toml(toml_content, skill_content, HashMap::new())?;
 
         if self.definitions.contains_key(&def.id) {
@@ -459,17 +480,12 @@ impl HandRegistry {
         toml_content: &str,
         skill_content: &str,
     ) -> HandResult<HandDefinition> {
-        let agents_dir = home_dir.join("registry").join("agents");
-        let agents_dir_opt = if agents_dir.is_dir() {
-            Some(agents_dir.as_path())
-        } else {
-            None
-        };
+        let agents_dir = resolve_agents_dir(home_dir);
         let def = parse_hand_toml_with_agents_dir(
             toml_content,
             skill_content,
             HashMap::new(),
-            agents_dir_opt,
+            agents_dir.as_deref(),
         )?;
 
         if self.definitions.contains_key(&def.id) {

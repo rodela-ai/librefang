@@ -6491,10 +6491,13 @@ system_prompt = "You are a helpful assistant."
                 );
             }
 
-            // Inject skill content: per-role override takes precedence over shared
+            // Inject skill content: per-role override takes precedence over shared.
+            // SKILL-{role}.md filenames are lowercased during scan, so normalize
+            // the role name to match.
+            let role_lower = role.to_lowercase();
             let effective_skill = def
                 .agent_skill_content
-                .get(role)
+                .get(&role_lower)
                 .or(def.skill_content.as_ref());
             if let Some(skill_content) = effective_skill {
                 manifest.model.system_prompt = format!(
