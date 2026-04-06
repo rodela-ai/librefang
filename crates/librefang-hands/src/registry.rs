@@ -427,6 +427,11 @@ impl HandRegistry {
     }
 
     /// Install a hand from raw TOML + skill content (for API-based installs).
+    ///
+    /// NOTE: `base` template references in agent entries are **not** resolved
+    /// here because this path has no access to the agents registry directory.
+    /// Use `install_from_path` or `install_from_content_persisted` when base
+    /// template resolution is needed.
     pub fn install_from_content(
         &self,
         toml_content: &str,
