@@ -1523,4 +1523,53 @@ system_prompt = "Prompt"
         // Original case should NOT exist
         assert!(agent_skills.get("PM").is_none());
     }
+
+    #[test]
+    fn install_from_content_rejects_base_template() {
+        let registry = HandRegistry::new();
+        let toml_content = r#"
+id = "base-ref-hand"
+name = "Base Ref Hand"
+description = "Uses base template"
+category = "development"
+tools = []
+
+[agents.main]
+coordinator = true
+base = "some-template"
+
+[dashboard]
+metrics = []
+"#;
+        let result = registry.install_from_content(toml_content, "");
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("base"),
+            "Error should mention base template: {err}"
+        );
+    }
+
+    #[test]
+    fn install_from_content_accepts_hand_without_base() {
+        let registry = HandRegistry::new();
+        let toml_content = r#"
+id = "no-base-hand"
+name = "No Base Hand"
+description = "No base used"
+category = "content"
+tools = []
+
+[agents.main]
+coordinator = true
+name = "main-agent"
+description = "A plain agent"
+system_prompt = "Hello"
+
+[dashboard]
+metrics = []
+"#;
+        let result = registry.install_from_content(toml_content, "");
+        assert!(result.is_ok());
+    }
 }

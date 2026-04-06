@@ -729,93 +729,16 @@ struct HandDefinitionRaw {
     i18n: HashMap<String, HandI18n>,
 }
 
-impl<'de> Deserialize<'de> for HandDefinition {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = HandDefinitionRaw::deserialize(deserializer)?;
-
-        let agents = if let Some(raw_agents) = raw.agents {
-            // Multi-agent format: [agents.*] — parse each entry with legacy fallback
-            if raw_agents.is_empty() {
-                return Err(serde::de::Error::custom(
-                    "Hand must define at least one agent in [agents.*]",
-                ));
-            }
-            let mut agents_map = BTreeMap::new();
-            for (role, value) in &raw_agents {
-                let agent =
-                    parse_multi_agent_entry(role, value, None).map_err(serde::de::Error::custom)?;
-                agents_map.insert(role.clone(), agent);
-            }
-            agents_map
-        } else if let Some(agent_value) = raw.agent {
-            // Single-agent format: [agent] → convert to {"main": ...}
-            // `base` template references are only supported in [agents.*] format.
-            if agent_value.as_table().and_then(|t| t.get("base")).is_some() {
-                return Err(serde::de::Error::custom(
-                    "[agent] does not support `base` template references. \
-                     Use [agents.main] with `base = \"...\"` instead.",
-                ));
-            }
-            let manifest =
-                parse_single_agent_section(&agent_value).map_err(serde::de::Error::custom)?;
-            let mut map = BTreeMap::new();
-            map.insert(
-                "main".to_string(),
-                HandAgentManifest {
-                    coordinator: true,
-                    invoke_hint: None,
-                    base: None,
-                    manifest,
-                },
-            );
-            map
-        } else {
-            return Err(serde::de::Error::custom(
-                "Hand must define either [agent] or [agents.*]",
-            ));
-        };
-
-        Ok(HandDefinition {
-            id: raw.id,
-            version: raw.version,
-            name: raw.name,
-            description: raw.description,
-            category: raw.category,
-            icon: raw.icon,
-            tools: raw.tools,
-            skills: raw.skills,
-            mcp_servers: raw.mcp_servers,
-            allowed_plugins: raw.allowed_plugins,
-            requires: raw.requires,
-            settings: raw.settings,
-            agents,
-            dashboard: raw.dashboard,
-            routing: raw.routing,
-            skill_content: None,
-            agent_skill_content: HashMap::new(),
-            metadata: raw.metadata,
-            i18n: raw.i18n,
-        })
-    }
-}
-
-/// Parse a HAND.toml string into a `HandDefinition`, resolving `base` agent
-/// templates when `agents_dir` is provided.
+/// Build a `HandDefinition` from the raw deserialized struct.
 ///
-/// This bypasses the `Deserialize` impl (which cannot do filesystem I/O) and
-/// manually constructs agents via `parse_multi_agent_entry` so that base
-/// template resolution has access to the agents registry directory.
-pub(crate) fn parse_hand_definition(
-    toml_content: &str,
+/// Shared logic between `Deserialize` impl (no filesystem access, `agents_dir = None`)
+/// and `parse_hand_definition` (with filesystem access for `base` template resolution).
+fn build_hand_from_raw(
+    raw: HandDefinitionRaw,
     agents_dir: Option<&Path>,
 ) -> Result<HandDefinition, String> {
-    let raw: HandDefinitionRaw =
-        toml::from_str(toml_content).map_err(|e| format!("Failed to parse HAND.toml: {e}"))?;
-
     let agents = if let Some(raw_agents) = raw.agents {
+        // Multi-agent format: [agents.*] — parse each entry with legacy fallback
         if raw_agents.is_empty() {
             return Err("Hand must define at least one agent in [agents.*]".to_string());
         }
@@ -826,6 +749,8 @@ pub(crate) fn parse_hand_definition(
         }
         agents_map
     } else if let Some(agent_value) = raw.agent {
+        // Single-agent format: [agent] → convert to {"main": ...}
+        // `base` template references are only supported in [agents.*] format.
         if agent_value.as_table().and_then(|t| t.get("base")).is_some() {
             return Err("[agent] does not support `base` template references. \
                  Use [agents.main] with `base = \"...\"` instead."
@@ -868,6 +793,31 @@ pub(crate) fn parse_hand_definition(
         metadata: raw.metadata,
         i18n: raw.i18n,
     })
+}
+
+impl<'de> Deserialize<'de> for HandDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = HandDefinitionRaw::deserialize(deserializer)?;
+        build_hand_from_raw(raw, None).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Parse a HAND.toml string into a `HandDefinition`, resolving `base` agent
+/// templates when `agents_dir` is provided.
+///
+/// This bypasses the `Deserialize` impl (which cannot do filesystem I/O) and
+/// manually constructs agents via `parse_multi_agent_entry` so that base
+/// template resolution has access to the agents registry directory.
+pub(crate) fn parse_hand_definition(
+    toml_content: &str,
+    agents_dir: Option<&Path>,
+) -> Result<HandDefinition, String> {
+    let raw: HandDefinitionRaw =
+        toml::from_str(toml_content).map_err(|e| format!("Failed to parse HAND.toml: {e}"))?;
+    build_hand_from_raw(raw, agents_dir)
 }
 
 /// Token consumption and activation metadata for user awareness.

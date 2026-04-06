@@ -2296,9 +2296,11 @@ async fn tool_workflow_run(
 
     // Serialize optional input object to a JSON string for the workflow engine.
     let input_str = match input.get("input") {
-        Some(v) if !v.is_null() => serde_json::to_string(v)
+        Some(v) if v.is_object() => serde_json::to_string(v)
             .map_err(|e| format!("Failed to serialize workflow input: {e}"))?,
-        _ => String::new(),
+        Some(v) if v.is_null() => String::new(),
+        Some(_) => return Err("'input' must be a JSON object or null".to_string()),
+        None => String::new(),
     };
 
     let kh = require_kernel(kernel)?;
