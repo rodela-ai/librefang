@@ -8,6 +8,15 @@ use librefang_channels::router::AgentRouter;
 use librefang_channels::sidecar::SidecarAdapter;
 use librefang_channels::types::{ChannelAdapter, SenderContext};
 
+/// Strict format check for recovery codes: exactly `DDDD-DDDD`.
+fn is_recovery_code_format(code: &str) -> bool {
+    let trimmed = code.trim();
+    trimmed.len() == 9
+        && trimmed.as_bytes()[4] == b'-'
+        && trimmed[..4].chars().all(|c| c.is_ascii_digit())
+        && trimmed[5..].chars().all(|c| c.is_ascii_digit())
+}
+
 /// Sanitize LLM/driver errors into user-friendly messages for channel delivery.
 ///
 /// Prevents raw technical details (stack traces, driver internals, status codes)
@@ -1172,6 +1181,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         id_prefix: &str,
         approve: bool,
         totp_code: Option<&str>,
+        sender_id: &str,
     ) -> String {
         let pending = self.kernel.approvals().list_pending();
         let matched: Vec<_> = pending
@@ -1190,11 +1200,11 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
 
                 // Pre-verify TOTP or recovery code if required
                 let totp_verified = if approve && self.kernel.approvals().requires_totp() {
-                    if self.kernel.approvals().is_totp_locked_out("channel_user") {
+                    if self.kernel.approvals().is_totp_locked_out(sender_id) {
                         return "Too many failed TOTP attempts. Try again later.".into();
                     }
                     match totp_code {
-                        Some(code) if code.contains('-') => {
+                        Some(code) if is_recovery_code_format(code) => {
                             // Recovery code
                             match self.kernel.vault_get("totp_recovery_codes") {
                                 Some(stored) => {
@@ -1221,7 +1231,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                             ) {
                                 Ok(true) => true,
                                 Ok(false) => {
-                                    self.kernel.approvals().record_totp_failure("channel_user");
+                                    self.kernel.approvals().record_totp_failure(sender_id);
                                     return "Invalid TOTP code.".into();
                                 }
                                 Err(e) => return format!("TOTP error: {e}"),
@@ -1238,7 +1248,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                     decision,
                     Some("channel".to_string()),
                     totp_verified,
-                    Some("channel_user"),
+                    Some(sender_id),
                 ) {
                     Ok(_) => {
                         let verb = if approve { "Approved" } else { "Rejected" };

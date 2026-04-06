@@ -208,6 +208,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
+// TOTP helpers
+// ---------------------------------------------------------------------------
+
+/// Strict format check for recovery codes: exactly `DDDD-DDDD` (9 chars, digits
+/// around a single dash at position 4).  This prevents attackers from sending
+/// arbitrary dash-containing strings to bypass TOTP rate-limiting via the
+/// recovery-code path.
+fn is_recovery_code_format(code: &str) -> bool {
+    let trimmed = code.trim();
+    trimmed.len() == 9
+        && trimmed.as_bytes()[4] == b'-'
+        && trimmed[..4].chars().all(|c| c.is_ascii_digit())
+        && trimmed[5..].chars().all(|c| c.is_ascii_digit())
+}
+
+// ---------------------------------------------------------------------------
 // Profile + Mode endpoints
 // ---------------------------------------------------------------------------
 
@@ -1421,7 +1437,7 @@ pub async fn approve_request(
         }
         match body.totp_code.as_deref() {
             Some(code) => {
-                if code.contains('-') {
+                if is_recovery_code_format(code) {
                     match state.kernel.vault_get("totp_recovery_codes") {
                         Some(stored) => {
                             match librefang_kernel::approval::ApprovalManager::verify_recovery_code(
@@ -1613,6 +1629,17 @@ pub async fn batch_resolve(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BatchResolveRequest>,
 ) -> impl IntoResponse {
+    // Batch approval is incompatible with TOTP enforcement — each approval must
+    // be individually verified with a TOTP code.
+    if state.kernel.approvals().requires_totp() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Batch approval is not available when TOTP is enforced. Approve items individually with TOTP verification."
+            })),
+        );
+    }
+
     const MAX_BATCH_SIZE: usize = 100;
 
     if body.ids.len() > MAX_BATCH_SIZE {
@@ -1753,7 +1780,7 @@ pub async fn totp_setup(
                 .into_json_tuple();
             }
             Some(code) => {
-                let verified = if code.contains('-') {
+                let verified = if is_recovery_code_format(code) {
                     // Recovery code
                     match state.kernel.vault_get("totp_recovery_codes") {
                         Some(stored) => {
@@ -1877,7 +1904,10 @@ pub async fn totp_confirm(
 
 /// GET /api/approvals/totp/status — Check TOTP enrollment status.
 pub async fn totp_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let has_secret = state.kernel.vault_get("totp_secret").is_some();
+    let has_secret = state
+        .kernel
+        .vault_get("totp_secret")
+        .is_some_and(|s| !s.is_empty());
     let confirmed = state.kernel.vault_get("totp_confirmed").as_deref() == Some("true");
     let policy = state.kernel.approvals().policy();
     let enforced = policy.second_factor == librefang_types::approval::SecondFactor::Totp;
@@ -1916,7 +1946,7 @@ pub async fn totp_revoke(
     }
 
     // Verify the provided code (recovery codes are consumed on use)
-    let verified = if body.code.contains('-') {
+    let verified = if is_recovery_code_format(&body.code) {
         match state.kernel.vault_get("totp_recovery_codes") {
             Some(stored) => {
                 match librefang_kernel::approval::ApprovalManager::verify_recovery_code(

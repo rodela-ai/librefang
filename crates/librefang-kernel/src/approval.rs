@@ -39,8 +39,11 @@ pub struct ApprovalManager {
     audit_db: Option<Arc<StdMutex<Connection>>>,
     /// TOTP grace period cache: sender_id → last successful verification time.
     totp_grace: StdMutex<HashMap<String, Instant>>,
-    /// TOTP failure tracking: sender_id → (failure_count, first_failure_time).
-    totp_failures: StdMutex<HashMap<String, (u32, Instant)>>,
+    /// TOTP failure tracking: sender_id → (failure_count, lockout_start).
+    /// `lockout_start` is `None` until the failure count reaches the threshold,
+    /// at which point it is set to the current instant. The lockout window is
+    /// measured from that moment, not from the first failure.
+    totp_failures: StdMutex<HashMap<String, (u32, Option<Instant>)>>,
 }
 
 struct PendingRequest {
@@ -729,10 +732,12 @@ impl ApprovalManager {
     /// Check if a sender is locked out due to too many TOTP failures.
     pub fn is_totp_locked_out(&self, sender_id: &str) -> bool {
         let failures = self.totp_failures.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((count, first_failure)) = failures.get(sender_id) {
+        if let Some((count, lockout_start)) = failures.get(sender_id) {
             if *count >= TOTP_MAX_FAILURES {
-                // Locked out if within lockout window
-                return first_failure.elapsed().as_secs() < TOTP_LOCKOUT_SECS;
+                // Locked out if within lockout window (measured from when threshold was reached)
+                return lockout_start
+                    .map(|t| t.elapsed().as_secs() < TOTP_LOCKOUT_SECS)
+                    .unwrap_or(false);
             }
         }
         false
@@ -741,15 +746,21 @@ impl ApprovalManager {
     /// Record a TOTP verification failure.
     pub fn record_totp_failure(&self, sender_id: &str) {
         let mut failures = self.totp_failures.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = failures
-            .entry(sender_id.to_string())
-            .or_insert((0, Instant::now()));
+        let entry = failures.entry(sender_id.to_string()).or_insert((0, None));
         // Reset counter if lockout window expired
-        if entry.1.elapsed().as_secs() >= TOTP_LOCKOUT_SECS {
-            *entry = (0, Instant::now());
+        if entry
+            .1
+            .map(|t| t.elapsed().as_secs() >= TOTP_LOCKOUT_SECS)
+            .unwrap_or(false)
+        {
+            *entry = (0, None);
         }
         entry.0 += 1;
         if entry.0 >= TOTP_MAX_FAILURES {
+            // Record lockout start time when threshold is first reached
+            if entry.1.is_none() {
+                entry.1 = Some(Instant::now());
+            }
             warn!(
                 sender_id,
                 "TOTP locked out: {} consecutive failures", entry.0
