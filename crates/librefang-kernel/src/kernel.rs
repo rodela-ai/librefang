@@ -6377,7 +6377,9 @@ system_prompt = "You are a helpful assistant."
             // standalone specialist agents spawned by routing.
             manifest.name = format!("{hand_id}:{}", manifest.name);
 
-            // Reuse existing hand agent if one with the same prefixed name is already running
+            // Reuse existing hand agent if one with the same prefixed name is already running.
+            // NOTE: this check-then-spawn is not atomic, but is safe because hand activation
+            // is serialized by the activate_lock mutex at the HandRegistry level.
             if let Some(existing) = self.registry.find_by_name(&manifest.name) {
                 agent_ids_map.insert(role.clone(), existing.id);
                 continue;
@@ -6397,35 +6399,70 @@ system_prompt = "You are a helpful assistant."
                 manifest.model.model = cfg.default_model.model.clone();
             }
 
-            // Hand-level tool inheritance + agent_send for multi-agent hands
+            // Hand-level tool inheritance: hand controls WHICH tools are available,
+            // but preserve agent-level capability fields (network, shell, memory, etc.)
             let mut tools = def.tools.clone();
             if is_multi_agent && !tools.contains(&"agent_send".to_string()) {
                 tools.push("agent_send".to_string());
             }
-            manifest.capabilities = ManifestCapabilities {
-                tools,
-                ..Default::default()
-            };
+            manifest.capabilities.tools = tools;
 
-            // Tags: hand, instance, role
-            manifest.tags = vec![
+            // Tags: append hand-level tags to agent's existing tags
+            manifest.tags.extend([
                 format!("hand:{hand_id}"),
                 format!("hand_instance:{}", instance.instance_id),
                 format!("hand_role:{role}"),
-            ];
+            ]);
             manifest.is_hand = true;
-            manifest.skills = def.skills.clone();
-            manifest.mcp_servers = def.mcp_servers.clone();
 
-            // Autonomous scheduling
-            if manifest.autonomous.is_some() {
+            // Skills: hand-level non-empty = allowlist (restrict to these);
+            // agent-level can further restrict within that.
+            // Empty hand-level + non-empty agent-level = agent decides.
+            if !def.skills.is_empty() {
+                if manifest.skills.is_empty() {
+                    // Agent has no preference → use hand allowlist
+                    manifest.skills = def.skills.clone();
+                } else {
+                    // Agent has its own list → intersect with hand allowlist
+                    manifest.skills.retain(|s| def.skills.contains(s));
+                }
+            }
+
+            // MCP servers: same merge logic as skills
+            if !def.mcp_servers.is_empty() {
+                if manifest.mcp_servers.is_empty() {
+                    manifest.mcp_servers = def.mcp_servers.clone();
+                } else {
+                    manifest.mcp_servers.retain(|s| def.mcp_servers.contains(s));
+                }
+            }
+
+            // Plugins: same merge logic as skills/mcp_servers
+            if !def.allowed_plugins.is_empty() {
+                if manifest.allowed_plugins.is_empty() {
+                    manifest.allowed_plugins = def.allowed_plugins.clone();
+                } else {
+                    manifest
+                        .allowed_plugins
+                        .retain(|p| def.allowed_plugins.contains(p));
+                }
+            }
+
+            // Autonomous scheduling: only override if agent doesn't already have
+            // a non-default schedule (respect agent-level schedule config)
+            if manifest.autonomous.is_some() && matches!(manifest.schedule, ScheduleMode::Reactive)
+            {
                 manifest.schedule = ScheduleMode::Continuous {
-                    check_interval_secs: 60,
+                    check_interval_secs: manifest
+                        .autonomous
+                        .as_ref()
+                        .map(|a| a.heartbeat_interval_secs)
+                        .unwrap_or(60),
                 };
             }
 
-            // Shell exec policy
-            if def.tools.iter().any(|t| t == "shell_exec") {
+            // Shell exec policy: only set if agent doesn't already have one
+            if manifest.exec_policy.is_none() && def.tools.iter().any(|t| t == "shell_exec") {
                 manifest.exec_policy = Some(librefang_types::config::ExecPolicy {
                     mode: librefang_types::config::ExecSecurityMode::Full,
                     timeout_secs: 300,
@@ -6454,8 +6491,12 @@ system_prompt = "You are a helpful assistant."
                 );
             }
 
-            // Inject skill content
-            if let Some(ref skill_content) = def.skill_content {
+            // Inject skill content: per-role override takes precedence over shared
+            let effective_skill = def
+                .agent_skill_content
+                .get(role)
+                .or(def.skill_content.as_ref());
+            if let Some(skill_content) = effective_skill {
                 manifest.model.system_prompt = format!(
                     "{}\n\n---\n\n## Reference Knowledge\n\n{}",
                     manifest.model.system_prompt, skill_content
@@ -6515,12 +6556,30 @@ system_prompt = "You are a helpful assistant."
             // When `instance_id` is Some (multi-instance or restart recovery),
             // uses the new format with instance UUID for uniqueness.
             let deterministic_id = AgentId::from_hand_agent(hand_id, role, instance_id);
-            let agent_id = self.spawn_agent_inner(
+            let agent_id = match self.spawn_agent_inner(
                 manifest,
                 None,
                 Some(hand_toml_path),
                 Some(deterministic_id),
-            )?;
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    // Rollback: kill all agents spawned so far in this activation
+                    for spawned_id in agent_ids_map.values() {
+                        if let Err(kill_err) = self.kill_agent(*spawned_id) {
+                            warn!(
+                                hand = %hand_id,
+                                agent = %spawned_id,
+                                error = %kill_err,
+                                "Failed to rollback agent during hand activation failure"
+                            );
+                        }
+                    }
+                    // Deactivate the hand instance
+                    let _ = self.hand_registry.deactivate(instance.instance_id);
+                    return Err(e);
+                }
+            };
 
             agent_ids_map.insert(role.clone(), agent_id);
         }
@@ -11106,6 +11165,38 @@ impl KernelHandle for LibreFangKernel {
     fn max_agent_call_depth(&self) -> u32 {
         let cfg = self.config.load();
         cfg.max_agent_call_depth
+    }
+
+    async fn run_workflow(
+        &self,
+        workflow_id: &str,
+        input: &str,
+    ) -> Result<(String, String), String> {
+        use crate::workflow::WorkflowId;
+
+        // Try parsing as UUID first, then fall back to name lookup.
+        let wf_id = if let Ok(uuid) = uuid::Uuid::parse_str(workflow_id) {
+            WorkflowId(uuid)
+        } else {
+            // Name-based lookup: scan all registered workflows.
+            let name_lower = workflow_id.to_lowercase();
+            let workflows = self.workflows.list_workflows().await;
+            workflows
+                .iter()
+                .find(|w| w.name.to_lowercase() == name_lower)
+                .map(|w| w.id)
+                .ok_or_else(|| {
+                    format!(
+                        "Workflow '{workflow_id}' not found. Use a valid UUID or workflow name."
+                    )
+                })?
+        };
+
+        let (run_id, output) = LibreFangKernel::run_workflow(self, wf_id, input.to_string())
+            .await
+            .map_err(|e| format!("Workflow execution failed: {e}"))?;
+
+        Ok((run_id.to_string(), output))
     }
 
     fn goal_list_active(

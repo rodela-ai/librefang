@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use librefang_types::agent::{AgentId, AgentManifest, AutonomousConfig, ModelConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use uuid::Uuid;
 
 // ─── Error types ─────────────────────────────────────────────────────────────
@@ -337,6 +338,11 @@ pub struct HandAgentManifest {
     /// Injected into the coordinator's system prompt as a dispatch guide.
     #[serde(default)]
     pub invoke_hint: Option<String>,
+    /// Reference to an agent template from the agents/ registry.
+    /// If set, the template's AgentManifest is loaded as a base,
+    /// and fields explicitly set in this hand agent override it.
+    #[serde(default)]
+    pub base: Option<String>,
     /// The underlying agent manifest (flattened so TOML fields sit alongside).
     #[serde(flatten)]
     pub manifest: AgentManifest,
@@ -372,13 +378,37 @@ fn default_version() -> String {
     "0.0.0".to_string()
 }
 
+/// Deep-merge two TOML values. `overlay` fields win over `base` fields.
+/// Tables are merged recursively; scalars and arrays in overlay replace base.
+fn deep_merge_toml(base: &mut toml::Value, overlay: &toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
+            for (key, value) in overlay_table {
+                if let Some(base_value) = base_table.get_mut(key) {
+                    deep_merge_toml(base_value, value);
+                } else {
+                    base_table.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        (base, overlay) => {
+            *base = overlay.clone();
+        }
+    }
+}
+
 /// Parse a single entry from `[agents.*]` into a `HandAgentManifest`.
 ///
-/// Extracts `coordinator` and `invoke_hint` from the raw TOML value, then
-/// delegates to `parse_single_agent_section()` for the agent manifest proper.
+/// Extracts `coordinator`, `invoke_hint`, and `base` from the raw TOML value.
+/// If `base` is set, loads the referenced agent template from the agents
+/// registry directory and deep-merges the hand's overrides on top.
 /// This gives multi-agent entries the same legacy flat-field fallback that
 /// single-agent `[agent]` already has.
-fn parse_multi_agent_entry(role: &str, value: &toml::Value) -> Result<HandAgentManifest, String> {
+pub(crate) fn parse_multi_agent_entry(
+    role: &str,
+    value: &toml::Value,
+    agents_dir: Option<&std::path::Path>,
+) -> Result<HandAgentManifest, String> {
     let table = value
         .as_table()
         .ok_or_else(|| format!("[agents.{role}] must be a table"))?;
@@ -393,12 +423,52 @@ fn parse_multi_agent_entry(role: &str, value: &toml::Value) -> Result<HandAgentM
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let manifest =
-        parse_single_agent_section(value).map_err(|e| format!("[agents.{role}]: {e}"))?;
+    let base_ref = table
+        .get("base")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let manifest = if let Some(ref template_name) = base_ref {
+        // Load the base agent template and merge hand overrides on top.
+        let agents_dir = agents_dir.ok_or_else(|| {
+            format!(
+                "[agents.{role}]: `base = \"{template_name}\"` requires agents registry directory"
+            )
+        })?;
+        let template_path = agents_dir.join(template_name).join("agent.toml");
+        let template_toml = std::fs::read_to_string(&template_path).map_err(|e| {
+            format!(
+                "[agents.{role}]: failed to read base template '{}': {e}",
+                template_path.display()
+            )
+        })?;
+        let mut base_value: toml::Value = toml::from_str(&template_toml).map_err(|e| {
+            format!(
+                "[agents.{role}]: failed to parse base template '{}': {e}",
+                template_path.display()
+            )
+        })?;
+
+        // Deep-merge: hand agent fields override base template fields.
+        // Remove hand-only fields before merge (they're not part of AgentManifest).
+        let mut overlay = value.clone();
+        if let Some(t) = overlay.as_table_mut() {
+            t.remove("coordinator");
+            t.remove("invoke_hint");
+            t.remove("base");
+        }
+        deep_merge_toml(&mut base_value, &overlay);
+
+        parse_single_agent_section(&base_value)
+            .map_err(|e| format!("[agents.{role}] (merged with base '{template_name}'): {e}"))?
+    } else {
+        parse_single_agent_section(value).map_err(|e| format!("[agents.{role}]: {e}"))?
+    };
 
     Ok(HandAgentManifest {
         coordinator,
         invoke_hint,
+        base: base_ref,
         manifest,
     })
 }
@@ -510,6 +580,9 @@ pub struct HandDefinition {
     pub skills: Vec<String>,
     /// MCP server allowlist for the spawned agents (empty = all).
     pub mcp_servers: Vec<String>,
+    /// Plugin allowlist for the spawned agents (empty = all).
+    #[serde(default)]
+    pub allowed_plugins: Vec<String>,
     /// Requirements that must be satisfied before activation.
     pub requires: Vec<HandRequirement>,
     /// Configurable settings (shown in activation modal).
@@ -522,8 +595,14 @@ pub struct HandDefinition {
     /// Routing keywords for hand selection.
     pub routing: HandRouting,
     /// Bundled skill content (populated at load time, not in TOML).
+    /// Shared across all agents unless overridden by `agent_skill_content`.
     #[serde(skip)]
     pub skill_content: Option<String>,
+    /// Per-role skill content overrides, keyed by role name (e.g. "pm", "qa").
+    /// Populated from `SKILL-{role}.md` files at load time.
+    /// When present for a role, takes precedence over the shared `skill_content`.
+    #[serde(skip)]
+    pub agent_skill_content: HashMap<String, String>,
     /// Token consumption and activation metadata.
     pub metadata: Option<HandMetadata>,
     /// Localized strings keyed by language code (e.g. "zh", "ja").
@@ -575,6 +654,8 @@ struct HandDefinitionRaw {
     #[serde(default)]
     mcp_servers: Vec<String>,
     #[serde(default)]
+    allowed_plugins: Vec<String>,
+    #[serde(default)]
     requires: Vec<HandRequirement>,
     #[serde(default)]
     settings: Vec<HandSetting>,
@@ -612,7 +693,7 @@ impl<'de> Deserialize<'de> for HandDefinition {
             let mut agents_map = BTreeMap::new();
             for (role, value) in &raw_agents {
                 let agent =
-                    parse_multi_agent_entry(role, value).map_err(serde::de::Error::custom)?;
+                    parse_multi_agent_entry(role, value, None).map_err(serde::de::Error::custom)?;
                 agents_map.insert(role.clone(), agent);
             }
             agents_map
@@ -626,6 +707,7 @@ impl<'de> Deserialize<'de> for HandDefinition {
                 HandAgentManifest {
                     coordinator: true,
                     invoke_hint: None,
+                    base: None,
                     manifest,
                 },
             );
@@ -646,16 +728,81 @@ impl<'de> Deserialize<'de> for HandDefinition {
             tools: raw.tools,
             skills: raw.skills,
             mcp_servers: raw.mcp_servers,
+            allowed_plugins: raw.allowed_plugins,
             requires: raw.requires,
             settings: raw.settings,
             agents,
             dashboard: raw.dashboard,
             routing: raw.routing,
             skill_content: None,
+            agent_skill_content: HashMap::new(),
             metadata: raw.metadata,
             i18n: raw.i18n,
         })
     }
+}
+
+/// Parse a HAND.toml string into a `HandDefinition`, resolving `base` agent
+/// templates when `agents_dir` is provided.
+///
+/// This bypasses the `Deserialize` impl (which cannot do filesystem I/O) and
+/// manually constructs agents via `parse_multi_agent_entry` so that base
+/// template resolution has access to the agents registry directory.
+pub(crate) fn parse_hand_definition(
+    toml_content: &str,
+    agents_dir: Option<&Path>,
+) -> Result<HandDefinition, String> {
+    let raw: HandDefinitionRaw =
+        toml::from_str(toml_content).map_err(|e| format!("Failed to parse HAND.toml: {e}"))?;
+
+    let agents = if let Some(raw_agents) = raw.agents {
+        if raw_agents.is_empty() {
+            return Err("Hand must define at least one agent in [agents.*]".to_string());
+        }
+        let mut agents_map = BTreeMap::new();
+        for (role, value) in &raw_agents {
+            let agent = parse_multi_agent_entry(role, value, agents_dir)?;
+            agents_map.insert(role.clone(), agent);
+        }
+        agents_map
+    } else if let Some(agent_value) = raw.agent {
+        let manifest = parse_single_agent_section(&agent_value)?;
+        let mut map = BTreeMap::new();
+        map.insert(
+            "main".to_string(),
+            HandAgentManifest {
+                coordinator: true,
+                invoke_hint: None,
+                base: None,
+                manifest,
+            },
+        );
+        map
+    } else {
+        return Err("Hand must define either [agent] or [agents.*]".to_string());
+    };
+
+    Ok(HandDefinition {
+        id: raw.id,
+        version: raw.version,
+        name: raw.name,
+        description: raw.description,
+        category: raw.category,
+        icon: raw.icon,
+        tools: raw.tools,
+        skills: raw.skills,
+        mcp_servers: raw.mcp_servers,
+        allowed_plugins: raw.allowed_plugins,
+        requires: raw.requires,
+        settings: raw.settings,
+        agents,
+        dashboard: raw.dashboard,
+        routing: raw.routing,
+        skill_content: None,
+        agent_skill_content: HashMap::new(),
+        metadata: raw.metadata,
+        i18n: raw.i18n,
+    })
 }
 
 /// Token consumption and activation metadata for user awareness.
@@ -1320,5 +1467,213 @@ metrics = []
         assert_eq!(install.steps[0], "Go to example.com and sign up");
         assert!(install.macos.is_none());
         assert!(install.windows.is_none());
+    }
+
+    #[test]
+    fn base_template_reuse() {
+        // Set up a temporary agents registry directory with a template.
+        let tmp = tempfile::tempdir().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        let template_dir = agents_dir.join("my-writer");
+        std::fs::create_dir_all(&template_dir).unwrap();
+        std::fs::write(
+            template_dir.join("agent.toml"),
+            r#"
+name = "writer-base"
+description = "A base writer agent"
+module = "builtin:chat"
+
+[model]
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+max_tokens = 4096
+temperature = 0.7
+system_prompt = "You are a writer."
+"#,
+        )
+        .unwrap();
+
+        let hand_toml = r#"
+id = "content-hand"
+name = "Content Hand"
+description = "Creates content using a writer template"
+category = "content"
+tools = []
+
+[agents.writer]
+coordinator = true
+base = "my-writer"
+# Override just the system prompt — everything else comes from the base.
+
+[agents.writer.model]
+system_prompt = "You are a blog post writer."
+
+[dashboard]
+metrics = []
+"#;
+
+        let def = parse_hand_definition(hand_toml, Some(agents_dir.as_path())).unwrap();
+        assert_eq!(def.id, "content-hand");
+        assert_eq!(def.agents.len(), 1);
+
+        let writer = &def.agents["writer"];
+        assert!(writer.coordinator);
+        assert_eq!(writer.base.as_deref(), Some("my-writer"));
+        // Name comes from the base template.
+        assert_eq!(writer.manifest.name, "writer-base");
+        // Provider and model come from base.
+        assert_eq!(writer.manifest.model.provider, "anthropic");
+        assert_eq!(writer.manifest.model.model, "claude-sonnet-4-20250514");
+        assert_eq!(writer.manifest.model.max_tokens, 4096);
+        // System prompt is overridden by the hand.
+        assert_eq!(
+            writer.manifest.model.system_prompt,
+            "You are a blog post writer."
+        );
+    }
+
+    #[test]
+    fn base_template_with_scalar_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        let template_dir = agents_dir.join("generic-chat");
+        std::fs::create_dir_all(&template_dir).unwrap();
+        std::fs::write(
+            template_dir.join("agent.toml"),
+            r#"
+name = "generic-chat"
+description = "Generic chat agent"
+
+[model]
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+max_tokens = 4096
+temperature = 0.7
+system_prompt = "You are a helpful assistant."
+"#,
+        )
+        .unwrap();
+
+        let hand_toml = r#"
+id = "custom-hand"
+name = "Custom Hand"
+description = "A hand that overrides scalar fields"
+category = "development"
+tools = []
+
+[agents.main]
+coordinator = true
+base = "generic-chat"
+name = "custom-agent"
+description = "Overridden description"
+
+[agents.main.model]
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+temperature = 0.3
+
+[dashboard]
+metrics = []
+"#;
+
+        let def = parse_hand_definition(hand_toml, Some(agents_dir.as_path())).unwrap();
+        let agent = &def.agents["main"];
+        assert_eq!(agent.base.as_deref(), Some("generic-chat"));
+        // Overridden fields.
+        assert_eq!(agent.manifest.name, "custom-agent");
+        assert_eq!(agent.manifest.description, "Overridden description");
+        assert_eq!(agent.manifest.model.provider, "groq");
+        assert_eq!(agent.manifest.model.model, "llama-3.3-70b-versatile");
+        assert_eq!(agent.manifest.model.temperature, 0.3);
+        // Preserved from base (not overridden).
+        assert_eq!(agent.manifest.model.max_tokens, 4096);
+        assert_eq!(
+            agent.manifest.model.system_prompt,
+            "You are a helpful assistant."
+        );
+    }
+
+    #[test]
+    fn base_template_missing_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+
+        let hand_toml = r#"
+id = "broken-hand"
+name = "Broken Hand"
+description = "References a non-existent template"
+category = "content"
+tools = []
+
+[agents.main]
+coordinator = true
+base = "does-not-exist"
+
+[dashboard]
+metrics = []
+"#;
+
+        let result = parse_hand_definition(hand_toml, Some(agents_dir.as_path()));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("does-not-exist"),
+            "Error should mention the missing template name: {err}"
+        );
+    }
+
+    #[test]
+    fn base_template_without_agents_dir_errors() {
+        let hand_toml = r#"
+id = "no-dir-hand"
+name = "No Dir Hand"
+description = "Uses base without agents_dir"
+category = "content"
+tools = []
+
+[agents.main]
+coordinator = true
+base = "some-template"
+
+[dashboard]
+metrics = []
+"#;
+
+        // Without agents_dir, base resolution should fail.
+        let result = parse_hand_definition(hand_toml, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("agents registry directory"),
+            "Error should mention missing agents dir: {err}"
+        );
+    }
+
+    #[test]
+    fn no_base_backward_compatible() {
+        // Agents without `base` should parse identically to before.
+        let hand_toml = r#"
+id = "plain-hand"
+name = "Plain Hand"
+description = "No base used"
+category = "content"
+tools = []
+
+[agents.worker]
+coordinator = true
+name = "worker-agent"
+description = "Just a worker"
+system_prompt = "You work."
+
+[dashboard]
+metrics = []
+"#;
+        // Should succeed even without agents_dir.
+        let def = parse_hand_definition(hand_toml, None).unwrap();
+        assert_eq!(def.agents.len(), 1);
+        let worker = &def.agents["worker"];
+        assert!(worker.base.is_none());
+        assert_eq!(worker.manifest.name, "worker-agent");
     }
 }
