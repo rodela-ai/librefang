@@ -8779,6 +8779,7 @@ system_prompt = "You are a helpful assistant."
     /// If `capabilities.tools` is empty (or contains `"*"`), all tools are
     /// available (backwards compatible).
     fn available_tools(&self, agent_id: AgentId) -> Arc<Vec<ToolDefinition>> {
+        use librefang_types::capability::glob_matches;
         let cfg = self.config.load();
         // Check the tool list cache first — avoids recomputing builtins, skill tools,
         // and MCP tools on every message for the same agent.
@@ -8843,10 +8844,11 @@ system_prompt = "You are a helpful assistant."
         });
 
         let mut all_tools: Vec<ToolDefinition> = if !tools_unrestricted {
-            // Agent declares specific tools — only include matching builtins
+            // Agent declares specific tools — only include matching builtins.
+            // Supports glob patterns (e.g. "mcp_filesystem_*", "file_*").
             all_builtins
                 .into_iter()
-                .filter(|t| declared_tools.iter().any(|d| d == &t.name))
+                .filter(|t| declared_tools.iter().any(|d| glob_matches(d, &t.name)))
                 .collect()
         } else {
             // No specific tools declared — fall back to profile or all builtins
@@ -8881,8 +8883,13 @@ system_prompt = "You are a helpful assistant."
             }
         };
         for skill_tool in skill_tools {
-            // If agent declares specific tools, only include matching skill tools
-            if !tools_unrestricted && !declared_tools.iter().any(|d| d == &skill_tool.name) {
+            // If agent declares specific tools, only include matching skill tools.
+            // Supports glob patterns (e.g. "skill_*").
+            if !tools_unrestricted
+                && !declared_tools
+                    .iter()
+                    .any(|d| glob_matches(d, &skill_tool.name))
+            {
                 continue;
             }
             all_tools.push(ToolDefinition {
@@ -8924,8 +8931,9 @@ system_prompt = "You are a helpful assistant."
                     .collect()
             };
             for t in mcp_candidates {
-                // If agent declares specific tools, only include matching MCP tools
-                if !tools_unrestricted && !declared_tools.iter().any(|d| d == &t.name) {
+                // If agent declares specific tools, only include matching MCP tools.
+                // Supports glob patterns (e.g. "mcp_filesystem_*").
+                if !tools_unrestricted && !declared_tools.iter().any(|d| glob_matches(d, &t.name)) {
                     continue;
                 }
                 all_tools.push(t);
@@ -8945,10 +8953,10 @@ system_prompt = "You are a helpful assistant."
             .unwrap_or_default();
 
         if !tool_allowlist.is_empty() {
-            all_tools.retain(|t| tool_allowlist.iter().any(|a| a == &t.name));
+            all_tools.retain(|t| tool_allowlist.iter().any(|a| glob_matches(a, &t.name)));
         }
         if !tool_blocklist.is_empty() {
-            all_tools.retain(|t| !tool_blocklist.iter().any(|b| b == &t.name));
+            all_tools.retain(|t| !tool_blocklist.iter().any(|b| glob_matches(b, &t.name)));
         }
 
         // Step 5: Apply global tool_policy rules (deny/allow with glob patterns).
