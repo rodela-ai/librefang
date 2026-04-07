@@ -1804,7 +1804,9 @@ pub async fn totp_setup(
                     match state.kernel.vault_get("totp_secret") {
                         Some(secret) => {
                             librefang_kernel::approval::ApprovalManager::verify_totp_code_with_issuer(
-                                &secret, code, &totp_issuer,
+                                &secret,
+                                code,
+                                &totp_issuer,
                             )
                             .unwrap_or(false)
                         }
@@ -1823,7 +1825,10 @@ pub async fn totp_setup(
     }
 
     let (secret_base32, otpauth_uri, qr_base64) =
-        match librefang_kernel::approval::ApprovalManager::generate_totp_secret(&totp_issuer, "admin") {
+        match librefang_kernel::approval::ApprovalManager::generate_totp_secret(
+            &totp_issuer,
+            "admin",
+        ) {
             Ok(v) => v,
             Err(e) => {
                 return ApiErrorResponse::internal(e).into_json_tuple();
@@ -1937,7 +1942,7 @@ pub async fn totp_status(State(state): State<Arc<AppState>>) -> impl IntoRespons
     }))
 }
 
-/// DELETE /api/approvals/totp — Revoke TOTP enrollment.
+/// POST /api/approvals/totp/revoke — Revoke TOTP enrollment.
 ///
 /// Requires a valid TOTP or recovery code to authorize revocation.
 #[derive(serde::Deserialize)]

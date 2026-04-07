@@ -1200,9 +1200,14 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                             // Recovery code
                             match self.kernel.vault_get("totp_recovery_codes") {
                                 Some(stored) => {
-                                    match librefang_kernel::approval::ApprovalManager::verify_recovery_code(&stored, code) {
+                                    match librefang_kernel::approval::ApprovalManager::verify_recovery_code(
+                                        &stored,
+                                        code,
+                                    ) {
                                         Ok((true, updated)) => {
-                                            let _ = self.kernel.vault_set("totp_recovery_codes", &updated);
+                                            let _ = self
+                                                .kernel
+                                                .vault_set("totp_recovery_codes", &updated);
                                             true
                                         }
                                         Ok((false, _)) => {
@@ -1221,10 +1226,11 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                                 Some(s) => s,
                                 None => return "TOTP not configured. Set up TOTP first.".into(),
                             };
-                            let totp_issuer =
-                                self.kernel.approvals().policy().totp_issuer.clone();
+                            let totp_issuer = self.kernel.approvals().policy().totp_issuer.clone();
                             match librefang_kernel::approval::ApprovalManager::verify_totp_code_with_issuer(
-                                &secret, code, &totp_issuer,
+                                &secret,
+                                code,
+                                &totp_issuer,
                             ) {
                                 Ok(true) => true,
                                 Ok(false) => {

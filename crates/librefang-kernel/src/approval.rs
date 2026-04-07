@@ -104,7 +104,9 @@ impl ApprovalManager {
     /// Entries whose lockout window has already expired are discarded at load
     /// time so a daemon restart does not extend the lockout beyond the original
     /// 5-minute window.
-    fn load_totp_lockout(conn: &Arc<StdMutex<Connection>>) -> HashMap<String, (u32, Option<Instant>)> {
+    fn load_totp_lockout(
+        conn: &Arc<StdMutex<Connection>>,
+    ) -> HashMap<String, (u32, Option<Instant>)> {
         let Ok(guard) = conn.lock() else { return HashMap::new() };
         let Ok(mut stmt) = guard.prepare(
             "SELECT sender_id, failures, locked_at FROM totp_lockout",
