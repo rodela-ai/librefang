@@ -642,6 +642,76 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         Ok(agent_id)
     }
 
+    async fn get_agent_aliases(&self, agent_id: AgentId) -> Vec<String> {
+        self.kernel
+            .agent_registry()
+            .get(agent_id)
+            .map(|entry| {
+                entry
+                    .manifest
+                    .metadata
+                    .get("routing")
+                    .and_then(|r| r.get("aliases"))
+                    .and_then(|a| a.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn classify_reply_intent(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+    ) -> Result<bool, String> {
+        // Heuristic-based reply-intent classification (zero LLM cost).
+        //
+        // Full LLM classification (like ZeroClaw's classify_channel_reply_intent)
+        // requires a direct provider call without the agent loop, which librefang
+        // doesn't currently expose via ChannelBridgeHandle. Using send_message()
+        // or send_message_ephemeral() would be nearly as expensive as just
+        // replying — defeating the purpose of a lightweight precheck.
+        //
+        // This heuristic approach covers the common cases:
+        // - Messages containing a question mark → likely wants a response
+        // - Messages starting with a greeting → likely starting a conversation
+        // - Very short messages (< 5 chars) → probably not for the bot
+        // - Messages that are a reply to the bot → handled upstream (was_mentioned)
+        //
+        // Future: when librefang exposes a lightweight `provider.classify()`
+        // API, upgrade this to an actual LLM call.
+
+        let _ = agent_id; // Will be used when LLM classification is available
+        let trimmed = message.trim();
+
+        // Very short messages are usually not directed at the bot
+        if trimmed.len() < 5 {
+            return Ok(false);
+        }
+
+        // Questions are likely seeking a response
+        if trimmed.contains('?') {
+            return Ok(true);
+        }
+
+        // Messages starting with common greetings
+        let lower = trimmed.to_lowercase();
+        let greetings = [
+            "hola", "buenas", "hey", "hi", "hello", "buenos", "oye", "eh", "a ver", "mira",
+            "venga", "vale", "ok ", "help", "ayuda",
+        ];
+        if greetings.iter().any(|g| lower.starts_with(g)) {
+            return Ok(true);
+        }
+
+        // Default: don't reply to random group chatter
+        Ok(false)
+    }
+
     async fn uptime_info(&self) -> String {
         let uptime = self.started_at.elapsed();
         let agents = self.list_agents().await.unwrap_or_default();
