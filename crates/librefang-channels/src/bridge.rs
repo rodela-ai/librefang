@@ -348,6 +348,9 @@ pub trait ChannelBridgeHandle: Send + Sync {
 
     /// Lightweight LLM precheck: should the agent reply to this group message?
     ///
+    /// `context` contains recent conversation lines (e.g. the message being
+    /// replied to) so the classifier can detect continuations.
+    ///
     /// Returns `Ok(true)` → reply, `Ok(false)` → stay silent.
     /// On error the caller fails open (replies anyway).
     /// Default: always reply (opt-in via `reply_precheck = true` in channel config).
@@ -355,14 +358,33 @@ pub trait ChannelBridgeHandle: Send + Sync {
         &self,
         _agent_id: AgentId,
         _message: &str,
+        _context: Option<&str>,
     ) -> Result<bool, String> {
         Ok(true)
+    }
+
+    /// Read the custom precheck prompt from the agent's workspace
+    /// (`PRECHECK.md`). Returns `None` if the file doesn't exist.
+    async fn get_precheck_prompt(&self, _agent_id: AgentId) -> Option<String> {
+        None
     }
 
     /// Get the routing aliases for an agent (from `[metadata.routing].aliases`).
     /// Default: empty (no aliases).
     async fn get_agent_aliases(&self, _agent_id: AgentId) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Upsert a member into the persistent group roster (SQLite-backed).
+    async fn roster_upsert(
+        &self,
+        _channel: &str,
+        _chat_id: &str,
+        _user_id: &str,
+        _display_name: &str,
+        _username: Option<&str>,
+    ) {
+        // default no-op
     }
 }
 
@@ -1488,7 +1510,7 @@ fn build_sender_context(
             };
             let store = group_roster();
             store.upsert(&channel, cid, current);
-            store.members(&channel, cid)
+            Vec::new() // Roster is now tool-based, not injected into prompt
         } else {
             Vec::new()
         }
@@ -2216,9 +2238,23 @@ async fn dispatch_message(
                 );
             } else if let Some(ref ov) = overrides {
                 if ov.reply_precheck {
-                    // No mention, no alias — run LLM precheck
+                    // No mention, no alias — run LLM precheck.
+                    // Include reply-to context so the classifier can detect
+                    // conversation continuations (e.g. user replying to the bot).
+                    let reply_context: Option<String> =
+                        message.metadata.get("reply_to").and_then(|rt| {
+                            let sender = rt
+                                .get("sender")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("someone");
+                            let text = rt.get("text").and_then(|t| t.as_str())?;
+                            Some(format!("[Replying to {sender}: \"{text}\"]"))
+                        });
                     if let Some(text) = text_content(message) {
-                        match handle.classify_reply_intent(agent_id, text).await {
+                        match handle
+                            .classify_reply_intent(agent_id, text, reply_context.as_deref())
+                            .await
+                        {
                             Ok(true) => {
                                 debug!(channel = ct_str, "Reply-intent precheck: REPLY");
                             }
@@ -2305,6 +2341,21 @@ async fn dispatch_message(
 
     // Build sender context to propagate identity to the agent
     let sender_ctx = build_sender_context(message, overrides.as_ref());
+
+    // Persist roster member to SQLite
+    if message.is_group {
+        if let Some(ref cid) = sender_ctx.chat_id {
+            handle
+                .roster_upsert(
+                    ct_str,
+                    cid,
+                    &sender_ctx.user_id,
+                    &sender_ctx.display_name,
+                    sender_ctx.sender_username.as_deref(),
+                )
+                .await;
+        }
+    }
 
     // Streaming path: if the adapter supports progressive output, pipe text
     // deltas directly to it instead of waiting for the full response.
@@ -2816,6 +2867,21 @@ async fn dispatch_with_blocks(
 
     // Build sender context to propagate identity to the agent
     let sender_ctx = build_sender_context(message, overrides);
+
+    // Persist roster member to SQLite
+    if message.is_group {
+        if let Some(ref cid) = sender_ctx.chat_id {
+            handle
+                .roster_upsert(
+                    ct_str,
+                    cid,
+                    &sender_ctx.user_id,
+                    &sender_ctx.display_name,
+                    sender_ctx.sender_username.as_deref(),
+                )
+                .await;
+        }
+    }
 
     match handle
         .send_message_with_blocks_and_sender(agent_id, blocks.clone(), &sender_ctx)

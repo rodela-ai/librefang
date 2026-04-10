@@ -663,14 +663,32 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             .unwrap_or_default()
     }
 
+    async fn roster_upsert(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        user_id: &str,
+        display_name: &str,
+        username: Option<&str>,
+    ) {
+        use librefang_runtime::kernel_handle::KernelHandle;
+        let _ = self
+            .kernel
+            .roster_upsert(channel, chat_id, user_id, display_name, username);
+    }
+
     async fn classify_reply_intent(
         &self,
         agent_id: AgentId,
         message: &str,
+        context: Option<&str>,
     ) -> Result<bool, String> {
-        // Lightweight LLM classification via kernel.classify_text() — calls the
-        // agent's LLM driver directly without the agent loop. ~100-200 tokens.
-        const CLASSIFY_SYSTEM: &str = "\
+        // Use the agent's custom PRECHECK.md prompt if it exists, otherwise a
+        // sensible default.  This lets operators tune sensitivity per-agent
+        // without recompiling.
+        let custom_prompt = self.get_precheck_prompt(agent_id).await;
+
+        const DEFAULT_SYSTEM: &str = "\
             Decide whether the assistant should reply to this group chat message.\n\
             Return exactly one word: REPLY or NO_REPLY.\n\n\
             Rules:\n\
@@ -680,9 +698,18 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
               the assistant → NO_REPLY\n\
             - When in doubt, prefer NO_REPLY to avoid being noisy.";
 
+        let system = custom_prompt.as_deref().unwrap_or(DEFAULT_SYSTEM);
+
+        // Build the user message, optionally prepending conversation context
+        // so the classifier can detect replies/continuations.
+        let user_msg = match context {
+            Some(ctx) => format!("{ctx}\n\n{message}"),
+            None => message.to_string(),
+        };
+
         match self
             .kernel
-            .classify_text(agent_id, CLASSIFY_SYSTEM, message, 10)
+            .classify_text(agent_id, system, &user_msg, 10)
             .await
         {
             Ok(response) => {
@@ -695,6 +722,10 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                     error = %e,
                     "LLM reply-intent classification failed — falling back to heuristic"
                 );
+                // If replying to the bot, always respond
+                if context.is_some() {
+                    return Ok(true);
+                }
                 let trimmed = message.trim();
                 if trimmed.len() < 5 {
                     return Ok(false);
@@ -707,6 +738,14 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                 Ok(greetings.iter().any(|g| lower.starts_with(g)))
             }
         }
+    }
+
+    async fn get_precheck_prompt(&self, agent_id: AgentId) -> Option<String> {
+        let registry = self.kernel.agent_registry();
+        let entry = registry.get(agent_id)?;
+        let workspace = entry.manifest.workspace.as_ref()?;
+        let path = workspace.join("PRECHECK.md");
+        tokio::fs::read_to_string(&path).await.ok()
     }
 
     async fn uptime_info(&self) -> String {
