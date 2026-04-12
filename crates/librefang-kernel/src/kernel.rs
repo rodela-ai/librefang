@@ -6533,13 +6533,17 @@ system_prompt = "You are a helpful assistant."
         let repairs = repair_stats.orphaned_results_removed
             + repair_stats.synthetic_results_inserted
             + repair_stats.duplicates_removed
-            + repair_stats.messages_merged;
+            + repair_stats.messages_merged
+            + repair_stats.positional_synthetic_inserted
+            + repair_stats.misplaced_results_ignored;
         if repairs > 0 {
-            msg.push_str(&format!(" Post-audit: repaired ({} orphaned removed, {} synthetic inserted, {} merged, {} deduped).",
+            msg.push_str(&format!(" Post-audit: repaired ({} orphaned removed, {} synthetic inserted, {} merged, {} deduped, {} positional synthetic inserted, {} misplaced ignored).",
                 repair_stats.orphaned_results_removed,
                 repair_stats.synthetic_results_inserted,
                 repair_stats.messages_merged,
                 repair_stats.duplicates_removed,
+                repair_stats.positional_synthetic_inserted,
+                repair_stats.misplaced_results_ignored,
             ));
         } else {
             msg.push_str(" Post-audit: clean.");

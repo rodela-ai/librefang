@@ -31,6 +31,12 @@ pub struct RepairStats {
     pub synthetic_results_inserted: usize,
     /// Number of duplicate ToolResults removed.
     pub duplicates_removed: usize,
+    /// Number of synthetic error results inserted by the positional
+    /// Phase 2f pair-aware check (distinct from Phase 2c `synthetic_results_inserted`).
+    pub positional_synthetic_inserted: usize,
+    /// Number of ToolResult blocks found inside assistant-role messages
+    /// and ignored (they are not honored as satisfying tool_call_ids).
+    pub misplaced_results_ignored: usize,
 }
 
 /// Validate and repair a message history for LLM consumption.
@@ -38,6 +44,7 @@ pub struct RepairStats {
 /// This ensures the message list is well-formed:
 /// 1. Drops orphaned ToolResult blocks that have no matching ToolUse
 /// 2. Drops empty messages
+///    - 2a1. Pair-aware positional validation (MUST run before 2b/2c/2d/2e)
 ///    - 2b. Reorders misplaced ToolResults to follow their matching ToolUse
 ///    - 2c. Inserts synthetic error results for unmatched ToolUse blocks
 ///    - 2d. Deduplicates ToolResults with the same tool_use_id
@@ -115,6 +122,16 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
         });
     }
 
+    // Phase 2a1: Pair-aware positional validation of assistant tool_calls
+    // against the immediately-following user tool_results. This is the
+    // strict Moonshot/OpenAI wire contract and MUST run before Phases
+    // 2b/2c/2d/2e so it sees the raw pre-repair shape. The later phases
+    // become safety nets that usually find nothing to do.
+    let (positional_synthetic, misplaced_ignored) =
+        enforce_adjacent_tool_result_pairs(&mut cleaned);
+    stats.positional_synthetic_inserted = positional_synthetic;
+    stats.misplaced_results_ignored = misplaced_ignored;
+
     // Phase 2b: Reorder misplaced ToolResults
     let reordered_count = reorder_tool_results(&mut cleaned);
     stats.results_reordered = reordered_count;
@@ -172,6 +189,8 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
             reordered = stats.results_reordered,
             synthetic = stats.synthetic_results_inserted,
             duplicates = stats.duplicates_removed,
+            positional_synthetic = stats.positional_synthetic_inserted,
+            misplaced_ignored = stats.misplaced_results_ignored,
             "Session repair applied fixes"
         );
     }
@@ -192,7 +211,9 @@ fn reorder_tool_results(messages: &mut Vec<Message>) -> usize {
             if let MessageContent::Blocks(blocks) = &msg.content {
                 for block in blocks {
                     if let ContentBlock::ToolUse { id, .. } = block {
-                        tool_use_index.insert(id.clone(), idx);
+                        // Use first occurrence: duplicate ids across turns should
+                        // map to their earliest assistant position.
+                        tool_use_index.entry(id.clone()).or_insert(idx);
                     }
                 }
             }
@@ -415,12 +436,183 @@ fn insert_synthetic_results(messages: &mut Vec<Message>) -> usize {
     count
 }
 
+/// Phase 2f: Pair-aware positional validation of assistant `ToolUse` blocks.
+///
+/// For each assistant message that contains `ToolUse` blocks, verify that the
+/// IMMEDIATELY FOLLOWING user message contains a `ToolResult` for every
+/// `tool_use_id`. Any `tool_use_id` that is missing from that adjacent user
+/// message receives a synthetic error result, regardless of whether some other
+/// position in the history happens to contain a result with the same id. This
+/// models the strict Moonshot/OpenAI wire contract (and is resilient to
+/// `tool_call_id` collisions across turns, which Phase 2c's flat set check is
+/// not).
+///
+/// Additionally, any `ToolResult` block found inside an assistant-role message
+/// is counted as "misplaced" and ignored for satisfaction purposes (those
+/// blocks never reach the driver because of how the driver serializes
+/// assistant messages).
+///
+/// Returns `(positional_synthetic_inserted, misplaced_results_ignored)`.
+fn enforce_adjacent_tool_result_pairs(messages: &mut Vec<Message>) -> (usize, usize) {
+    // First pass (read-only): tally misplaced ToolResults living inside
+    // assistant-role blocks. They are noise.
+    let mut misplaced_ignored: usize = 0;
+    for msg in messages.iter() {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        if let MessageContent::Blocks(bs) = &msg.content {
+            for block in bs {
+                if matches!(block, ContentBlock::ToolResult { .. }) {
+                    misplaced_ignored += 1;
+                }
+            }
+        }
+    }
+
+    // Second pass: for each assistant with ToolUse blocks, check the
+    // IMMEDIATELY FOLLOWING message for satisfaction. Missing ids get
+    // a synthetic inserted in the adjacent user (or a new user is inserted
+    // / appended as needed).
+    let mut positional_synthetic: usize = 0;
+    let mut i: usize = 0;
+    while i < messages.len() {
+        // Extract tool_use_ids from this message if it's an assistant with uses.
+        let ids_needed: Vec<String> = match (&messages[i].role, &messages[i].content) {
+            (Role::Assistant, MessageContent::Blocks(blocks)) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        if ids_needed.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Collect tool_use_ids from the adjacent (i+1) user message, if any.
+        let adjacent_results: HashSet<String> = messages
+            .get(i + 1)
+            .filter(|m| m.role == Role::User)
+            .and_then(|m| match &m.content {
+                MessageContent::Blocks(bs) => Some(
+                    bs.iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::ToolResult { tool_use_id, .. } => {
+                                Some(tool_use_id.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect::<HashSet<String>>(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        let missing: Vec<String> = ids_needed
+            .into_iter()
+            .filter(|id| !adjacent_results.contains(id))
+            .collect();
+
+        if missing.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let missing_count = missing.len();
+        let synthetic_blocks: Vec<ContentBlock> = missing
+            .into_iter()
+            .map(|id| ContentBlock::ToolResult {
+                tool_use_id: id,
+                tool_name: String::new(),
+                content: "[Tool execution was interrupted or lost]".to_string(),
+                is_error: true,
+                status: ToolExecutionStatus::Error,
+                approval_request_id: None,
+            })
+            .collect();
+
+        if i + 1 < messages.len() {
+            if messages[i + 1].role == Role::User {
+                // Amend the adjacent user: either extend its Blocks, or upgrade
+                // its Text content to Blocks with the original text preserved.
+                let next = &mut messages[i + 1];
+                match &mut next.content {
+                    MessageContent::Blocks(bs) => {
+                        bs.extend(synthetic_blocks);
+                    }
+                    MessageContent::Text(_) => {
+                        let old = std::mem::replace(
+                            &mut next.content,
+                            MessageContent::Text(String::new()),
+                        );
+                        let mut new_blocks = content_to_blocks(old);
+                        new_blocks.extend(synthetic_blocks);
+                        next.content = MessageContent::Blocks(new_blocks);
+                    }
+                }
+            } else {
+                // Next message is not a User — insert a new user message
+                // immediately after this assistant.
+                messages.insert(
+                    i + 1,
+                    Message {
+                        role: Role::User,
+                        content: MessageContent::Blocks(synthetic_blocks),
+                        pinned: false,
+                    },
+                );
+            }
+        } else {
+            // Tail of history — append a new user message.
+            messages.push(Message {
+                role: Role::User,
+                content: MessageContent::Blocks(synthetic_blocks),
+                pinned: false,
+            });
+        }
+
+        positional_synthetic += missing_count;
+        // Skip the user we just amended/inserted.
+        i += 2;
+    }
+
+    (positional_synthetic, misplaced_ignored)
+}
+
 /// Phase 2d: Drop duplicate ToolResults for the same tool_use_id.
 ///
 /// If multiple ToolResult blocks exist for the same tool_use_id across the
 /// message history, keep the strongest result so approval placeholders can be
 /// replaced by their later terminal outcome. Returns the count of duplicates removed.
 fn deduplicate_tool_results(messages: &mut Vec<Message>) -> usize {
+    // Ids that appear in more than one assistant turn are positional duplicates
+    // (e.g. Moonshot reuses per-completion counters like `schedule_delete:6`).
+    // Deduplicating them globally would remove legitimate per-turn results, so
+    // we skip dedup for any id that is used by multiple assistant messages.
+    let mut tool_use_turn_count: HashMap<String, usize> = HashMap::new();
+    for msg in messages.iter() {
+        if msg.role != Role::Assistant {
+            continue;
+        }
+        if let MessageContent::Blocks(blocks) = &msg.content {
+            for block in blocks {
+                if let ContentBlock::ToolUse { id, .. } = block {
+                    *tool_use_turn_count.entry(id.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let collision_ids: HashSet<String> = tool_use_turn_count
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(id, _)| id)
+        .collect();
+
     let mut kept_results: HashMap<String, ToolExecutionStatus> = HashMap::new();
 
     for msg in messages.iter() {
@@ -432,6 +624,9 @@ fn deduplicate_tool_results(messages: &mut Vec<Message>) -> usize {
                     ..
                 } = block
                 {
+                    if collision_ids.contains(tool_use_id) {
+                        continue;
+                    }
                     kept_results
                         .entry(tool_use_id.clone())
                         .and_modify(|kept_status| {
@@ -458,6 +653,10 @@ fn deduplicate_tool_results(messages: &mut Vec<Message>) -> usize {
                     ..
                 } = b
                 {
+                    // Never dedup results whose id is shared across multiple turns.
+                    if collision_ids.contains(tool_use_id) {
+                        return true;
+                    }
                     let keep_status = kept_results.get(tool_use_id).copied().unwrap_or(*status);
                     if seen_ids.contains(tool_use_id) || *status != keep_status {
                         return false;
@@ -991,7 +1190,10 @@ mod tests {
         ];
 
         let (repaired, stats) = validate_and_repair_with_stats(&messages);
-        assert_eq!(stats.synthetic_results_inserted, 1);
+        assert!(
+            stats.synthetic_results_inserted + stats.positional_synthetic_inserted >= 1,
+            "expected at least one synthetic result (phase 2a1 or 2c)"
+        );
 
         // Find the synthetic result
         let has_synthetic = repaired.iter().any(|m| match &m.content {
@@ -1258,7 +1460,10 @@ mod tests {
 
         // Should have: removed orphan, removed empty, inserted synthetic for tu-b
         assert_eq!(stats.orphaned_results_removed, 1, "ghost result removed");
-        assert_eq!(stats.synthetic_results_inserted, 1, "tu-b gets synthetic");
+        assert!(
+            stats.synthetic_results_inserted + stats.positional_synthetic_inserted >= 1,
+            "tu-b gets synthetic (phase 2a1 or 2c)"
+        );
         assert!(stats.empty_messages_removed >= 1, "empty message removed");
 
         // Verify tu-b has a synthetic result somewhere
@@ -1278,6 +1483,368 @@ mod tests {
                 window[0].role, window[1].role
             );
         }
+    }
+
+    // --- Phase 2f (pair-aware positional validation) tests ---
+
+    fn tool_use_block(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "dummy_tool".to_string(),
+            input: serde_json::json!({}),
+            provider_metadata: None,
+        }
+    }
+
+    fn tool_result_block(id: &str, content: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            tool_name: String::new(),
+            content: content.to_string(),
+            is_error: false,
+            status: ToolExecutionStatus::default(),
+            approval_request_id: None,
+        }
+    }
+
+    /// For a given message, does its Blocks content satisfy `tool_use_id` with
+    /// a synthetic error result (is_error=true and content contains the
+    /// "interrupted or lost" marker)?
+    fn has_synthetic_result_for(msg: &Message, tool_use_id: &str) -> bool {
+        match &msg.content {
+            MessageContent::Blocks(blocks) => blocks.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolResult {
+                        tool_use_id: id,
+                        is_error: true,
+                        content,
+                        ..
+                    } if id == tool_use_id && content.contains("interrupted")
+                )
+            }),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn pair_aware_emits_synthetic_for_missing_result_in_adjacent_user() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![tool_use_block("A")]),
+                pinned: false,
+            },
+            Message::user("hi"),
+        ];
+
+        let (repaired, stats) = validate_and_repair_with_stats(&messages);
+        assert_eq!(stats.positional_synthetic_inserted, 1);
+
+        // After repair, the user message immediately following the assistant
+        // must contain a synthetic ToolResult for "A".
+        let asst_idx = repaired
+            .iter()
+            .position(|m| m.role == Role::Assistant)
+            .expect("assistant message present");
+        let next = repaired
+            .get(asst_idx + 1)
+            .expect("user message following assistant");
+        assert_eq!(next.role, Role::User);
+        assert!(
+            has_synthetic_result_for(next, "A"),
+            "adjacent user should contain synthetic for A"
+        );
+    }
+
+    #[test]
+    fn pair_aware_ignores_tool_result_in_assistant_blocks() {
+        // We need "B" to be a valid tool_use_id so Phase 1 does not drop the
+        // ToolResult as orphaned. Plant a prior assistant with ToolUse "B".
+        // Then a second assistant misuses its blocks: [ToolUse A, ToolResult B].
+        // Phase 2f should (a) count the misplaced ToolResult B, and (b) emit a
+        // synthetic for A in the following user message.
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![tool_use_block("B")]),
+                pinned: false,
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![tool_result_block("B", "ok")]),
+                pinned: false,
+            },
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![
+                    tool_use_block("A"),
+                    tool_result_block("B", "stray"),
+                ]),
+                pinned: false,
+            },
+            Message::user("hi"),
+        ];
+
+        let (repaired, stats) = validate_and_repair_with_stats(&messages);
+        assert_eq!(
+            stats.misplaced_results_ignored, 1,
+            "ToolResult inside assistant blocks must be counted as misplaced"
+        );
+        assert_eq!(
+            stats.positional_synthetic_inserted, 1,
+            "A needs a positional synthetic"
+        );
+
+        // Locate the SECOND assistant (the one with ToolUse A) and its
+        // immediately-following user.
+        let asst_a_idx = repaired
+            .iter()
+            .enumerate()
+            .find_map(|(idx, m)| {
+                if m.role == Role::Assistant {
+                    if let MessageContent::Blocks(bs) = &m.content {
+                        if bs.iter().any(|b| {
+                            matches!(
+                                b,
+                                ContentBlock::ToolUse { id, .. } if id == "A"
+                            )
+                        }) {
+                            return Some(idx);
+                        }
+                    }
+                }
+                None
+            })
+            .expect("assistant with ToolUse A present");
+        let next = repaired
+            .get(asst_a_idx + 1)
+            .expect("user message following assistant A");
+        assert!(
+            has_synthetic_result_for(next, "A"),
+            "A should have synthetic in adjacent user"
+        );
+    }
+
+    #[test]
+    fn pair_aware_handles_id_collision_across_turns() {
+        // ⭐ Red→green gate: Moonshot reuses per-completion counters like
+        // `schedule_delete:6` across turns. History:
+        //   [asst[ToolUse :6], user[ToolResult :6],
+        //    asst[ToolUse :6], user[Text "ok"]]
+        // The SECOND `:6` has no adjacent ToolResult, even though the FIRST
+        // `:6` is satisfied. Flat-set Phase 2c would miss this; Phase 2f
+        // evaluates each pair positionally.
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![tool_use_block(":6")]),
+                pinned: false,
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![tool_result_block(":6", "first")]),
+                pinned: false,
+            },
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![tool_use_block(":6")]),
+                pinned: false,
+            },
+            Message::user("ok"),
+        ];
+
+        let (repaired, stats) = validate_and_repair_with_stats(&messages);
+        assert_eq!(
+            stats.positional_synthetic_inserted, 1,
+            "second :6 must get a positional synthetic"
+        );
+
+        // Collect assistant indices with ToolUse :6.
+        let assistant_positions: Vec<usize> = repaired
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, m)| {
+                if m.role == Role::Assistant {
+                    if let MessageContent::Blocks(bs) = &m.content {
+                        if bs.iter().any(|b| {
+                            matches!(
+                                b,
+                                ContentBlock::ToolUse { id, .. } if id == ":6"
+                            )
+                        }) {
+                            return Some(idx);
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+        assert_eq!(
+            assistant_positions.len(),
+            2,
+            "both assistant turns should survive repair"
+        );
+
+        // The SECOND assistant's adjacent user must carry the synthetic.
+        let second_asst_idx = assistant_positions[1];
+        let next = repaired
+            .get(second_asst_idx + 1)
+            .expect("user message following second :6 assistant");
+        assert!(
+            has_synthetic_result_for(next, ":6"),
+            "second :6 turn must be backed by a synthetic in the adjacent user"
+        );
+
+        // The FIRST assistant's adjacent user must still carry the ORIGINAL
+        // (non-error) result content "first".
+        let first_asst_idx = assistant_positions[0];
+        let first_next = repaired
+            .get(first_asst_idx + 1)
+            .expect("user message following first :6 assistant");
+        let has_first_real = match &first_next.content {
+            MessageContent::Blocks(blocks) => blocks.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        is_error: false,
+                        content,
+                        ..
+                    } if tool_use_id == ":6" && content == "first"
+                )
+            }),
+            _ => false,
+        };
+        assert!(
+            has_first_real,
+            "first :6 turn's original result must be preserved untouched"
+        );
+    }
+
+    #[test]
+    fn pair_aware_handles_mixed_blocks_assistant() {
+        // Assistant emits two ToolUses [A, B] but user only answers A.
+        // B must receive a positional synthetic; A must be untouched.
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![tool_use_block("A"), tool_use_block("B")]),
+                pinned: false,
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![tool_result_block("A", "ok-A")]),
+                pinned: false,
+            },
+        ];
+
+        let (repaired, stats) = validate_and_repair_with_stats(&messages);
+        assert_eq!(stats.positional_synthetic_inserted, 1);
+
+        let asst_idx = repaired
+            .iter()
+            .position(|m| m.role == Role::Assistant)
+            .expect("assistant present");
+        let next = repaired
+            .get(asst_idx + 1)
+            .expect("user present after assistant");
+        assert_eq!(next.role, Role::User);
+        assert!(has_synthetic_result_for(next, "B"), "B needs synthetic");
+
+        // A's real result must still be present and NOT be a synthetic error.
+        let has_real_a = match &next.content {
+            MessageContent::Blocks(blocks) => blocks.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        is_error: false,
+                        content,
+                        ..
+                    } if tool_use_id == "A" && content == "ok-A"
+                )
+            }),
+            _ => false,
+        };
+        assert!(has_real_a, "A's original result must remain untouched");
+    }
+
+    #[test]
+    fn pair_aware_stats_accuracy() {
+        // Clean history: both new stats remain zero.
+        let clean = vec![
+            Message::user("hello"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![tool_use_block("t1")]),
+                pinned: false,
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![tool_result_block("t1", "done")]),
+                pinned: false,
+            },
+            Message::assistant("ok"),
+        ];
+        let (_clean_repaired, clean_stats) = validate_and_repair_with_stats(&clean);
+        assert_eq!(clean_stats.positional_synthetic_inserted, 0);
+        assert_eq!(clean_stats.misplaced_results_ignored, 0);
+
+        // Corrupt history: assistant with ToolUse, no result in adjacent user.
+        let corrupt = vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![tool_use_block("A")]),
+                pinned: false,
+            },
+            Message::user("hi"),
+        ];
+        let (_corrupt_repaired, corrupt_stats) = validate_and_repair_with_stats(&corrupt);
+        assert!(corrupt_stats.positional_synthetic_inserted > 0);
+    }
+
+    #[test]
+    fn pair_aware_no_adjacent_user_inserts_new() {
+        // Only an assistant with a ToolUse at the tail — no following message
+        // at all. Phase 2f must push a new synthetic user message.
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![tool_use_block("A")]),
+            pinned: false,
+        }];
+
+        let (repaired, stats) = validate_and_repair_with_stats(&messages);
+        assert_eq!(stats.positional_synthetic_inserted, 1);
+        assert_eq!(repaired.len(), 2);
+        assert_eq!(repaired[0].role, Role::Assistant);
+        assert_eq!(repaired[1].role, Role::User);
+        assert!(has_synthetic_result_for(&repaired[1], "A"));
+    }
+
+    #[test]
+    fn pair_aware_assistant_followed_by_assistant() {
+        // [asst[ToolUse A], asst[Text "hola"]]: the second message is NOT a
+        // user, so Phase 2f must INSERT a new user message between them with
+        // a synthetic for A.
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![tool_use_block("A")]),
+                pinned: false,
+            },
+            Message::assistant("hola"),
+        ];
+
+        let (repaired, stats) = validate_and_repair_with_stats(&messages);
+        assert_eq!(stats.positional_synthetic_inserted, 1);
+
+        // After repair: assistant(ToolUse A), user(synthetic A), assistant("hola")
+        assert_eq!(repaired.len(), 3);
+        assert_eq!(repaired[0].role, Role::Assistant);
+        assert_eq!(repaired[1].role, Role::User);
+        assert_eq!(repaired[2].role, Role::Assistant);
+        assert!(has_synthetic_result_for(&repaired[1], "A"));
     }
 
     #[test]
