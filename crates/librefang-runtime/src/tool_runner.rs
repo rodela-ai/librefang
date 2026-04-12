@@ -1346,7 +1346,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "name": { "type": "string", "description": "Job name (max 128 chars, alphanumeric + spaces/hyphens/underscores)" },
                     "schedule": {
                         "type": "object",
-                        "description": "Schedule: {\"kind\":\"at\",\"at\":\"2025-01-01T00:00:00Z\"} or {\"kind\":\"every\",\"every_secs\":300} or {\"kind\":\"cron\",\"expr\":\"0 */6 * * *\"}"
+                        "description": "Schedule. One of:\n- {\"kind\":\"at\",\"at\":\"2025-01-01T00:00:00Z\"} — one-shot at a UTC timestamp (tz not applicable).\n- {\"kind\":\"every\",\"every_secs\":300} — recurring every N seconds (tz not applicable).\n- {\"kind\":\"cron\",\"expr\":\"0 */6 * * *\",\"tz\":\"Europe/Madrid\"} — 5-field cron expression. REQUIRED: set `tz` to an IANA timezone name (e.g. \"Europe/Madrid\", \"America/New_York\", \"Asia/Tokyo\") so the expression is interpreted in the user's local wall-clock time. If the user explicitly asked for UTC, set `tz` to \"UTC\". If you do not know the user's timezone, ASK THEM before calling this tool — cron_create will reject cron schedules without a tz."
                     },
                     "action": {
                         "type": "object",
@@ -2763,6 +2763,54 @@ async fn tool_schedule_delete(
 // Cron scheduling tools (delegated to kernel via KernelHandle trait)
 // ---------------------------------------------------------------------------
 
+/// Validate the `schedule` field of a `cron_create` input before forwarding
+/// it to the kernel. The only validation performed here is to require an
+/// explicit `tz` field whenever `schedule.kind == "cron"`.
+///
+/// This guards against the LLM-side bug where a model emits a cron expression
+/// in the user's local wall-clock time (e.g. "18:30 Madrid") but omits the
+/// timezone, which the scheduler then interprets as UTC and fires at the wrong
+/// hour. By rejecting tz-less cron schedules at the tool boundary we force the
+/// LLM to either supply the IANA tz, set "UTC" intentionally, or ask the user.
+///
+/// Schedules with `kind == "at"` or `kind == "every"` are not affected — `at`
+/// already takes a timezone-anchored RFC3339 timestamp, and `every` is a pure
+/// duration.
+///
+/// The string contents of `tz` are *not* validated here (that's the
+/// scheduler's job via `chrono_tz::Tz::from_str`); we only check that the
+/// field is present and non-empty.
+fn validate_cron_schedule_input(input: &serde_json::Value) -> Result<(), String> {
+    let Some(schedule) = input.get("schedule") else {
+        // Missing schedule entirely is the kernel's problem (the JSON schema
+        // marks `schedule` as required and the kernel will return its own
+        // error). We only enforce the tz rule here.
+        return Ok(());
+    };
+    let kind = schedule.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if kind != "cron" {
+        return Ok(());
+    }
+    let tz_present_and_nonempty = schedule
+        .get("tz")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    if tz_present_and_nonempty {
+        return Ok(());
+    }
+    let expr = schedule
+        .get("expr")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<missing expr>");
+    Err(format!(
+        "cron_create validation error: cron schedule 'expr={expr}' requires an explicit `tz` field. \
+         If the user referred to local wall-clock time, set `schedule.tz` to an IANA timezone \
+         (examples: \"Europe/Madrid\", \"America/New_York\", \"Asia/Tokyo\"). \
+         If the user explicitly asked for UTC, set `schedule.tz` to \"UTC\" to confirm. \
+         If you do not know the user's timezone, ask them in a reply before calling cron_create again."
+    ))
+}
+
 async fn tool_cron_create(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
@@ -2772,6 +2820,9 @@ async fn tool_cron_create(
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let agent_id = caller_agent_id.ok_or("Agent ID required for cron_create")?;
+    // Reject cron schedules without an explicit tz before touching the kernel,
+    // so the structured error reaches the LLM and it can self-correct.
+    validate_cron_schedule_input(input)?;
     // Auto-inject delivery from sender context if not already specified in input
     let mut job = input.clone();
     if !job.get("delivery").is_some_and(|d| d.is_object()) {
@@ -6339,5 +6390,133 @@ mod tests {
         ) -> Result<Vec<librefang_types::memory::GraphMatch>, String> {
             Err("not used".to_string())
         }
+    }
+
+    // -----------------------------------------------------------------
+    // cron_create tz validation (issue #2352)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cron_create_with_explicit_tz_passes_validation() {
+        let input = serde_json::json!({
+            "name": "evening reminder",
+            "schedule": {
+                "kind": "cron",
+                "expr": "30 18 * * 1,2,3",
+                "tz": "Europe/Madrid"
+            },
+            "action": { "kind": "system_event", "text": "ping" }
+        });
+        assert!(validate_cron_schedule_input(&input).is_ok());
+    }
+
+    #[test]
+    fn cron_create_without_tz_returns_structured_error() {
+        let input = serde_json::json!({
+            "name": "evening reminder",
+            "schedule": {
+                "kind": "cron",
+                "expr": "30 18 * * 1,2,3"
+            },
+            "action": { "kind": "system_event", "text": "ping" }
+        });
+        let err = validate_cron_schedule_input(&input).expect_err("missing tz must error");
+        assert!(err.contains("IANA"), "error must mention IANA: {err}");
+        assert!(
+            err.contains("timezone"),
+            "error must mention timezone: {err}"
+        );
+        assert!(
+            err.contains("Europe/Madrid"),
+            "error must give an IANA example like Europe/Madrid: {err}"
+        );
+        assert!(
+            err.contains("30 18 * * 1,2,3"),
+            "error should echo the offending cron expr: {err}"
+        );
+    }
+
+    #[test]
+    fn cron_create_with_null_tz_returns_structured_error() {
+        let input = serde_json::json!({
+            "name": "evening reminder",
+            "schedule": {
+                "kind": "cron",
+                "expr": "30 18 * * 1,2,3",
+                "tz": serde_json::Value::Null
+            },
+            "action": { "kind": "system_event", "text": "ping" }
+        });
+        let err = validate_cron_schedule_input(&input).expect_err("null tz must error");
+        assert!(err.contains("IANA"), "error must mention IANA: {err}");
+        assert!(
+            err.contains("Europe/Madrid"),
+            "error must give an IANA example: {err}"
+        );
+    }
+
+    #[test]
+    fn cron_create_with_empty_string_tz_returns_error() {
+        let input = serde_json::json!({
+            "name": "evening reminder",
+            "schedule": {
+                "kind": "cron",
+                "expr": "0 9 * * *",
+                "tz": ""
+            },
+            "action": { "kind": "system_event", "text": "ping" }
+        });
+        let err = validate_cron_schedule_input(&input).expect_err("empty tz must error");
+        assert!(err.contains("IANA"), "error must mention IANA: {err}");
+    }
+
+    #[test]
+    fn cron_create_with_at_schedule_no_tz_required() {
+        let input = serde_json::json!({
+            "name": "one shot",
+            "schedule": {
+                "kind": "at",
+                "at": "2025-01-01T00:00:00Z"
+            },
+            "action": { "kind": "system_event", "text": "ping" }
+        });
+        assert!(validate_cron_schedule_input(&input).is_ok());
+    }
+
+    #[test]
+    fn cron_create_with_every_schedule_no_tz_required() {
+        let input = serde_json::json!({
+            "name": "heartbeat",
+            "schedule": {
+                "kind": "every",
+                "every_secs": 300
+            },
+            "action": { "kind": "system_event", "text": "ping" }
+        });
+        assert!(validate_cron_schedule_input(&input).is_ok());
+    }
+
+    #[test]
+    fn cron_create_schema_documents_tz_requirement() {
+        let tools = builtin_tool_definitions();
+        let cron_create = tools
+            .iter()
+            .find(|t| t.name == "cron_create")
+            .expect("cron_create tool must exist");
+        let schedule_desc = cron_create.input_schema["properties"]["schedule"]["description"]
+            .as_str()
+            .expect("schedule description must be a string");
+        assert!(
+            schedule_desc.contains("IANA"),
+            "schedule description must mention IANA: {schedule_desc}"
+        );
+        assert!(
+            schedule_desc.contains("Europe/Madrid"),
+            "schedule description must give an IANA example: {schedule_desc}"
+        );
+        assert!(
+            schedule_desc.contains("tz"),
+            "schedule description must mention the tz field: {schedule_desc}"
+        );
     }
 }
