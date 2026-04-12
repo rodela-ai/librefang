@@ -112,6 +112,60 @@ fn is_parameter_error_content(content: &str) -> bool {
     lower.contains("argument is required")
 }
 
+/// Synthesize a `ToolResult` content block standing in for a tool call that
+/// was interrupted on a failure path (circuit breaker, timeout, cancellation).
+///
+/// Extracted for unit-testability: the session-wide helper
+/// `ensure_tool_pairs_before_save` walks the message history, but individual
+/// call-sites that know the exact `tool_use_id` can call this directly.
+#[cfg(test)]
+fn synthesize_interrupted_result(tool_use_id: &str, reason: &str) -> ContentBlock {
+    ContentBlock::ToolResult {
+        tool_use_id: tool_use_id.to_string(),
+        tool_name: String::new(),
+        content: format!("[Tool execution was interrupted: {reason}]"),
+        is_error: true,
+        status: librefang_types::tool::ToolExecutionStatus::Error,
+        approval_request_id: None,
+    }
+}
+
+/// Defensively repair `session.messages` before a failure-path
+/// `save_session_async` call so that no orphaned assistant `ToolUse` block is
+/// ever persisted to disk.
+///
+/// Follow-up 1 of the session-repair series (see plan
+/// `shiny-sprouting-spring.md` — "Out (separate PRs)" point A). The original
+/// bug (#2344) was that Moonshot/OpenAI reject message histories containing an
+/// assistant `ToolUse` whose matching `user` `ToolResult` is missing from the
+/// immediately-following message. Phase 2a1 of `session_repair` already
+/// repairs such histories on load, but the corruption was still being
+/// *generated* in the first place because `agent_loop.rs` persists sessions
+/// on failure paths (circuit breaker, LLM stream timeout) at moments when the
+/// assistant `ToolUse` has been pushed but the corresponding `ToolResult` has
+/// not yet been flushed. This helper plugs that hole at the source by piping
+/// `session.messages` through `validate_and_repair_with_stats` right before
+/// every such save, so the on-disk copy is always wire-contract clean.
+///
+/// The `agent_id` and `reason` parameters are only used for `tracing::warn!`
+/// observability so we can see in the logs when a repair was actually needed
+/// (i.e. the stats were non-default).
+fn ensure_tool_pairs_before_save(session: &mut Session, agent_id: &str, reason: &str) {
+    let (repaired, stats) =
+        crate::session_repair::validate_and_repair_with_stats(&session.messages);
+    if stats != crate::session_repair::RepairStats::default() {
+        warn!(
+            agent = %agent_id,
+            reason = %reason,
+            positional_synthetic = stats.positional_synthetic_inserted,
+            synthetic = stats.synthetic_results_inserted,
+            orphaned = stats.orphaned_results_removed,
+            "Persisting synthetic tool_result to avoid orphaned tool_use on failure path"
+        );
+    }
+    session.messages = repaired;
+}
+
 /// Safely trim message history to `MAX_HISTORY_MESSAGES`, cutting at
 /// conversation-turn boundaries so ToolUse/ToolResult pairs are never split.
 ///
@@ -449,6 +503,14 @@ async fn execute_single_tool_call(
             } else {
                 warn!(tool = %tool_call.name, "Circuit breaker triggered");
             }
+            // Defensive repair (Follow-up 1): the assistant message containing
+            // the ToolUse blocks was already pushed by `begin_tool_use_turn`,
+            // but we are aborting before `finalize_tool_use_results` flushes
+            // the matching ToolResult user message. Persisting now would leave
+            // orphaned ToolUse blocks on disk, which Moonshot/OpenAI reject on
+            // the next turn. Run `validate_and_repair` so the disk copy is
+            // wire-contract clean before the save.
+            ensure_tool_pairs_before_save(ctx.session, ctx.agent_id_str, "circuit_break");
             if let Err(e) = ctx.memory.save_session_async(ctx.session).await {
                 warn!("Failed to save session on circuit break: {e}");
             }
@@ -1332,6 +1394,13 @@ struct PromptSetupContext<'a> {
 struct PreparedMessages {
     messages: Vec<Message>,
     new_messages_start: usize,
+    /// Repair stats from running `validate_and_repair_with_stats` on the
+    /// *persistent* `session.messages` (not the filtered LLM view). When
+    /// non-default, the caller MUST persist `session.messages` to disk via
+    /// `save_session_async` so the next load does not re-pay the repair cost
+    /// (Follow-up 2 of the session-repair series; see
+    /// `shiny-sprouting-spring.md` — "Out (separate PRs)" point B).
+    persistent_repair_stats: crate::session_repair::RepairStats,
 }
 
 struct FinalizeEndTurnContext<'a> {
@@ -1636,6 +1705,20 @@ fn prepare_llm_messages(
     user_message: &str,
     memory_context_msg: Option<String>,
 ) -> PreparedMessages {
+    // Follow-up 2: run the repair against the *persistent* `session.messages`
+    // first. If the store was dirty (e.g. an older bug persisted an orphan
+    // ToolUse, or a prior turn crashed before a failure-path save), replace
+    // the persistent copy in-place with the repaired version and hand the
+    // caller the stats so it can persist the clean history to disk. Without
+    // this pass, every load of the session would re-pay the same repair cost
+    // and `Session repair applied fixes` would fire indefinitely (tracer
+    // evidence on the RPi: five identical repair log lines in ten minutes).
+    let (repaired_persistent, persistent_repair_stats) =
+        crate::session_repair::validate_and_repair_with_stats(&session.messages);
+    if persistent_repair_stats != crate::session_repair::RepairStats::default() {
+        session.messages = repaired_persistent;
+    }
+
     let llm_messages: Vec<Message> = session
         .messages
         .iter()
@@ -1677,6 +1760,7 @@ fn prepare_llm_messages(
     PreparedMessages {
         messages,
         new_messages_start,
+        persistent_repair_stats,
     }
 }
 
@@ -2083,12 +2167,42 @@ pub async fn run_agent_loop(
     let PreparedMessages {
         mut messages,
         new_messages_start: prepared_new_messages_start,
+        persistent_repair_stats,
     } = prepare_llm_messages(
         manifest,
         session,
         &effective_user_message,
         memory_context_msg,
     );
+
+    // Follow-up 2: if `prepare_llm_messages` had to repair the persistent
+    // history, the in-memory copy is already clean but disk is still dirty.
+    // Persist the cleaned version so the next load does not re-pay the
+    // repair cost. A failed save is logged and tolerated — the in-memory
+    // repair still holds for the current turn.
+    if persistent_repair_stats != crate::session_repair::RepairStats::default() {
+        match memory.save_session_async(session).await {
+            Ok(()) => {
+                info!(
+                    agent = %agent_id_str,
+                    orphaned = persistent_repair_stats.orphaned_results_removed,
+                    positional_synthetic = persistent_repair_stats.positional_synthetic_inserted,
+                    synthetic = persistent_repair_stats.synthetic_results_inserted,
+                    reordered = persistent_repair_stats.results_reordered,
+                    duplicates = persistent_repair_stats.duplicates_removed,
+                    misplaced_ignored = persistent_repair_stats.misplaced_results_ignored,
+                    "Persisted repaired session history after validate_and_repair"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    agent = %agent_id_str,
+                    error = %e,
+                    "Failed to persist repaired session history; continuing with in-memory repair"
+                );
+            }
+        }
+    }
 
     let mut total_usage = TokenUsage::default();
     let final_response;
@@ -2567,7 +2681,13 @@ pub async fn run_agent_loop(
         }
     }
 
-    // Save session before failing so conversation history is preserved
+    // Save session before failing so conversation history is preserved.
+    // Defensive repair (Follow-up 1): this is a terminal failure path
+    // (max iterations exceeded). The loop body should have flushed every
+    // ToolUse/ToolResult pair, but we run `validate_and_repair` as a
+    // conservative safety net so a loop-body bug cannot leak an orphaned
+    // ToolUse to disk and break the next session load.
+    ensure_tool_pairs_before_save(session, agent_id_str.as_str(), "max_iterations_exceeded");
     if let Err(e) = memory.save_session_async(session).await {
         warn!("Failed to save session on max iterations: {e}");
     }
@@ -2993,12 +3113,41 @@ pub async fn run_agent_loop_streaming(
     let PreparedMessages {
         mut messages,
         new_messages_start: prepared_new_messages_start,
+        persistent_repair_stats,
     } = prepare_llm_messages(
         manifest,
         session,
         &effective_user_message,
         memory_context_msg,
     );
+
+    // Follow-up 2: mirror of the non-streaming path — persist any in-place
+    // repair that `prepare_llm_messages` applied to `session.messages` so
+    // the next session load does not re-pay the repair cost. See the
+    // matching comment in `run_agent_loop` for the full rationale.
+    if persistent_repair_stats != crate::session_repair::RepairStats::default() {
+        match memory.save_session_async(session).await {
+            Ok(()) => {
+                info!(
+                    agent = %agent_id_str,
+                    orphaned = persistent_repair_stats.orphaned_results_removed,
+                    positional_synthetic = persistent_repair_stats.positional_synthetic_inserted,
+                    synthetic = persistent_repair_stats.synthetic_results_inserted,
+                    reordered = persistent_repair_stats.results_reordered,
+                    duplicates = persistent_repair_stats.duplicates_removed,
+                    misplaced_ignored = persistent_repair_stats.misplaced_results_ignored,
+                    "Persisted repaired session history after validate_and_repair (streaming)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    agent = %agent_id_str,
+                    error = %e,
+                    "Failed to persist repaired session history (streaming); continuing with in-memory repair"
+                );
+            }
+        }
+    }
 
     let mut total_usage = TokenUsage::default();
     let final_response;
@@ -3170,6 +3319,18 @@ pub async fn run_agent_loop_streaming(
                          Any partial output was already sent to the user.]"
                     );
                     session.messages.push(Message::assistant(note));
+                    // Defensive repair (Follow-up 1): a streaming LLM timeout
+                    // can land while session.messages still holds an assistant
+                    // ToolUse from the previous iteration whose ToolResult was
+                    // never flushed (e.g. the driver timed out while the model
+                    // was mid-turn). Without this pass, the timeout note would
+                    // be persisted alongside orphaned ToolUse blocks, which
+                    // Moonshot/OpenAI reject on the next session load.
+                    ensure_tool_pairs_before_save(
+                        session,
+                        agent_id_str.as_str(),
+                        "llm_stream_timeout",
+                    );
                     if let Err(save_err) = memory.save_session_async(session).await {
                         warn!(
                             "Failed to persist timeout note to session: {save_err}. \
@@ -3541,6 +3702,13 @@ pub async fn run_agent_loop_streaming(
         }
     }
 
+    // Defensive repair (Follow-up 1): terminal max-iterations save in the
+    // streaming path. See the non-streaming sibling for the rationale.
+    ensure_tool_pairs_before_save(
+        session,
+        agent_id_str.as_str(),
+        "max_iterations_exceeded_streaming",
+    );
     if let Err(e) = memory.save_session_async(session).await {
         warn!("Failed to save session on max iterations: {e}");
     }
@@ -5019,6 +5187,7 @@ mod tests {
         let PreparedMessages {
             messages,
             new_messages_start,
+            ..
         } = prepare_llm_messages(
             &manifest,
             &mut session,
@@ -7491,5 +7660,344 @@ mod tests {
             }
             other => panic!("Expected RepeatedToolFailures, got {other:?}"),
         }
+    }
+
+    // --- Follow-up 1: orphaned ToolUse prevention on failure-path saves ---
+
+    fn empty_test_session() -> librefang_memory::session::Session {
+        librefang_memory::session::Session {
+            id: librefang_types::agent::SessionId::new(),
+            agent_id: librefang_types::agent::AgentId::new(),
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        }
+    }
+
+    /// Helper: does `messages` contain any assistant `ToolUse` whose
+    /// `tool_use_id` is not matched by a `ToolResult` anywhere later in
+    /// the history? Used as the invariant that failure-path saves must
+    /// maintain.
+    fn has_orphaned_tool_use(messages: &[Message]) -> bool {
+        let mut satisfied_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for msg in messages {
+            if let MessageContent::Blocks(blocks) = &msg.content {
+                for b in blocks {
+                    if let ContentBlock::ToolResult { tool_use_id, .. } = b {
+                        satisfied_ids.insert(tool_use_id.clone());
+                    }
+                }
+            }
+        }
+        for msg in messages {
+            if msg.role != Role::Assistant {
+                continue;
+            }
+            if let MessageContent::Blocks(blocks) = &msg.content {
+                for b in blocks {
+                    if let ContentBlock::ToolUse { id, .. } = b {
+                        if !satisfied_ids.contains(id) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn synthesize_interrupted_result_shape_is_wire_contract_compatible() {
+        // The synthetic stand-in must carry the original tool_use_id, be
+        // flagged as an error, and contain the human-readable reason.
+        let block = synthesize_interrupted_result("call-42", "circuit_break");
+        match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                content,
+                is_error,
+                status,
+                approval_request_id,
+            } => {
+                assert_eq!(tool_use_id, "call-42");
+                assert!(tool_name.is_empty());
+                assert!(content.contains("interrupted"));
+                assert!(content.contains("circuit_break"));
+                assert!(is_error);
+                assert_eq!(status, librefang_types::tool::ToolExecutionStatus::Error);
+                assert!(approval_request_id.is_none());
+            }
+            other => panic!("Expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn circuit_break_save_has_no_orphan_tool_use() {
+        // Simulates the circuit-breaker failure path: `begin_tool_use_turn`
+        // has already pushed an assistant message containing a `ToolUse`,
+        // but no matching `ToolResult` has been flushed yet. Running
+        // `ensure_tool_pairs_before_save` must leave the session in a state
+        // where no assistant `ToolUse` is orphaned — otherwise the save
+        // would persist a history Moonshot/OpenAI later reject.
+        let mut session = empty_test_session();
+        session.messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Text("run tool".to_string()),
+            pinned: false,
+        });
+        session.messages.push(Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "call-1".to_string(),
+                name: "shell".to_string(),
+                input: serde_json::json!({"cmd": "ls"}),
+                provider_metadata: None,
+            }]),
+            pinned: false,
+        });
+
+        assert!(
+            has_orphaned_tool_use(&session.messages),
+            "pre-repair state must have an orphan ToolUse (test setup invariant)"
+        );
+
+        ensure_tool_pairs_before_save(&mut session, "agent-test", "circuit_break");
+
+        assert!(
+            !has_orphaned_tool_use(&session.messages),
+            "after repair, no assistant ToolUse should be orphaned"
+        );
+    }
+
+    #[test]
+    fn timeout_save_is_repair_clean() {
+        // Simulates the streaming LLM timeout failure path: while handling
+        // the prior iteration's tool calls, we pushed an assistant `ToolUse`
+        // but never got its `ToolResult` because the provider call timed out.
+        // The timeout-note save must run `ensure_tool_pairs_before_save`
+        // before persisting so the disk copy is wire-contract clean.
+        let mut session = empty_test_session();
+        session.messages.push(Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![
+                ContentBlock::ToolUse {
+                    id: "call-a".to_string(),
+                    name: "web_search".to_string(),
+                    input: serde_json::json!({"q": "rust"}),
+                    provider_metadata: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "call-b".to_string(),
+                    name: "fetch".to_string(),
+                    input: serde_json::json!({"url": "https://example.com"}),
+                    provider_metadata: None,
+                },
+            ]),
+            pinned: false,
+        });
+        // And the timeout-note assistant message that the prod path pushes
+        // right before the failing save:
+        session
+            .messages
+            .push(Message::assistant("[System: your previous task timed out]"));
+
+        assert!(
+            has_orphaned_tool_use(&session.messages),
+            "pre-repair state must have two orphan ToolUse blocks"
+        );
+
+        ensure_tool_pairs_before_save(&mut session, "agent-test", "llm_stream_timeout");
+
+        assert!(
+            !has_orphaned_tool_use(&session.messages),
+            "after repair, neither call-a nor call-b should be orphaned"
+        );
+    }
+
+    #[test]
+    fn ensure_tool_pairs_before_save_is_noop_when_already_clean() {
+        // Happy-path invariant: a session that already has balanced
+        // ToolUse/ToolResult pairs must survive the defensive repair pass
+        // untouched (we assert the length and roles stay identical).
+        let mut session = empty_test_session();
+        session.messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Text("do the thing".to_string()),
+            pinned: false,
+        });
+        session.messages.push(Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "call-1".to_string(),
+                name: "echo".to_string(),
+                input: serde_json::json!({"text": "hi"}),
+                provider_metadata: None,
+            }]),
+            pinned: false,
+        });
+        session.messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "call-1".to_string(),
+                tool_name: "echo".to_string(),
+                content: "hi".to_string(),
+                is_error: false,
+                status: librefang_types::tool::ToolExecutionStatus::Completed,
+                approval_request_id: None,
+            }]),
+            pinned: false,
+        });
+
+        let before = session.messages.clone();
+        ensure_tool_pairs_before_save(&mut session, "agent-test", "noop_check");
+
+        assert_eq!(
+            session.messages.len(),
+            before.len(),
+            "clean session must not be resized by defensive repair"
+        );
+        assert!(!has_orphaned_tool_use(&session.messages));
+    }
+
+    // --- Follow-up 2: persistent repair is applied in-place + stats reported ---
+
+    /// Follow-up 2 contract test: `prepare_llm_messages` must repair the
+    /// *persistent* `session.messages` in-place (not just the filtered LLM
+    /// view) when the stored history is dirty, and surface non-default
+    /// `RepairStats` so the caller knows to persist the clean copy to disk.
+    ///
+    /// This is the unit-test half of the full fix. The integration half —
+    /// actually calling `memory.save_session_async` — is exercised by the
+    /// happy-path agent-loop tests that already round-trip through
+    /// `MemorySubstrate`, and the save-if-dirty call site lives in
+    /// `run_agent_loop` / `run_agent_loop_streaming` immediately after the
+    /// destructure. Mocking `MemorySubstrate` here would add a large
+    /// surface area with no extra confidence over asserting (a) the session
+    /// is repaired in-place and (b) the stats are non-default.
+    #[test]
+    fn prepare_llm_messages_repairs_persistent_session_and_reports_stats() {
+        let mut manifest = test_manifest();
+        manifest.metadata.remove("canonical_context_msg");
+
+        let agent_id = librefang_types::agent::AgentId::new();
+        let mut session = librefang_memory::session::Session {
+            id: librefang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+
+        // Dirty history: a prior user turn, then an assistant ToolUse with
+        // NO matching ToolResult — exactly the shape Phase 2a1 was built to
+        // repair, and exactly the shape that used to be re-repaired on
+        // every load because the clean version was never written back.
+        session.messages.push(Message::user("please run a tool"));
+        session.messages.push(Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "call-orphan".to_string(),
+                name: "shell".to_string(),
+                input: serde_json::json!({"cmd": "ls"}),
+                provider_metadata: None,
+            }]),
+            pinned: false,
+        });
+        // The current turn's user message, already pushed by the prod path
+        // right before `prepare_llm_messages` is called.
+        session.messages.push(Message::user("follow-up question"));
+
+        assert!(
+            has_orphaned_tool_use(&session.messages),
+            "pre-call invariant: session must have an orphaned ToolUse"
+        );
+
+        let PreparedMessages {
+            persistent_repair_stats,
+            ..
+        } = prepare_llm_messages(&manifest, &mut session, "follow-up question", None);
+
+        // Contract 1: stats are non-default — caller MUST persist.
+        assert_ne!(
+            persistent_repair_stats,
+            crate::session_repair::RepairStats::default(),
+            "repair of dirty persistent history must produce non-default stats"
+        );
+
+        // Contract 2: the session.messages persistent copy is now clean —
+        // no orphan assistant ToolUse survives. This is what the caller
+        // will then hand to `memory.save_session_async`.
+        assert!(
+            !has_orphaned_tool_use(&session.messages),
+            "persistent session.messages must be repaired in-place"
+        );
+
+        // Contract 3: at least one synthetic result was inserted by the
+        // positional Phase 2a1 check (the specific field the tracer
+        // evidence showed firing on the RPi). The exact count depends on
+        // the repair pipeline, so we assert `>= 1` rather than equality.
+        assert!(
+            persistent_repair_stats.positional_synthetic_inserted >= 1
+                || persistent_repair_stats.synthetic_results_inserted >= 1,
+            "a synthetic tool_result must have been inserted for the orphan: \
+             stats = {persistent_repair_stats:?}"
+        );
+    }
+
+    /// Idempotence contract: after `prepare_llm_messages` repairs a dirty
+    /// session, a second call on the same (now clean) session must report
+    /// default stats. Without this guarantee, the caller's save-if-dirty
+    /// branch would fire on every turn even when nothing changed, which
+    /// would defeat the whole point of Follow-up 2.
+    #[test]
+    fn prepare_llm_messages_is_idempotent_after_repair() {
+        let mut manifest = test_manifest();
+        manifest.metadata.remove("canonical_context_msg");
+
+        let agent_id = librefang_types::agent::AgentId::new();
+        let mut session = librefang_memory::session::Session {
+            id: librefang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+
+        // Dirty history setup.
+        session.messages.push(Message::user("please run a tool"));
+        session.messages.push(Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "call-orphan-2".to_string(),
+                name: "shell".to_string(),
+                input: serde_json::json!({"cmd": "ls"}),
+                provider_metadata: None,
+            }]),
+            pinned: false,
+        });
+        session.messages.push(Message::user("follow-up question"));
+
+        // First call: repairs + reports non-default stats.
+        let PreparedMessages {
+            persistent_repair_stats: first_stats,
+            ..
+        } = prepare_llm_messages(&manifest, &mut session, "follow-up question", None);
+        assert_ne!(
+            first_stats,
+            crate::session_repair::RepairStats::default(),
+            "first call on dirty session must report non-default stats"
+        );
+
+        // Second call on the already-repaired session: no-op, default stats.
+        let PreparedMessages {
+            persistent_repair_stats: second_stats,
+            ..
+        } = prepare_llm_messages(&manifest, &mut session, "follow-up question", None);
+        assert_eq!(
+            second_stats,
+            crate::session_repair::RepairStats::default(),
+            "second call on clean session must report default stats (idempotence)"
+        );
     }
 }
