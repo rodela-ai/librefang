@@ -4054,6 +4054,12 @@ system_prompt = "You are a helpful assistant."
                     serde_json::Value::String(ctx.channel.clone()),
                 );
             }
+            if let Some(ref cid) = ctx.chat_id {
+                manifest.metadata.insert(
+                    "sender_chat_id".to_string(),
+                    serde_json::Value::String(cid.clone()),
+                );
+            }
         }
 
         let memory = Arc::clone(&self.memory);
@@ -5281,6 +5287,12 @@ system_prompt = "You are a helpful assistant."
                 manifest.metadata.insert(
                     "sender_channel".to_string(),
                     serde_json::Value::String(ctx.channel.clone()),
+                );
+            }
+            if let Some(ref cid) = ctx.chat_id {
+                manifest.metadata.insert(
+                    "sender_chat_id".to_string(),
+                    serde_json::Value::String(cid.clone()),
                 );
             }
             if !ctx.display_name.is_empty() {
@@ -10766,7 +10778,7 @@ impl KernelHandle for LibreFangKernel {
             serde_json::from_value(job_json["delivery"].clone())
                 .map_err(|e| format!("Invalid delivery: {e}"))?
         } else {
-            CronDelivery::None
+            CronDelivery::LastChannel
         };
         let one_shot = job_json["one_shot"].as_bool().unwrap_or(false);
 
@@ -12018,6 +12030,7 @@ impl LibreFangKernel {
             process_manager: Some(&self.process_manager),
             sender_id: deferred.sender_id.as_deref(),
             channel: deferred.channel.as_deref(),
+            chat_id: None,
         }
     }
 
