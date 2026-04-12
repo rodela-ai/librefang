@@ -164,7 +164,9 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
     let mut merged: Vec<Message> = Vec::with_capacity(cleaned.len());
     for msg in cleaned {
         if let Some(last) = merged.last_mut() {
-            if last.role == msg.role {
+            let neither_has_tool_result =
+                !content_has_tool_result(&last.content) && !content_has_tool_result(&msg.content);
+            if last.role == msg.role && neither_has_tool_result {
                 merge_content(&mut last.content, msg.content);
                 stats.messages_merged += 1;
                 continue;
@@ -935,6 +937,17 @@ fn message_has_tool_use(msg: &Message) -> bool {
         MessageContent::Blocks(blocks) => blocks
             .iter()
             .any(|b| matches!(b, ContentBlock::ToolUse { .. })),
+        _ => false,
+    }
+}
+
+/// Returns `true` if the content contains any `ToolResult` block.
+/// Used by Phase 3 to prevent merging tool-result carriers across turn boundaries.
+fn content_has_tool_result(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. })),
         _ => false,
     }
 }
@@ -2130,5 +2143,99 @@ mod tests {
             Message::assistant("a2"),
         ];
         assert_eq!(find_safe_trim_point(&messages, 0), Some(1));
+    }
+
+    #[test]
+    fn phase3_does_not_merge_user_messages_with_tool_results() {
+        // Two consecutive user messages that each contain ToolResult blocks
+        // must NOT be merged — merging would fool Phase 2a1 into thinking
+        // tool_call_ids from different turns are satisfied.
+        let tool_result_a = ContentBlock::ToolResult {
+            tool_use_id: "call_a".to_string(),
+            tool_name: "tool_a".to_string(),
+            content: "result a".to_string(),
+            is_error: false,
+            status: librefang_types::tool::ToolExecutionStatus::default(),
+            approval_request_id: None,
+        };
+        let tool_result_b = ContentBlock::ToolResult {
+            tool_use_id: "call_b".to_string(),
+            tool_name: "tool_b".to_string(),
+            content: "result b".to_string(),
+            is_error: false,
+            status: librefang_types::tool::ToolExecutionStatus::default(),
+            approval_request_id: None,
+        };
+
+        // Build: [asst(ToolUse A), user(ToolResult A), asst(ToolUse B), user(ToolResult B)]
+        // Phase 3 without fix would merge the two user messages.
+        // Phase 3 with fix must keep them separate.
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "call_a".to_string(),
+                    name: "tool_a".to_string(),
+                    input: serde_json::json!({}),
+                    provider_metadata: None,
+                }]),
+                pinned: false,
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![tool_result_a]),
+                pinned: false,
+            },
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "call_b".to_string(),
+                    name: "tool_b".to_string(),
+                    input: serde_json::json!({}),
+                    provider_metadata: None,
+                }]),
+                pinned: false,
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![tool_result_b]),
+                pinned: false,
+            },
+        ];
+
+        let (repaired, stats) = validate_and_repair_with_stats(&messages);
+        // History must stay as 4 messages (not merged into 3)
+        assert_eq!(
+            repaired.len(),
+            4,
+            "Phase 3 must not merge tool-result user messages"
+        );
+        assert_eq!(stats.messages_merged, 0);
+        // No synthetic insertions needed — all tool_use_ids are satisfied positionally
+        assert_eq!(stats.positional_synthetic_inserted, 0);
+    }
+
+    #[test]
+    fn phase3_still_merges_plain_user_messages() {
+        // Verify the fix does not break the legitimate merge of two plain text user messages.
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("hello ".to_string()),
+                pinned: false,
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("world".to_string()),
+                pinned: false,
+            },
+        ];
+        let (repaired, stats) = validate_and_repair_with_stats(&messages);
+        assert_eq!(
+            repaired.len(),
+            1,
+            "Plain text user messages should still merge"
+        );
+        assert_eq!(stats.messages_merged, 1);
     }
 }
