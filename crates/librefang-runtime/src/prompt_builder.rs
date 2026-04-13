@@ -179,6 +179,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
                 ctx.was_mentioned,
                 ctx.bot_username.as_deref(),
                 &ctx.group_members,
+                &ctx.granted_tools,
             ));
         }
     }
@@ -489,6 +490,7 @@ fn build_channel_section(
     was_mentioned: bool,
     bot_username: Option<&str>,
     _group_members: &[(String, String, Option<String>)],
+    granted_tools: &[String],
 ) -> String {
     let (limit, hints) = match channel {
         "telegram" => (
@@ -588,6 +590,30 @@ fn build_channel_section(
 
         // Group roster is now available via the `group_members` tool.
         // No longer injected into the system prompt (saves context tokens).
+    }
+
+    // Tell the agent it can send rich media via channel_send when the tool is available.
+    let has_channel_send = granted_tools
+        .iter()
+        .any(|t| t == "channel_send" || t == "*");
+    if has_channel_send {
+        if let Some(id) = sender_id {
+            section.push_str(&format!(
+                "\n\nTo send images, files, polls, or other media to the user, use the `channel_send` tool \
+                 with channel=\"{channel}\" and recipient=\"{id}\". Set `image_url` for photos, \
+                 `file_url` or `file_path` for file attachments, `poll_question` + `poll_options` \
+                 to create a poll (add `poll_is_quiz` and `poll_correct_option` for a quiz). \
+                 Your normal text replies are sent automatically — only use `channel_send` when you need to send media.",
+            ));
+        } else {
+            section.push_str(
+                "\n\nTo send images, files, polls, or other media to the user, use the `channel_send` tool. \
+                 Set `image_url` for photos, `file_url` or `file_path` for file attachments, \
+                 `poll_question` + `poll_options` to create a poll (add `poll_is_quiz` and \
+                 `poll_correct_option` for a quiz). Your normal text replies are sent automatically \
+                 — only use `channel_send` when you need to send media.",
+            );
+        }
     }
 
     section
@@ -728,6 +754,9 @@ pub fn tool_hint(name: &str) -> &'static str {
         "agent_spawn" => "create a new agent",
         "agent_list" => "list running agents",
         "agent_kill" => "terminate an agent",
+
+        // Channel
+        "channel_send" => "send a message, image, file, or poll to a channel user",
 
         // Media
         "image_describe" => "describe an image",
@@ -1048,29 +1077,40 @@ mod tests {
 
     #[test]
     fn test_channel_telegram() {
-        let section = build_channel_section("telegram", None, None, None, false, false, None, &[]);
+        let section =
+            build_channel_section("telegram", None, None, None, false, false, None, &[], &[]);
         assert!(section.contains("4096"));
         assert!(section.contains("Telegram"));
     }
 
     #[test]
     fn test_channel_discord() {
-        let section = build_channel_section("discord", None, None, None, false, false, None, &[]);
+        let section =
+            build_channel_section("discord", None, None, None, false, false, None, &[], &[]);
         assert!(section.contains("2000"));
         assert!(section.contains("Discord"));
     }
 
     #[test]
     fn test_channel_irc() {
-        let section = build_channel_section("irc", None, None, None, false, false, None, &[]);
+        let section = build_channel_section("irc", None, None, None, false, false, None, &[], &[]);
         assert!(section.contains("512"));
         assert!(section.contains("plain text"));
     }
 
     #[test]
     fn test_channel_unknown_gets_default() {
-        let section =
-            build_channel_section("smoke_signal", None, None, None, false, false, None, &[]);
+        let section = build_channel_section(
+            "smoke_signal",
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            &[],
+            &[],
+        );
         assert!(section.contains("4096"));
         assert!(section.contains("smoke_signal"));
     }
@@ -1086,6 +1126,7 @@ mod tests {
             false,
             None,
             &[],
+            &[],
         );
         assert!(section.contains("group chat"));
         // Not mentioned — the "respond to this message" directive must be absent.
@@ -1094,8 +1135,17 @@ mod tests {
 
     #[test]
     fn test_channel_group_mentioned() {
-        let section =
-            build_channel_section("whatsapp", Some("Bob"), None, None, true, true, None, &[]);
+        let section = build_channel_section(
+            "whatsapp",
+            Some("Bob"),
+            None,
+            None,
+            true,
+            true,
+            None,
+            &[],
+            &[],
+        );
         assert!(section.contains("group chat"));
         assert!(section.contains("respond to this message"));
     }
@@ -1110,6 +1160,7 @@ mod tests {
             true,
             true,
             Some("fandangorodelo_bot"),
+            &[],
             &[],
         );
         assert!(section.contains("@fandangorodelo_bot"));
@@ -1145,6 +1196,7 @@ mod tests {
             true,
             Some("fandangorodelo_bot"),
             &members,
+            &[],
         );
         assert!(
             !section.contains("### Known members of this group"),
@@ -1173,8 +1225,56 @@ mod tests {
             false,
             Some("fandangorodelo_bot"),
             &members,
+            &[],
         );
         assert!(!section.contains("### Known members of this group"));
+    }
+
+    #[test]
+    fn test_channel_send_hint_with_tool() {
+        let tools = vec!["channel_send".to_string()];
+        let section = build_channel_section(
+            "telegram",
+            Some("Alice"),
+            Some("12345"),
+            None,
+            false,
+            false,
+            None,
+            &[],
+            &tools,
+        );
+        assert!(
+            section.contains("channel_send"),
+            "Should mention channel_send tool when available"
+        );
+        assert!(
+            section.contains("image_url"),
+            "Should mention image_url parameter"
+        );
+        assert!(
+            section.contains("12345"),
+            "Should include recipient ID for convenience"
+        );
+    }
+
+    #[test]
+    fn test_channel_send_hint_without_tool() {
+        let section = build_channel_section(
+            "telegram",
+            Some("Alice"),
+            Some("12345"),
+            None,
+            false,
+            false,
+            None,
+            &[],
+            &[],
+        );
+        assert!(
+            !section.contains("channel_send"),
+            "Should NOT mention channel_send when tool is not available"
+        );
     }
 
     #[test]
