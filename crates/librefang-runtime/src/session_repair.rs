@@ -206,21 +206,31 @@ pub fn validate_and_repair_with_stats(messages: &[Message]) -> (Vec<Message>, Re
 /// For each user message containing ToolResults, checks if the previous message is
 /// the correct assistant message. If not, moves the ToolResult to the correct position.
 fn reorder_tool_results(messages: &mut Vec<Message>) -> usize {
-    // Build map: tool_use_id → index of the assistant message containing it
-    let mut tool_use_index: HashMap<String, usize> = HashMap::new();
+    // Build map: tool_use_id → index of the assistant message containing it.
+    // Two-pass: first count how many distinct assistant turns each id appears in,
+    // then only include ids with exactly one producing turn. Ids that collide
+    // across turns (e.g. Moonshot/Kimi's per-completion integer counters that
+    // reset and reuse like "memory_store:6") are excluded so Phase 2b does not
+    // reclassify Phase 2a1's correctly-placed synthetics as misplaced.
+    // Mirrors the collision guard already used in Phase 2d (deduplicate_tool_results).
+    let mut tool_use_turn_count: HashMap<String, usize> = HashMap::new();
+    let mut first_idx: HashMap<String, usize> = HashMap::new();
     for (idx, msg) in messages.iter().enumerate() {
         if msg.role == Role::Assistant {
             if let MessageContent::Blocks(blocks) = &msg.content {
                 for block in blocks {
                     if let ContentBlock::ToolUse { id, .. } = block {
-                        // Use first occurrence: duplicate ids across turns should
-                        // map to their earliest assistant position.
-                        tool_use_index.entry(id.clone()).or_insert(idx);
+                        *tool_use_turn_count.entry(id.clone()).or_insert(0) += 1;
+                        first_idx.entry(id.clone()).or_insert(idx);
                     }
                 }
             }
         }
     }
+    let tool_use_index: HashMap<String, usize> = first_idx
+        .into_iter()
+        .filter(|(id, _)| tool_use_turn_count.get(id).copied().unwrap_or(0) == 1)
+        .collect();
 
     // Collect misplaced ToolResult blocks that need to move.
     // Track (msg_idx, tool_use_id, block, target_assistant_idx).
@@ -2237,5 +2247,143 @@ mod tests {
             "Plain text user messages should still merge"
         );
         assert_eq!(stats.messages_merged, 1);
+    }
+
+    #[test]
+    fn reorder_preserves_per_turn_synthetic_when_tool_id_collides_across_turns() {
+        // Regression test for Phase 2b global-index bug.
+        //
+        // Repro of the Moonshot/Kimi collision pattern: any driver with
+        // small-integer tool_call_id counters that reset per-completion can
+        // produce the same id in two different assistant turns.
+        //
+        // Input:
+        //   0: asst(ToolUse "memory_store:6")         — first use
+        //   1: user(ToolResult "memory_store:6")       — legitimate adjacent result
+        //   2: asst(text "ack")
+        //   3: user(text "next question")
+        //   4: asst(ToolUse "memory_store:6")          — second use, same id
+        //   5: user(text "no result yet")              — orphan: no ToolResult
+        //
+        // Before fix: Phase 2b's global index maps "memory_store:6" → 0.
+        //   Phase 2a1 inserts synthetic at pos 5 (adjacent to asst-4).
+        //   Phase 2b reclassifies synthetic as misplaced, moves it to pos 1.
+        //   stats.results_reordered == 1 (spurious reorder), asst-4 re-orphaned.
+        //
+        // After fix: colliding ids excluded from reorder index.
+        //   stats.results_reordered == 0, asst-4 keeps its synthetic.
+
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "memory_store:6".to_string(),
+                    name: "memory_store".to_string(),
+                    input: serde_json::json!({}),
+                    provider_metadata: None,
+                }]),
+                pinned: false,
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "memory_store:6".to_string(),
+                    tool_name: "memory_store".to_string(),
+                    content: "stored".to_string(),
+                    is_error: false,
+                    status: librefang_types::tool::ToolExecutionStatus::default(),
+                    approval_request_id: None,
+                }]),
+                pinned: false,
+            },
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Text("ack".to_string()),
+                pinned: false,
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("next question".to_string()),
+                pinned: false,
+            },
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                    id: "memory_store:6".to_string(),
+                    name: "memory_store".to_string(),
+                    input: serde_json::json!({}),
+                    provider_metadata: None,
+                }]),
+                pinned: false,
+            },
+            Message {
+                role: Role::User,
+                content: MessageContent::Text("no result yet".to_string()),
+                pinned: false,
+            },
+        ];
+
+        let (repaired, stats) = validate_and_repair_with_stats(&messages);
+
+        // Phase 2a1 must insert exactly one synthetic ToolResult for asst-4.
+        assert_eq!(
+            stats.positional_synthetic_inserted, 1,
+            "Phase 2a1 must insert exactly one per-turn synthetic for the second orphaned asst"
+        );
+
+        // Phase 2b must NOT spuriously reorder — the collision id must be excluded
+        // from the reorder index so the synthetic stays where Phase 2a1 placed it.
+        assert_eq!(
+            stats.results_reordered, 0,
+            "Phase 2b must not classify Phase 2a1's synthetic as misplaced (global-index bug)"
+        );
+
+        // The second assistant (which has the collision id) must have an adjacent
+        // ToolResult in the repaired output.
+        let second_asst_idx = repaired
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m.role == Role::Assistant
+                    && matches!(&m.content, MessageContent::Blocks(bs) if bs.iter().any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == "memory_store:6")))
+            })
+            .nth(1)
+            .map(|(i, _)| i)
+            .expect("second assistant with collision id must exist in repaired output");
+
+        let next = &repaired[second_asst_idx + 1];
+        assert!(
+            next.role == Role::User
+                && matches!(&next.content, MessageContent::Blocks(bs) if bs.iter().any(|b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "memory_store:6"))),
+            "second assistant must have an adjacent ToolResult in the repaired output"
+        );
+
+        // The first assistant must still have exactly one ToolResult (no duplicate).
+        let first_asst_idx = repaired
+            .iter()
+            .enumerate()
+            .find(|(_, m)| {
+                m.role == Role::Assistant
+                    && matches!(&m.content, MessageContent::Blocks(bs) if bs.iter().any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == "memory_store:6")))
+            })
+            .map(|(i, _)| i)
+            .expect("first assistant with collision id must exist");
+
+        let first_result_count = repaired[first_asst_idx + 1..]
+            .iter()
+            .take_while(|m| m.role == Role::User)
+            .flat_map(|m| match &m.content {
+                MessageContent::Blocks(bs) => bs.iter().collect::<Vec<_>>(),
+                _ => vec![],
+            })
+            .filter(|b| {
+                matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "memory_store:6")
+            })
+            .count();
+
+        assert_eq!(
+            first_result_count, 1,
+            "first assistant must keep exactly its one original ToolResult, not receive a duplicate"
+        );
     }
 }

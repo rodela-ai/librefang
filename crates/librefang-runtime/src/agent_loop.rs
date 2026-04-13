@@ -199,6 +199,12 @@ fn safe_trim_messages(
         );
 
         session_messages.drain(..trim_point);
+
+        // Re-repair the persisted session after trimming. The trim boundary can
+        // fall inside a tool-call chain, creating new orphaned tool_use/tool_result
+        // pairs at the head of session_messages. Repair here so the on-disk session
+        // is always consistent before the next persist() call.
+        *session_messages = crate::session_repair::validate_and_repair(session_messages);
     }
 
     if messages.len() <= MAX_HISTORY_MESSAGES {
