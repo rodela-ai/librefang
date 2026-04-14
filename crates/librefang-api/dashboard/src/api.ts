@@ -192,6 +192,7 @@ export interface AgentItem {
   model_name?: string;
   model_tier?: string;
   auth_status?: string;
+  supports_thinking?: boolean;
   ready?: boolean;
   profile?: string;
   identity?: AgentIdentity;
@@ -866,6 +867,7 @@ export interface ModelItem {
   supports_tools?: boolean;
   supports_vision?: boolean;
   supports_streaming?: boolean;
+  supports_thinking?: boolean;
   available?: boolean;
 }
 
