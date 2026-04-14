@@ -49,6 +49,33 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, info, warn};
 
+/// Build the MCP bridge config that lets CLI-based drivers (Claude Code)
+/// reach back into the daemon's own `/mcp` endpoint. Uses loopback when the
+/// API listens on a wildcard address.
+fn build_mcp_bridge_cfg(cfg: &KernelConfig) -> librefang_llm_driver::McpBridgeConfig {
+    let listen = cfg.api_listen.trim();
+    let base = if listen.is_empty() {
+        "http://127.0.0.1:4545".to_string()
+    } else if listen.starts_with("0.0.0.0")
+        || listen.starts_with("[::]")
+        || listen.starts_with("::")
+    {
+        let port = listen.rsplit(':').next().unwrap_or("4545");
+        format!("http://127.0.0.1:{port}")
+    } else {
+        format!("http://{listen}")
+    };
+    let api_key = if cfg.api_key.is_empty() {
+        None
+    } else {
+        Some(cfg.api_key.clone())
+    };
+    librefang_llm_driver::McpBridgeConfig {
+        base_url: base,
+        api_key,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Prompt metadata cache — avoids redundant filesystem I/O and skill registry
 // iteration on every message.
@@ -1394,6 +1421,7 @@ impl LibreFangKernel {
                 .get(&config.default_model.provider)
                 .cloned()
         });
+        let mcp_bridge_cfg = build_mcp_bridge_cfg(&config);
         let driver_config = DriverConfig {
             provider: config.default_model.provider.clone(),
             api_key: default_api_key.clone(),
@@ -1402,6 +1430,7 @@ impl LibreFangKernel {
             azure_openai: config.azure_openai.clone(),
             skip_permissions: true,
             message_timeout_secs: config.default_model.message_timeout_secs,
+            mcp_bridge: Some(mcp_bridge_cfg.clone()),
         };
         // Primary driver failure is non-fatal: the dashboard should remain accessible
         // even if the LLM provider is misconfigured. Users can fix config via dashboard.
@@ -1436,6 +1465,7 @@ impl LibreFangKernel {
                     azure_openai: config.azure_openai.clone(),
                     skip_permissions: true,
                     message_timeout_secs: config.default_model.message_timeout_secs,
+                    mcp_bridge: Some(mcp_bridge_cfg.clone()),
                 };
                 match drivers::create_driver(&profile_config) {
                     Ok(profile_driver) => {
@@ -1491,7 +1521,8 @@ impl LibreFangKernel {
                     true, // skip_permissions — daemon mode
                     config.default_model.message_timeout_secs,
                 )
-                .with_config_dir(dir);
+                .with_config_dir(dir)
+                .with_mcp_bridge(mcp_bridge_cfg.clone());
                 let name = format!("profile-{}", i + 1);
                 profile_drivers.push((Arc::new(d), name));
             }
@@ -1538,6 +1569,7 @@ impl LibreFangKernel {
                             azure_openai: config.azure_openai.clone(),
                             skip_permissions: true,
                             message_timeout_secs: config.default_model.message_timeout_secs,
+                            mcp_bridge: Some(mcp_bridge_cfg.clone()),
                         };
                         match drivers::create_driver(&auto_config) {
                             Ok(d) => {
@@ -1587,6 +1619,7 @@ impl LibreFangKernel {
                 azure_openai: config.azure_openai.clone(),
                 skip_permissions: true,
                 message_timeout_secs: config.default_model.message_timeout_secs,
+                mcp_bridge: Some(mcp_bridge_cfg.clone()),
             };
             match drivers::create_driver(&fb_config) {
                 Ok(d) => {
@@ -8659,6 +8692,7 @@ system_prompt = "You are a helpful assistant."
                 azure_openai: cfg.azure_openai.clone(),
                 skip_permissions: true,
                 message_timeout_secs: cfg.default_model.message_timeout_secs,
+                mcp_bridge: Some(build_mcp_bridge_cfg(&cfg)),
             };
 
             match self.driver_cache.get_or_create(&driver_config) {
@@ -8740,6 +8774,7 @@ system_prompt = "You are a helpful assistant."
                         .or_else(|| self.lookup_provider_url(&fb_provider)),
                     vertex_ai: cfg.vertex_ai.clone(),
                     azure_openai: cfg.azure_openai.clone(),
+                    mcp_bridge: Some(build_mcp_bridge_cfg(&cfg)),
                     skip_permissions: true,
                     message_timeout_secs: cfg.default_model.message_timeout_secs,
                 };
