@@ -282,14 +282,14 @@
     },
     {
       "path": "crates/librefang-runtime/src/tool_runner.rs",
-      "accessCount": 33,
-      "lastAccessed": 1776270252847,
+      "accessCount": 36,
+      "lastAccessed": 1776287689528,
       "type": "directory"
     },
     {
       "path": "crates/librefang-kernel/src/kernel/mod.rs",
-      "accessCount": 18,
-      "lastAccessed": 1776269672496,
+      "accessCount": 21,
+      "lastAccessed": 1776281993128,
       "type": "file"
     },
     {
@@ -315,6 +315,12 @@
       "accessCount": 14,
       "lastAccessed": 1776270226635,
       "type": "directory"
+    },
+    {
+      "path": "crates/librefang-types/src/config/types.rs",
+      "accessCount": 12,
+      "lastAccessed": 1776281982448,
+      "type": "file"
     },
     {
       "path": "crates/librefang-types/src/scheduler.rs",
@@ -389,6 +395,12 @@
       "type": "file"
     },
     {
+      "path": "crates/librefang-types/src/config",
+      "accessCount": 2,
+      "lastAccessed": 1776281949053,
+      "type": "directory"
+    },
+    {
       "path": "rodela/k8s/kustomization.yaml",
       "accessCount": 1,
       "lastAccessed": 1776079979174,
@@ -440,6 +452,12 @@
       "path": "crates/librefang-runtime",
       "accessCount": 1,
       "lastAccessed": 1776270203843,
+      "type": "directory"
+    },
+    {
+      "path": "crates/librefang-memory/src",
+      "accessCount": 1,
+      "lastAccessed": 1776282004046,
       "type": "directory"
     }
   ],
