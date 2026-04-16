@@ -9126,6 +9126,7 @@ system_prompt = "You are a helpful assistant."
                 headers: server_config.headers.clone(),
                 oauth_provider: Some(self.oauth_provider_ref()),
                 oauth_config: server_config.oauth.clone(),
+                taint_scanning: server_config.taint_scanning,
             };
 
             match McpConnection::connect(mcp_config).await {
@@ -9251,6 +9252,7 @@ system_prompt = "You are a helpful assistant."
             headers: server_config.headers.clone(),
             oauth_provider: Some(self.oauth_provider_ref()),
             oauth_config: server_config.oauth.clone(),
+            taint_scanning: server_config.taint_scanning,
         };
 
         match McpConnection::connect(mcp_config).await {
@@ -9385,6 +9387,7 @@ system_prompt = "You are a helpful assistant."
                 headers: server_config.headers.clone(),
                 oauth_provider: Some(self.oauth_provider_ref()),
                 oauth_config: server_config.oauth.clone(),
+                taint_scanning: server_config.taint_scanning,
             };
 
             self.extension_health.register(&server_config.name);
@@ -9531,6 +9534,7 @@ system_prompt = "You are a helpful assistant."
             headers: server_config.headers.clone(),
             oauth_provider: Some(self.oauth_provider_ref()),
             oauth_config: server_config.oauth.clone(),
+            taint_scanning: server_config.taint_scanning,
         };
 
         match McpConnection::connect(mcp_config).await {
