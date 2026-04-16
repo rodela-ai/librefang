@@ -384,25 +384,6 @@ pub trait ChannelBridgeHandle: Send + Sync {
     ) {
     }
 
-    /// Classify the reply intent for a message.
-    #[allow(unused_variables)]
-    async fn classify_reply_intent(
-        &self,
-        _agent_id: AgentId,
-        _message: &str,
-        _sender_id: &str,
-        _is_group: bool,
-        _was_mentioned: bool,
-        _sender_aliases: &[String],
-    ) -> i32 {
-        0
-    }
-
-    /// Get custom precheck prompt for an agent.
-    async fn get_precheck_prompt(&self, _agent_id: AgentId) -> Option<String> {
-        None
-    }
-
     /// Get the agent's upload directory.
     async fn agent_upload_dir(&self, _agent_id: AgentId) -> Option<std::path::PathBuf> {
         None
