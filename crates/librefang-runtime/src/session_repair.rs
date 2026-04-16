@@ -46,7 +46,7 @@ pub struct RepairStats {
 /// This ensures the message list is well-formed:
 /// 1. Drops orphaned ToolResult blocks that have no matching ToolUse
 /// 2. Drops empty messages
-///    - 2a1. Pair-aware positional validation (MUST run before 2b/2c/2d/2e)
+///    - 2a1. Pair-aware positional validation (MUST run before 2a/2a1/2b/2c/2d/2e)
 ///    - 2b. Reorders misplaced ToolResults to follow their matching ToolUse
 ///    - 2c. Inserts synthetic error results for unmatched ToolUse blocks
 ///    - 2d. Deduplicates ToolResults with the same tool_use_id
