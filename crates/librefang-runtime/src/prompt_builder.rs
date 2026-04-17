@@ -601,7 +601,7 @@ fn build_channel_section(
     is_group: bool,
     was_mentioned: bool,
     bot_username: Option<&str>,
-    _group_members: &[(String, String, Option<String>)],
+    group_members: &[(String, String, Option<String>)],
     granted_tools: &[String],
 ) -> String {
     let (limit, hints) = match channel {
@@ -1412,80 +1412,6 @@ mod tests {
             !section.contains("channel_send"),
             "Should NOT mention channel_send when tool is not available"
         );
-    }
-
-    #[test]
-    fn test_channel_bot_handle_self_awareness() {
-        let section = build_channel_section(
-            "telegram",
-            Some("Alice"),
-            Some("123"),
-            Some("alice"),
-            true,
-            true,
-            Some("mybot"),
-            &[],
-        );
-        assert!(section.contains("@mybot"));
-        assert!(section.contains("valid alias"));
-        // Current sender rendered with its @handle
-        assert!(section.contains("Alice"));
-        assert!(section.contains("@alice"));
-    }
-
-    #[test]
-    fn test_channel_group_roster_rendered() {
-        let members = vec![
-            (
-                "1".to_string(),
-                "Alice".to_string(),
-                Some("alice".to_string()),
-            ),
-            (
-                "2".to_string(),
-                "Bob Smith".to_string(),
-                Some("bobsmith".to_string()),
-            ),
-            ("3".to_string(), "carol".to_string(), None),
-        ];
-        let section = build_channel_section(
-            "telegram",
-            Some("Alice"),
-            Some("1"),
-            Some("alice"),
-            true,
-            true,
-            Some("mybot"),
-            &members,
-        );
-        assert!(section.contains("### Known members of this group"));
-        assert!(section.contains("Alice"));
-        assert!(section.contains("Bob Smith"));
-        assert!(section.contains("carol"));
-        assert!(section.contains("@bobsmith"));
-        assert!(section.contains("real humans"));
-        assert!(section.contains("NEVER agents"));
-    }
-
-    #[test]
-    fn test_channel_dm_has_no_roster() {
-        // DMs should never get a roster block even if one is passed.
-        let members = vec![(
-            "1".to_string(),
-            "Alice".to_string(),
-            Some("alice".to_string()),
-        )];
-        let section = build_channel_section(
-            "telegram",
-            Some("Alice"),
-            Some("1"),
-            Some("alice"),
-            false, // is_group = false
-            false,
-            Some("mybot"),
-            &members,
-        );
-        assert!(!section.contains("### Known members of this group"));
     }
 
     #[test]

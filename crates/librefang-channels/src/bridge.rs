@@ -10,7 +10,7 @@ use crate::router::AgentRouter;
 use crate::sanitizer::{InputSanitizer, SanitizeResult};
 use crate::types::{
     default_phase_emoji, truncate_utf8, AgentPhase, ChannelAdapter, ChannelContent, ChannelMessage,
-    ChannelUser, InteractiveButton, LifecycleReaction, ParticipantRef, SenderContext,
+    ChannelUser, GroupMember, InteractiveButton, LifecycleReaction, ParticipantRef, SenderContext,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
