@@ -351,8 +351,8 @@ impl ChannelAdapter for IrcAdapter {
                                 }
 
                                 // RPL_WELCOME (001) — registration complete, join channels
-                                "001" => {
-                                    if !joined {
+                                "001"
+                                    if !joined => {
                                         info!("IRC registered as {nick_clone}");
                                         for ch in &channels_clone {
                                             let join_cmd = format!("JOIN {ch}\r\n");
@@ -364,7 +364,6 @@ impl ChannelAdapter for IrcAdapter {
                                         }
                                         joined = true;
                                     }
-                                }
 
                                 // PRIVMSG — incoming message
                                 "PRIVMSG" => {

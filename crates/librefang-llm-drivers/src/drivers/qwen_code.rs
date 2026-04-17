@@ -263,10 +263,8 @@ impl QwenCodeDriver {
                     let mut msg_parts = Vec::new();
                     for block in blocks {
                         match block {
-                            ContentBlock::Text { text, .. } => {
-                                if !text.is_empty() {
-                                    msg_parts.push(text.clone());
-                                }
+                            ContentBlock::Text { text, .. } if !text.is_empty() => {
+                                msg_parts.push(text.clone());
                             }
                             ContentBlock::Image { media_type, data } => {
                                 // Decode first — if the base64 is bad, we
