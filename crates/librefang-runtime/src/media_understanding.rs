@@ -730,11 +730,13 @@ mod tests {
             eprintln!("ffmpeg not on PATH — skipping");
             return;
         }
-        // With zero bytes ffmpeg produces no output on stdout and we reject it.
+        // With zero bytes ffmpeg either produces no output (older versions) or
+        // exits non-zero with an "End of file" / pipe error (newer versions).
+        // Both cases must be rejected; accept either error variant.
         let err = transcode_oga_to_ogg_opus(&[]).await.unwrap_err();
         assert!(
-            err.contains("empty output"),
-            "expected empty-output rejection, got: {err}"
+            err.contains("empty output") || err.contains("ffmpeg exited"),
+            "expected empty-output or ffmpeg-exit rejection, got: {err}"
         );
     }
 
