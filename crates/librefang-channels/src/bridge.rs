@@ -5,6 +5,7 @@
 
 use crate::formatter;
 use crate::rate_limiter::ChannelRateLimiter;
+use crate::roster::GroupRosterStore;
 use crate::router::AgentRouter;
 use crate::sanitizer::{InputSanitizer, SanitizeResult};
 use crate::types::{
@@ -1651,6 +1652,18 @@ fn extract_agent_name(message: &ChannelMessage) -> String {
 ///
 /// Per-channel auto-routing fields are populated from `overrides` when provided,
 /// and default to `AutoRouteStrategy::Off` / zeros otherwise.
+/// Singleton in-memory group roster shared across all channel adapters.
+///
+/// Populated on every incoming group message from `build_sender_context`. The
+/// accumulated roster is then handed to the agent's system prompt so the LLM
+/// can distinguish the current message sender from other group members it has
+/// seen before (e.g. when a user writes `@pepe` meaning another human, not an
+/// agent in the system).
+fn group_roster() -> &'static GroupRosterStore {
+    static ROSTER: OnceLock<GroupRosterStore> = OnceLock::new();
+    ROSTER.get_or_init(GroupRosterStore::new)
+}
+
 fn build_sender_context(
     message: &ChannelMessage,
     overrides: Option<&ChannelOverrides>,
@@ -1671,13 +1684,56 @@ fn build_sender_context(
         ),
         None => (AutoRouteStrategy::Off, 0, 0, 0, 0),
     };
-    let chat_id = if message.sender.platform_id.is_empty() {
-        None
+    let channel = channel_type_str(&message.channel).to_string();
+    // Preferred chat_id comes from metadata when the adapter populates it
+    // (Telegram, Discord, ...). Fall back to the sender platform_id for
+    // channels/flows that don't set it (WhatsApp / legacy path).
+    let chat_id = message
+        .metadata
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| {
+            if message.sender.platform_id.is_empty() {
+                None
+            } else {
+                Some(message.sender.platform_id.clone())
+            }
+        });
+    let bot_username = message
+        .metadata
+        .get("bot_username")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let sender_username = message
+        .metadata
+        .get("sender_username")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    // For group messages, upsert the current sender into the roster and then
+    // read back all known members. For DMs the roster stays empty — the LLM
+    // only needs the current sender and doesn't gain anything from a roster
+    // with a single member.
+    let group_members: Vec<GroupMember> = if message.is_group {
+        if let Some(ref cid) = chat_id {
+            let current = GroupMember {
+                user_id: sender_user_id(message).to_string(),
+                display_name: message.sender.display_name.clone(),
+                username: sender_username.clone(),
+            };
+            let store = group_roster();
+            store.upsert(&channel, cid, current);
+            store.members(&channel, cid)
+        } else {
+            Vec::new()
+        }
     } else {
-        Some(message.sender.platform_id.clone())
+        Vec::new()
     };
+
     SenderContext {
-        channel: channel_type_str(&message.channel).to_string(),
+        channel,
         user_id: sender_user_id(message).to_string(),
         chat_id,
         display_name: message.sender.display_name.clone(),
@@ -1702,10 +1758,9 @@ fn build_sender_context(
         // sock.groupMetadata). Empty for non-WhatsApp channels — addressee
         // guard then becomes a no-op (BC-01).
         group_participants: extract_group_participants(message),
-        // Additional fields for backward compatibility
-        bot_username: None,
-        sender_username: None,
-        group_members: Vec::new(),
+        bot_username,
+        sender_username,
+        group_members,
         chat_id_legacy: None,
     }
 }

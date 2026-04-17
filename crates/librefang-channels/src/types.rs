@@ -52,6 +52,22 @@ pub struct ChannelUser {
     pub librefang_user: Option<String>,
 }
 
+/// A known member of a group chat, accumulated from past messages.
+///
+/// Used to populate multi-user context in the system prompt so agents can
+/// distinguish between the current sender and other users mentioned in a
+/// message (e.g. `@pepe`, `@jose`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupMember {
+    /// Platform-specific user ID.
+    pub user_id: String,
+    /// Human-readable display name (what the platform shows).
+    pub display_name: String,
+    /// Optional `@handle` for platforms that expose one (Telegram, Discord, ...).
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
 /// Typing indicator event from a channel.
 #[derive(Debug, Clone)]
 pub struct TypingEvent {
@@ -316,16 +332,21 @@ pub struct SenderContext {
     /// this field still deserialize cleanly.
     #[serde(default)]
     pub group_participants: Vec<ParticipantRef>,
-    /// Bot username for this channel (if applicable).
+    /// The bot's own platform `@handle` on this channel (e.g. `mybot`
+    /// on Telegram). Used so the agent knows its own alias in the prompt.
     #[serde(default)]
     pub bot_username: Option<String>,
-    /// Sender's username/handle for this channel (if applicable).
+    /// The current sender's `@handle` on the platform, when available.
     #[serde(default)]
     pub sender_username: Option<String>,
-    /// Group members (legacy field, prefer group_participants).
+    /// Known members of the group chat where this message was sent
+    /// (populated by the in-memory roster store — Telegram/Discord/etc.).
+    /// Empty for DMs and for the very first message in a group before the
+    /// roster has accumulated any entries.
     #[serde(default)]
-    pub group_members: Vec<ParticipantRef>,
-    /// Chat ID for this context (legacy field, prefer chat_id).
+    pub group_members: Vec<GroupMember>,
+    /// Legacy chat id field, retained for stored canonical blob compatibility.
+    /// Prefer the top-level `chat_id` field.
     #[serde(default)]
     pub chat_id_legacy: Option<String>,
 }

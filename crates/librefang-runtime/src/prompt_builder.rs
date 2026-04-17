@@ -145,7 +145,7 @@ pub struct PromptContext {
     pub is_group: bool,
     /// Whether the bot was @mentioned in a group message.
     pub was_mentioned: bool,
-    /// The bot's own platform `@handle` (e.g. `fandangorodelo_bot` on Telegram).
+    /// The bot's own platform `@handle` (e.g. `mybot` on Telegram).
     /// Injected into the system prompt so the LLM recognises mentions of itself
     /// as a valid alias, not as a reference to some other entity.
     pub bot_username: Option<String>,
@@ -700,8 +700,33 @@ fn build_channel_section(
             section.push_str(" You were @mentioned directly — respond to this message.");
         }
 
-        // Group roster is now available via the `group_members` tool.
-        // No longer injected into the system prompt (saves context tokens).
+        // Group roster: list the known members so the agent can distinguish
+        // the current sender from other humans mentioned by `@handle` in the
+        // message text. Without this, a message like `dile a @jose ...` looks
+        // like a reference to an internal agent.
+        if !group_members.is_empty() {
+            section.push_str("\n\n### Known members of this group");
+            for (user_id, display_name, username) in group_members {
+                let name_clean = sanitize_identity(display_name);
+                let id_clean = sanitize_identity(user_id);
+                let handle = match username {
+                    Some(u) => format!(" (@{}, id={})", sanitize_identity(u), id_clean),
+                    None => format!(" (id={id_clean})"),
+                };
+                section.push_str(&format!("\n- {name_clean}{handle}"));
+            }
+            section.push_str(
+                "\n\nWhen a message contains an `@handle` or a user name, look it up \
+                 in the list above. Those are real humans in this chat. They are \
+                 NEVER agents or other LibreFang entities — if you need to reach \
+                 another agent you use the `agent_send` tool (by name), not an \
+                 `@` mention in the reply text. If the referenced name is not in \
+                 the list above, say so plainly — do not invent an identity. \
+                 Address replies to the actual sender of the current message, \
+                 not to other members unless explicitly asked to pass a message \
+                 along.",
+            );
+        }
     }
 
     // Tell the agent it can send rich media via channel_send when the tool is available.
@@ -1387,6 +1412,80 @@ mod tests {
             !section.contains("channel_send"),
             "Should NOT mention channel_send when tool is not available"
         );
+    }
+
+    #[test]
+    fn test_channel_bot_handle_self_awareness() {
+        let section = build_channel_section(
+            "telegram",
+            Some("Alice"),
+            Some("123"),
+            Some("alice"),
+            true,
+            true,
+            Some("mybot"),
+            &[],
+        );
+        assert!(section.contains("@mybot"));
+        assert!(section.contains("valid alias"));
+        // Current sender rendered with its @handle
+        assert!(section.contains("Alice"));
+        assert!(section.contains("@alice"));
+    }
+
+    #[test]
+    fn test_channel_group_roster_rendered() {
+        let members = vec![
+            (
+                "1".to_string(),
+                "Alice".to_string(),
+                Some("alice".to_string()),
+            ),
+            (
+                "2".to_string(),
+                "Bob Smith".to_string(),
+                Some("bobsmith".to_string()),
+            ),
+            ("3".to_string(), "carol".to_string(), None),
+        ];
+        let section = build_channel_section(
+            "telegram",
+            Some("Alice"),
+            Some("1"),
+            Some("alice"),
+            true,
+            true,
+            Some("mybot"),
+            &members,
+        );
+        assert!(section.contains("### Known members of this group"));
+        assert!(section.contains("Alice"));
+        assert!(section.contains("Bob Smith"));
+        assert!(section.contains("carol"));
+        assert!(section.contains("@bobsmith"));
+        assert!(section.contains("real humans"));
+        assert!(section.contains("NEVER agents"));
+    }
+
+    #[test]
+    fn test_channel_dm_has_no_roster() {
+        // DMs should never get a roster block even if one is passed.
+        let members = vec![(
+            "1".to_string(),
+            "Alice".to_string(),
+            Some("alice".to_string()),
+        )];
+        let section = build_channel_section(
+            "telegram",
+            Some("Alice"),
+            Some("1"),
+            Some("alice"),
+            false, // is_group = false
+            false,
+            Some("mybot"),
+            &members,
+        );
+        assert!(!section.contains("### Known members of this group"));
     }
 
     #[test]
