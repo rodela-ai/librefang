@@ -2682,8 +2682,6 @@ fn sanitize_telegram_html(text: &str) -> String {
                 if !tag_name_raw.is_empty()
                     && ALLOWED.iter().any(|a| a.eq_ignore_ascii_case(tag_name_raw))
                 {
-                    // Allowed tag — keep as-is
-                    result.push_str(&text[i..tag_end + 1]);
                     let tag_name = tag_name_raw.to_ascii_lowercase();
                     // Track open/close for balancing
                     if is_closing {
