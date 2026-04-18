@@ -2360,15 +2360,15 @@ async fn dispatch_message(
         }
     }
 
-    // For files: download to disk so the agent can access them via file_read.
+    // For files: download content so the agent can see it directly.
     // Telegram (and other) URLs are temporary and require auth, so the LLM
     // cannot fetch them directly.
-    let file_local_path = if let ChannelContent::File {
+    let file_content = if let ChannelContent::File {
         ref url,
         ref filename,
     } = message.content
     {
-        download_file_to_disk(url, filename).await
+        download_file_content(url, filename).await
     } else {
         None
     };
@@ -2390,9 +2390,9 @@ async fn dispatch_message(
         ChannelContent::File {
             ref filename,
             ref url,
-        } => match &file_local_path {
-            Some(path) => {
-                format!("[User sent a file: {filename} — saved locally at {path}]")
+        } => match &file_content {
+            Some(content) => {
+                format!("[User sent a file: {filename}]\n\n{content}")
             }
             None => format!("[User sent a file ({filename}): {url}]"),
         },
@@ -3227,10 +3227,13 @@ async fn download_image_to_blocks(
     blocks
 }
 
-/// Download a file from a URL (e.g. Telegram temporary link) and save it to
-/// `/tmp/librefang_uploads/` so the agent can access it via `file_read`.
-/// Returns `Some(local_path)` on success, `None` on failure.
-async fn download_file_to_disk(url: &str, filename: &str) -> Option<String> {
+/// Download a file from a URL (e.g. Telegram temporary link) and return its
+/// text content directly.  For text-readable files (UTF-8) the content is
+/// returned as `Some(content_string)` (truncated to ~100 KB to protect
+/// context windows).  For binary files (PDFs, images, archives) returns
+/// `Some("[Binary file: {filename} ({size} KB) — …]")` so the agent
+/// knows what was received even though the raw bytes cannot be inlined.
+async fn download_file_content(url: &str, filename: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
@@ -3257,33 +3260,47 @@ async fn download_file_to_disk(url: &str, filename: &str) -> Option<String> {
         }
     };
 
-    let upload_dir = std::env::temp_dir().join("librefang_uploads");
-    if let Err(e) = tokio::fs::create_dir_all(&upload_dir).await {
-        warn!("Failed to create upload dir: {e}");
-        return None;
-    }
+    let size_kb = bytes.len() / 1024;
+    tracing::debug!(
+        filename = filename,
+        size_kb = size_kb,
+        "Downloaded channel file"
+    );
 
-    // Preserve original extension from filename
-    let ext = std::path::Path::new(filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("bin");
-    let unique_name = format!("{}.{}", uuid::Uuid::new_v4(), ext);
-    let file_path = upload_dir.join(&unique_name);
-
-    match tokio::fs::write(&file_path, &bytes).await {
-        Ok(()) => {
-            tracing::debug!(
-                path = %file_path.display(),
-                filename = filename,
-                size_kb = bytes.len() / 1024,
-                "Saved channel file to disk"
-            );
-            Some(file_path.to_string_lossy().into_owned())
+    // Try to decode as UTF-8 text
+    const MAX_TEXT_BYTES: usize = 100 * 1024; // 100 KB cap
+    match String::from_utf8(bytes.to_vec()) {
+        Ok(text) => {
+            if text.len() > MAX_TEXT_BYTES {
+                let truncated = &text[..text.floor_char_boundary(MAX_TEXT_BYTES)];
+                Some(format!(
+                    "{truncated}\n\n[… truncated — file is {size_kb} KB total]"
+                ))
+            } else {
+                Some(text)
+            }
         }
-        Err(e) => {
-            warn!("Failed to write file to {}: {e}", file_path.display());
-            None
+        Err(_) => {
+            // Binary file — save to disk for potential shell_exec access
+            let upload_dir = std::env::temp_dir().join("librefang_uploads");
+            let _ = tokio::fs::create_dir_all(&upload_dir).await;
+            let ext = std::path::Path::new(filename)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("bin");
+            let unique_name = format!("{}.{}", uuid::Uuid::new_v4(), ext);
+            let file_path = upload_dir.join(&unique_name);
+            if let Err(e) = tokio::fs::write(&file_path, &bytes).await {
+                warn!(
+                    "Failed to write binary file to {}: {e}",
+                    file_path.display()
+                );
+            }
+            Some(format!(
+                "[Binary file ({size_kb} KB) saved at {}. \
+                 Use shell_exec with appropriate tools (e.g. pdftotext for PDFs) to extract content.]",
+                file_path.display()
+            ))
         }
     }
 }
