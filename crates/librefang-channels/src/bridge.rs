@@ -2360,6 +2360,19 @@ async fn dispatch_message(
         }
     }
 
+    // For files: download to disk so the agent can access them via file_read.
+    // Telegram (and other) URLs are temporary and require auth, so the LLM
+    // cannot fetch them directly.
+    let file_local_path = if let ChannelContent::File {
+        ref url,
+        ref filename,
+    } = message.content
+    {
+        download_file_to_disk(url, filename).await
+    } else {
+        None
+    };
+
     let text = match &message.content {
         ChannelContent::Text(t) => t.clone(),
         ChannelContent::Command { name, args } => reconstruct_command_text(name, args),
@@ -2375,11 +2388,14 @@ async fn dispatch_message(
             }
         }
         ChannelContent::File {
-            ref url,
             ref filename,
-        } => {
-            format!("[User sent a file ({filename}): {url}]")
-        }
+            ref url,
+        } => match &file_local_path {
+            Some(path) => {
+                format!("[User sent a file: {filename} — saved locally at {path}]")
+            }
+            None => format!("[User sent a file ({filename}): {url}]"),
+        },
         ChannelContent::Voice {
             ref url,
             ref caption,
@@ -3209,6 +3225,67 @@ async fn download_image_to_blocks(
     }
 
     blocks
+}
+
+/// Download a file from a URL (e.g. Telegram temporary link) and save it to
+/// `/tmp/librefang_uploads/` so the agent can access it via `file_read`.
+/// Returns `Some(local_path)` on success, `None` on failure.
+async fn download_file_to_disk(url: &str, filename: &str) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .ok()?;
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("File download failed for {filename}: {e}");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        warn!(
+            "File download returned HTTP {} for {filename}",
+            resp.status()
+        );
+        return None;
+    }
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("Failed to read file bytes for {filename}: {e}");
+            return None;
+        }
+    };
+
+    let upload_dir = std::env::temp_dir().join("librefang_uploads");
+    if let Err(e) = tokio::fs::create_dir_all(&upload_dir).await {
+        warn!("Failed to create upload dir: {e}");
+        return None;
+    }
+
+    // Preserve original extension from filename
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin");
+    let unique_name = format!("{}.{}", uuid::Uuid::new_v4(), ext);
+    let file_path = upload_dir.join(&unique_name);
+
+    match tokio::fs::write(&file_path, &bytes).await {
+        Ok(()) => {
+            tracing::debug!(
+                path = %file_path.display(),
+                filename = filename,
+                size_kb = bytes.len() / 1024,
+                "Saved channel file to disk"
+            );
+            Some(file_path.to_string_lossy().into_owned())
+        }
+        Err(e) => {
+            warn!("Failed to write file to {}: {e}", file_path.display());
+            None
+        }
+    }
 }
 
 /// Dispatch a multimodal message (content blocks) to an agent, handling routing
