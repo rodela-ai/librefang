@@ -2062,6 +2062,39 @@ async fn dispatch_message(
             if !should_process_group_message(ct_str, ov, message) {
                 return;
             }
+            // Reply-intent precheck: lightweight LLM classification for group
+            // messages when group_policy is "all" and precheck is enabled.
+            // Skipped for mentions and commands (already filtered above).
+            if ov.reply_precheck && matches!(ov.group_policy, GroupPolicy::All) {
+                let text = text_content(message).unwrap_or("");
+                let sender = &message.sender.display_name;
+                let was_mentioned = message
+                    .metadata
+                    .get("was_mentioned")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if let Some(aid) = resolve_or_fallback(message, handle, router).await {
+                    let aliases = handle.get_agent_aliases(aid).await;
+                    let result = handle
+                        .classify_reply_intent(
+                            aid,
+                            text,
+                            sender,
+                            true, // is_group
+                            was_mentioned,
+                            &aliases,
+                        )
+                        .await;
+                    if result == 0 {
+                        debug!(
+                            channel = ct_str,
+                            sender = %sender,
+                            "Reply precheck: NO_REPLY — staying silent"
+                        );
+                        return;
+                    }
+                }
+            }
         } else {
             // DM
             match ov.dm_policy {
