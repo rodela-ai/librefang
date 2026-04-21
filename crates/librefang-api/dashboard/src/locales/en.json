@@ -2196,6 +2196,8 @@
     "title": "Terminal",
     "subtitle_connected": "Connected",
     "subtitle_disconnected": "Disconnected",
+    "subtitle_connecting": "Connecting…",
+    "subtitle_reconnecting": "Reconnecting… ({{attempt}}/{{max}})",
     "subtitle_error": "Error: {{error}}",
     "connect": "Connect",
     "disconnect": "Disconnect",
@@ -2208,6 +2210,7 @@
     "root_warning": "Warning: The daemon is running as root. Terminal commands execute with full privileges.",
     "enter_fullscreen": "Enter fullscreen",
     "exit_fullscreen": "Exit fullscreen (Esc)",
+    "dismiss_error": "Dismiss",
     "tabs": {
       "new": "New tab",
       "unnamed": "Unnamed",
@@ -2221,7 +2224,17 @@
       "tmux_unavailable": "tmux is not available on this host",
       "name_label": "Window name",
       "name_invalid": "Only letters, digits, space, . _ - are allowed (1–64 chars).",
-      "counter": "{{used}} / {{total}}"
+      "counter": "{{used}} / {{total}}",
+      "help": "Keyboard shortcuts",
+      "help_title": "Tab shortcuts",
+      "help_switch": "Switch tab",
+      "help_switch_key": "Click",
+      "help_rename": "Rename tab",
+      "help_rename_key": "Double-click",
+      "help_close": "Close tab",
+      "help_close_key": "Middle-click / ✕",
+      "help_new": "New tab",
+      "help_new_key": "＋"
     },
     "install_tmux": "Install tmux"
   },
