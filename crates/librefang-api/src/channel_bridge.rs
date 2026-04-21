@@ -3706,6 +3706,7 @@ mod tests {
             "en",
         );
 
+        // Iteration 1: the tool-call content block.
         event_tx
             .send(StreamEvent::ToolUseStart {
                 id: "tool_1".to_string(),
@@ -3714,6 +3715,14 @@ mod tests {
             .await
             .unwrap();
         event_tx
+            .send(StreamEvent::ContentComplete {
+                stop_reason: librefang_types::message::StopReason::ToolUse,
+                usage: librefang_types::message::TokenUsage::default(),
+            })
+            .await
+            .unwrap();
+        // Tool executes; result feeds back into the next LLM iteration.
+        event_tx
             .send(StreamEvent::ToolExecutionResult {
                 name: "web_search".to_string(),
                 result_preview: "irrelevant".to_string(),
@@ -3721,6 +3730,7 @@ mod tests {
             })
             .await
             .unwrap();
+        // Iteration 2: model's prose response after seeing the tool result.
         event_tx
             .send(StreamEvent::TextDelta {
                 text: "Final answer.".to_string(),
