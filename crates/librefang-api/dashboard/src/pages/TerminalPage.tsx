@@ -95,6 +95,7 @@ export function TerminalPage() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toastDismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const intentionalDisconnectRef = useRef(false);
   const connectRef = useRef<() => void>(() => {});
   const attemptRef = useRef(0);
@@ -118,6 +119,7 @@ export function TerminalPage() {
 
   const terminalEnabled = useUIStore((s) => s.terminalEnabled);
   const addToast = useUIStore((s) => s.addToast);
+  const removeToast = useUIStore((s) => s.removeToast);
   const {
     data: terminalHealth,
     isError: terminalHealthError,
@@ -166,6 +168,7 @@ export function TerminalPage() {
     wsRef.current = ws;
 
     ws.onopen = () => {
+      const wasReconnect = attemptRef.current > 0;
       setIsConnecting(false);
       setIsConnected(true);
       attemptRef.current = 0;
@@ -177,6 +180,21 @@ export function TerminalPage() {
       }
       if (desiredWindowIdRef.current) {
         ws.send(JSON.stringify({ type: "switch_window", window: desiredWindowIdRef.current }));
+      }
+      if (wasReconnect) {
+        addToast(t("terminal.reconnected"), "success");
+        // Grab the id that addToast just inserted (it uses Date.now() as id).
+        const toasts = useUIStore.getState().toasts;
+        const latest = toasts[toasts.length - 1];
+        if (latest) {
+          if (toastDismissTimerRef.current) {
+            clearTimeout(toastDismissTimerRef.current);
+          }
+          toastDismissTimerRef.current = setTimeout(() => {
+            removeToast(latest.id);
+            toastDismissTimerRef.current = null;
+          }, 3000);
+        }
       }
       const hintKey = "terminal.copyPasteHintShown";
       if (!localStorage.getItem(hintKey)) {
@@ -385,6 +403,9 @@ export function TerminalPage() {
       lineHeight: 1.2,
       cursorBlink: true,
       cursorStyle: "block",
+      // Show a dimmed underline cursor when the terminal loses focus (xterm v5.5+).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ...({"cursorInactiveStyle": "underline"} as any),
       scrollback: 5000,
     });
 
@@ -405,6 +426,15 @@ export function TerminalPage() {
       if (e.ctrlKey && e.key === "f") {
         setSearchVisible(true);
         return false; // prevent xterm default
+      }
+      // Ctrl+L: clear the visible terminal buffer and forward \x0c to the shell
+      // so the shell's own clear handler also runs (e.g. bash/zsh clear scrollback).
+      if (e.type === "keydown" && e.ctrlKey && e.key === "l") {
+        term.clear();
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: "input", data: "\x0c" }));
+        }
+        return false; // prevent xterm from passing the keystroke a second time
       }
       return true;
     });
@@ -437,6 +467,9 @@ export function TerminalPage() {
       ro.disconnect();
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
+      }
+      if (toastDismissTimerRef.current) {
+        clearTimeout(toastDismissTimerRef.current);
       }
       if (wsRef.current) {
         intentionalDisconnectRef.current = true;
