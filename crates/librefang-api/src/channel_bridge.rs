@@ -3832,7 +3832,7 @@ mod tests {
         use librefang_kernel::error::KernelError;
         use librefang_types::error::LibreFangError;
 
-        let (_event_tx, event_rx) = mpsc::channel::<StreamEvent>(16);
+        let (_, event_rx) = mpsc::channel::<StreamEvent>(16);
         let kernel_handle = tokio::spawn(async {
             Err::<librefang_runtime::agent_loop::AgentLoopResult, KernelError>(
                 LibreFangError::Internal("rate limit hit".to_string()).into(),
@@ -3876,7 +3876,7 @@ mod tests {
         use librefang_kernel::error::KernelError;
         use librefang_types::error::LibreFangError;
 
-        let (_event_tx, event_rx) = mpsc::channel::<StreamEvent>(16);
+        let (_, event_rx) = mpsc::channel::<StreamEvent>(16);
         let kernel_handle = tokio::spawn(async {
             Err::<librefang_runtime::agent_loop::AgentLoopResult, KernelError>(
                 LibreFangError::Internal("some internal failure".to_string()).into(),
@@ -3921,7 +3921,7 @@ mod tests {
         use librefang_kernel::error::KernelError;
         use librefang_types::error::LibreFangError;
 
-        let (_event_tx, event_rx) = mpsc::channel::<StreamEvent>(16);
+        let (_, event_rx) = mpsc::channel::<StreamEvent>(16);
         let kernel_handle = tokio::spawn(async {
             // Mirror the kernel-side error format: a string that contains
             // the timeout marker constant.
