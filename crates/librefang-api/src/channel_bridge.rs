@@ -1974,7 +1974,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
     ) -> Result<String, String> {
         use librefang_runtime::kernel_handle::KernelHandle;
         self.kernel
-            .send_channel_message(channel_type, recipient, message, thread_id)
+            .send_channel_message(channel_type, recipient, message, thread_id, None)
             .await
     }
 }
@@ -3320,20 +3320,50 @@ pub async fn start_channel_bridge_with_config(
     }
 
     let mut started_names = Vec::new();
-    for (adapter, _, _account_id) in adapters {
+    // Track which plain keys were claimed by the first adapter in this batch.
+    // Using a per-batch set (not kernel.contains_key) ensures hot-reload always
+    // overwrites stale plain-key entries from a previous bridge cycle.
+    let mut plain_key_owners: std::collections::HashSet<String> = Default::default();
+    for (adapter, _, account_id) in adapters {
         let name = adapter.name().to_string();
-        // Register adapter in kernel so agents can use `channel_send` tool
-        kernel
-            .channel_adapters_ref()
-            .insert(name.clone(), adapter.clone());
+        // First adapter for this channel type in this reload batch claims the
+        // plain key (e.g. "telegram") as the backward-compat fallback.
+        // Later adapters for the same type are only reachable via their qualified
+        // "telegram:account_id" key.
+        let owns_plain_key = plain_key_owners.insert(name.clone());
+        if owns_plain_key {
+            kernel
+                .channel_adapters_ref()
+                .insert(name.clone(), adapter.clone());
+        }
+        // Always register under qualified key when account_id is present so
+        // agents can explicitly route through a specific bot.
+        if let Some(ref aid) = account_id {
+            let qualified = format!("{name}:{aid}");
+            kernel
+                .channel_adapters_ref()
+                .insert(qualified, adapter.clone());
+        }
         match manager.start_adapter(adapter).await {
             Ok(()) => {
                 info!("{name} channel bridge started");
                 started_names.push(name);
             }
             Err(e) => {
-                // Remove from kernel map if start failed
-                kernel.channel_adapters_ref().remove(&name);
+                // Only remove the plain key if this adapter owns it — removing
+                // it unconditionally would discard a working fallback inserted
+                // by an earlier adapter in this batch.
+                if owns_plain_key {
+                    kernel.channel_adapters_ref().remove(&name);
+                    // Release ownership so the next adapter of the same channel
+                    // type can claim the plain key as fallback.
+                    plain_key_owners.remove(&name);
+                }
+                if let Some(ref aid) = account_id {
+                    kernel
+                        .channel_adapters_ref()
+                        .remove(&format!("{name}:{aid}"));
+                }
                 error!("Failed to start {name} bridge: {e}");
             }
         }
@@ -3693,6 +3723,7 @@ mod tests {
             "en",
         );
 
+        // Iteration 1: the tool-call content block.
         event_tx
             .send(StreamEvent::ToolUseStart {
                 id: "tool_1".to_string(),
@@ -3701,6 +3732,14 @@ mod tests {
             .await
             .unwrap();
         event_tx
+            .send(StreamEvent::ContentComplete {
+                stop_reason: librefang_types::message::StopReason::ToolUse,
+                usage: librefang_types::message::TokenUsage::default(),
+            })
+            .await
+            .unwrap();
+        // Tool executes; result feeds back into the next LLM iteration.
+        event_tx
             .send(StreamEvent::ToolExecutionResult {
                 name: "web_search".to_string(),
                 result_preview: "irrelevant".to_string(),
@@ -3708,6 +3747,7 @@ mod tests {
             })
             .await
             .unwrap();
+        // Iteration 2: model's prose response after seeing the tool result.
         event_tx
             .send(StreamEvent::TextDelta {
                 text: "Final answer.".to_string(),
@@ -3819,7 +3859,7 @@ mod tests {
         use librefang_kernel::error::KernelError;
         use librefang_types::error::LibreFangError;
 
-        let (_event_tx, event_rx) = mpsc::channel::<StreamEvent>(16);
+        let (_, event_rx) = mpsc::channel::<StreamEvent>(16);
         let kernel_handle = tokio::spawn(async {
             Err::<librefang_runtime::agent_loop::AgentLoopResult, KernelError>(
                 LibreFangError::Internal("rate limit hit".to_string()).into(),
@@ -3863,7 +3903,7 @@ mod tests {
         use librefang_kernel::error::KernelError;
         use librefang_types::error::LibreFangError;
 
-        let (_event_tx, event_rx) = mpsc::channel::<StreamEvent>(16);
+        let (_, event_rx) = mpsc::channel::<StreamEvent>(16);
         let kernel_handle = tokio::spawn(async {
             Err::<librefang_runtime::agent_loop::AgentLoopResult, KernelError>(
                 LibreFangError::Internal("some internal failure".to_string()).into(),
@@ -3908,7 +3948,7 @@ mod tests {
         use librefang_kernel::error::KernelError;
         use librefang_types::error::LibreFangError;
 
-        let (_event_tx, event_rx) = mpsc::channel::<StreamEvent>(16);
+        let (_, event_rx) = mpsc::channel::<StreamEvent>(16);
         let kernel_handle = tokio::spawn(async {
             // Mirror the kernel-side error format: a string that contains
             // the timeout marker constant.
