@@ -5,6 +5,330 @@ All notable changes to LibreFang will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Calendar Versioning](https://calver.org/) (YYYY.M.DD).
 
+## [2026.4.21] - 2026-04-21
+
+### Added
+
+- Complete trigger feature — persistence, CRUD API, CLI subcommands, dashboard UI (#2827) (#2830) (@houko)
+- Add account_id to channel_send for explicit multi-bot routing (#2845) (@houko)
+- Add per-agent auto_evolve flag to skip background skill review (#2846) (@houko)
+- Implement MCP Roots capability (#2847) (@houko)
+
+### Fixed
+
+- Correct query invalidation and missing data flow across mutations (#2770) (@leszek3737)
+- Harden workflow save and draft state (#2781) (@leszek3737)
+- Align mutation flows across config channels goals and hands (#2782) (@leszek3737)
+- Unify dashboard query hooks and flow guards (#2783) (@leszek3737)
+- Exempt Unix/Slack-style timestamps from PII phone check (#2795) (@neo-wanderer)
+- Change wizard default ollama model to gemma3:4b (#2811) (@houko)
+- Strip empty assistant messages unconditionally (#2812) (@houko)
+- Auto-delete At-schedule jobs after execution (#2808) (#2814) (@houko)
+- Reimplement apply_seccomp_allowlist with libc::SYS_* constants (#2817) (@houko)
+- Allow dashboard static assets through auth gate (#2824) (@leszek3737)
+- Force wildcard bind for api_listen in Docker (#2825) (@leszek3737)
+- Resolve channel_bridge test deadlock that blocked CI for 6h (#2829) (@houko)
+- ChatPage — type safety, cache correctness, cleanup (#2832) (@leszek3737)
+- Correct event sequence in show_progress=false test (#2834) (@houko)
+- Exempt dashboard and static paths from GCRA rate limiter (#2835) (@houko)
+- Use main as default branch for ~/.librefang git repo (#2837) (@houko)
+- Task_claim() now matches assigned_to by name as well as UUID (#2844) (@houko)
+- Dashboard refresh no longer drops history — unify webui session with canonical (#2848) (@houko)
+- Type-safety and RC-safe fixes (#2849) (@leszek3737)
+- Unbreak --all-features build + stop warning on local LLM providers (#2850) (@houko)
+- Per-job session_mode override to fix context accumulation (#2647) (#2851) (@houko)
+- Proactive extraction loses JSON mode through fork path + log noise cleanup (#2852) (@houko)
+
+### Changed
+
+- RC cleanup for ModelsPage (#2833) (@leszek3737)
+- Relocate config backups under ~/.librefang/backups/ (#2838) (@houko)
+- Move stray state/log files out of ~/.librefang root (#2840) (@houko)
+
+### Documentation
+
+- Add unofficial wiki link and DeepWiki badge to READMEs (#2821) (@leszek3737)
+
+### Maintenance
+
+- Run Windows and macOS tests on affected crates for every Rust PR (#2819) (@houko)
+- Follow-up cleanup from #2783 review (#2820) (@houko)
+- Ignore rust_out build artifact (#2836) (@houko)
+
+
+## [2026.4.20] - 2026-04-20
+
+### Added
+
+- Canonical silent-response primitive, end the NO_REPLY literal leak (#2470) (@f-liva)
+- Gate /dashboard/* behind auth + tailwind v4 renames (#2785) (@houko)
+- Add stop button to interrupt in-flight agent streams (#2787) (@neo-wanderer)
+- Add native Cohere driver (#2791) (@houko)
+- Show tool execution progress in channel replies (#2792) (@houko)
+- Finish channel-progress — universal coverage, Telegram fix, show_progress, i18n, prettify, dashboard parity (#2793) (@houko)
+- Redesign `librefang status` for layered visibility (#2799) (@houko)
+- Unify create/edit modals + inline rename (#2800) (@houko)
+
+### Fixed
+
+- Make extract_categories config drive LLM prompt categories (#2761) (@neo-wanderer)
+- Sync terminal health and active window state (#2777) (@leszek3737)
+- Clear history consistently and refresh model state (#2780) (@leszek3737)
+- Align shared query flows for MCP, skills, and workflows (#2784) (@leszek3737)
+- Route comms_task through kernel wrapper; surface task system events (#2789) (@neo-wanderer)
+- Rewrite /install to /install.sh for CLI clients (#2794) (@houko)
+- Stop writing PATH into the wrong rc file (#2796) (@houko)
+- Auto-activate PATH after installation (#2797) (@houko)
+- Bypass auth for loopback connections (#2802) (@houko)
+- Drop stray </div> from #2800 modal refactor (#2803) (@houko)
+- Surface reload error to dashboard instead of opaque 'saved but reload failed' (#2805) (@houko)
+- Validate config BEFORE writing TOML so failed saves don't corrupt the file (#2806) (@houko)
+
+### Documentation
+
+- Clarify session_mode scope — cron/channels/forks ignore it (#2790) (@neo-wanderer)
+
+### Maintenance
+
+- Split PR/main pipelines; compute affected crates precisely (#2801) (@houko)
+- Merge release-* workflows into one (keep notify) (#2804) (@houko)
+
+
+## [2026.4.19] - 2026-04-19
+
+### Added
+
+- Add auto-dream per-agent background memory consolidation (#2750) (@houko)
+- Trigger on AgentLoopEnd hook, scheduler becomes backstop (#2755) (@houko)
+- Derivative LLM calls reuse parent's prompt cache (#2767) (@houko)
+
+### Fixed
+
+- Show Provider before Model in Config default_model section (#2749) (@houko)
+- Add peer_id to cron jobs for peer-scoped memory access (#2759) (@DaBlitzStein)
+- Match ImageFile in vision dispatch gates (#2762) (@DaBlitzStein)
+- Default api_listen to 127.0.0.1:4545 for local-only startup (closes #2766) (#2769) (@houko)
+- Clear stale TOTP banners, refetch status on reset, localize error messages (#2771) (@leszek3737)
+- Fix 12 UI bugs across scheduler, sessions, memory, models, plugins, providers, runtime, workflows (#2772) (@leszek3737)
+- Gate Duration import with cfg(unix) for Windows CI (#2773) (@houko)
+- Harden canvas workflow recovery and related UI state (#2774) (@leszek3737)
+- Derive 'connected' from health state + fix catalog card overflow (closes #2738) (#2775) (@houko)
+- Align workflow mutation invalidation (#2778) (@leszek3737)
+
+### Documentation
+
+- Fix stale documentation references (#2720) (@leszek3737)
+
+### Maintenance
+
+- Replace cloudflare/wrangler-action with direct npx wrangler calls (#2740) (@houko)
+
+
+## [Unreleased]
+
+### Changed
+
+- Default `api_listen` flipped from `0.0.0.0:4545` to `127.0.0.1:4545` (loopback-only). New installs are local-only by default; set `api_listen = "0.0.0.0:4545"` to expose on LAN/remote. Affects `librefang init`, the dashboard's init endpoint, and `librefang.toml.example`. `librefang start` with an explicit `--config <path>` that doesn't exist now prints a clear `librefang init` hint instead of failing obscurely. (#2766)
+
+## [2026.4.18] - 2026-04-18
+
+### Added
+
+- Forked agent pattern: kernel exposes `run_forked_agent_streaming(agent_id, prompt, allowed_tools)` for derivative LLM calls that share the parent turn's system + tools + message prefix (Anthropic prompt cache alignment) without persisting the derivative's messages into the canonical session. Anthropic driver's `cache_control` extended from system-only to cover both the last tool block (system + tools prefix) AND the last content block of the last message (full conversation prefix), giving forks near-full cache coverage. Dashboard settings page now surfaces cache-hit rate and per-dream cost so the forkedAgent savings are visible. Proactive-memory `LlmMemoryExtractor` migrated to the forkedAgent pattern: a new trait method `extract_memories_with_agent_id` routes the extraction LLM call through `KernelHandle::run_forked_agent_oneshot` (a new trait method that drives a single-turn fork and returns the final text), sharing the parent agent's `(system + tools + messages)` cache key. The extraction-specific system prompt is embedded into the fork's user message rather than replacing the agent's system prompt, so cache alignment holds. Fall back to a standalone `driver.complete()` with `prompt_caching = true` when no kernel handle is installed (tests / rule-based extractor / fork failure) so system-prompt caching still applies. Kernel wires the extractor's weak handle inside `set_self_handle` — first call only, matching the auto-dream hook idempotency pattern. Migrates auto-dream off its previous `SenderContext { channel: "auto_dream" }` side-channel pattern — dreams now fork from the canonical session and the kernel-side `channel == AUTO_DREAM_CHANNEL` tool filter is replaced by runtime `LoopOptions::allowed_tools` enforcement at tool execute time (request schema stays byte-identical to parent for cache alignment, model's `tool_use` for disallowed tools returns synthetic error). Agent loop adds `LoopOptions { is_fork, allowed_tools }` threaded through; fork turns skip `save_session_async` and add `"is_fork": true` to `AgentLoopEnd` hook context data so subscribers can filter fork events. Auto-dream's own hook filters fork turns to avoid dream-triggers-dream recursion. (@houko)
+- Auto-dream: per-agent background memory consolidation with four-layer gating (global / per-agent opt-in / time / session count / file lock). Triggered event-driven from the `AgentLoopEnd` hook (fires the moment an agent finishes a turn) with a sparse daily backstop scheduler for opted-in agents that never turn. Includes web dashboard toggle card, TUI Dashboard strip, `[auto_dream]` config section, `DreamConsolidation` audit events with token and cost capture, runtime tool allowlist enforcement, and `GET/POST/PUT /api/auto-dream/status|trigger|abort|enabled` endpoints. (#2750) (@houko)
+
+### Maintenance
+
+- Drop bogus npm cache config on setup-node (#2736) (@houko)
+
+
+## [2026.4.15] - 2026-04-15
+
+### Added
+
+- Add LIBREFANG_DASHBOARD_EMBEDDED_ONLY env var to pin dashboard to embedded assets (#2520) (@neo-wanderer)
+- Add TOTP scope selector in Settings (#2526) (@houko)
+- Add section tab switcher to config category pages (#2532) (@houko)
+- Add voice input button to ChatPage (#2533) (@houko)
+- Swap tab bar and page header positions in config pages (#2534) (@houko)
+- Polish config page layout and UX (#2535) (@houko)
+- Step-by-step provider creation wizard (#2544) (@houko)
+
+### Fixed
+
+- Scope telegram sessions per chat_id to prevent context leakage (#2349) (#2522) (@DaBlitzStein)
+- Honour silent flag in KernelBridgeAdapter sender methods (#2521) (#2523) (@DaBlitzStein)
+- Use is_some_and instead of map_or in webchat asset_path check (#2525) (@houko)
+- Move TOTP scope to ConfigPage via schema (#2527) (@houko)
+- Restore ready-for-review when blockers are cleared (#2528) (@houko)
+- Fall back to npm when pnpm is unavailable in dev command (#2529) (@houko)
+- Check review state before clearing needs-changes on push (#2530) (@houko)
+- Remove needless borrow in serde_json::to_value call (#2531) (@houko)
+- Show disabled mic button when STT not configured (#2536) (@houko)
+- Fix stale state bugs in provider config modal (#2537) (@houko)
+- Move field description to label column (#2538) (@houko)
+- Show field description below input/toggle (#2539) (@houko)
+- Save API key on provider creation and show remove button for all providers (#2540) (@houko)
+- Improve provider auto-detection accuracy and UX (#2542) (@houko)
+- Remove orphaned doc comment causing clippy failure on main (#2543) (@houko)
+
+
+## [2026.4.14] - 2026-04-14
+
+### Added
+
+- Pass image blocks to CLI via @path references (#2331) (@f-liva)
+- MCP OAuth discovery for Streamable HTTP transport (#2346) (@neo-wanderer)
+- Add require_auth_for_reads to lock down dashboard reads (#2398) (@houko)
+- Per-call deep-thinking toggle and reasoning display (#2423) (@houko)
+- Add audit.anchor_path to redirect the tip-anchor file (#2442) (@houko)
+- Enrich registry cards with manifest metadata (#2452) (@houko)
+- Channel scoping enforcement, proactive LID, heartbeat watchdog, jittered backoff (#2462) (@f-liva)
+- PR review state and issue response tracking labels (#2471) (@houko)
+- Multi-page configuration editor under Configuration nav group (#2473) (@houko)
+- Group addressee detection — stop responding when not actually spoken to (#2480) (@f-liva)
+- Per-provider cost/token limits (#2316) (#2482) (@houko)
+- Add qwen3.6-plus from coding plan (#2494) (@joshuachong)
+- Add echo tracker to drop our own messages reflected back (#2498) (@f-liva)
+
+### Fixed
+
+- Transcode .oga to .ogg before Whisper transcription (#2386) (@f-liva)
+- Relax brittle alibaba-coding-plan model count assertion (#2388) (@houko)
+- Block SSRF via IPv4-mapped IPv6 addresses (#2396) (@houko)
+- Reject path traversal in agent template name param (#2397) (@houko)
+- Require trusted_manifest_signers for signed manifests (#2407) (@houko)
+- Make NonceTracker check_and_record atomic and bounded (#2408) (@houko)
+- Block SSRF via NAT64 well-known prefix (64:ff9b::/96) (#2409) (@houko)
+- Stop leaking sandbox watchdog threads (#2410) (@houko)
+- Extend IPv4-mapped IPv6 SSRF guard to remaining call sites (#2411) (@houko)
+- Clippy regressions from refactor splits (#2404, #2406) (#2412) (@houko)
+- GCRA rate limiter never honoured per-key token exhaustion (#2413) (@houko)
+- Strip parent env before host_shell_exec spawns child (#2417) (@houko)
+- Tighten upload MIME allowlist to match SECURITY.md (#2419) (@houko)
+- Split_message panic on multi-byte UTF-8 at boundary (#2285) (#2420) (@houko)
+- Add default connect/read timeouts to shared HTTP client (#2340) (#2421) (@houko)
+- Lock Owner-only writes away from Admin-role API keys (#2422) (@houko)
+- Copy button silently failing in non-secure contexts (#2424) (@houko)
+- At schedules in the past no longer fire forever (#2337) (#2425) (@houko)
+- Task_claim accepts agent name in addition to UUID (#2330) (#2427) (@houko)
+- Emit stub tool_results when batch is interrupted (#2381) (#2428) (@houko)
+- Actually extract WWW-Authenticate from rmcp AuthRequired (#2429) (@houko)
+- Hot-reload of agent.toml updates ResourceQuota immediately (#2317) (#2430) (@houko)
+- Add external tip anchor to audit log to detect full rewrites (#2431) (@houko)
+- Default delivery to LastChannel instead of None (#2338) (#2432) (@houko)
+- Session_repair phase 3 preserves tool-call boundaries (#2353) (#2433) (@houko)
+- Claude_code fails fast when agent has tools (#2314) (#2434) (@houko)
+- Wire audit log through with_db_anchored by default (#2436) (@houko)
+- Use full viewport width for page content (#2439) (@houko)
+- Enforce capability inheritance at spawn_agent_inner (#2440) (@houko)
+- Terminal WebSocket rejected local-dev daemons with no api_key (#2441) (@houko)
+- Break Feishu bot self-echo loop (#2435) (#2443) (@houko)
+- Extend taint-sink checks to agent_send and web_fetch body/headers (#2444) (@houko)
+- Terminal WebSocket froze after ~10 keystrokes from per-message cap (#2445) (@houko)
+- Cap chat message bubble width for readability (#2446) (@houko)
+- Taint-scan MCP tool-call arguments before send (#2447) (@houko)
+- Derive require_auth_for_reads from api_key when unset (#2448) (@houko)
+- Make overview stats cards responsive at md breakpoint (#2449) (@houko)
+- Tighten recent agents grid and widen running hand chips (#2450) (@houko)
+- Repair mobile layout breakage across pages (#2451) (@houko)
+- Tighten card grid breakpoints across pages (#2453) (@houko)
+- Revert issue auto-label body scan, keep keyword expansion (#2457) (@houko)
+- Match camelCase/snake_case keywords in issue auto-label (#2461) (@houko)
+- Scope canonical context injection per session to stop cross-chat leak (#2464) (@f-liva)
+- Stop killing unrelated process groups in tree-kill path (#2472) (@houko)
+- Bridge LibreFang tools to claude_code driver via MCP config (#2314) (#2478) (@houko)
+- Scope canonical context injection per session to stop cross-chat leak (#2464) (#2490) (@houko)
+- Wire MCP bridge end-to-end for claude_code (#2314) (#2495) (@houko)
+- Use direct libc::kill syscall to prevent Ubuntu CI SIGTERM (#2497) (@houko)
+
+### Changed
+
+- Extract http_client into librefang-http shared crate (#2389) (@houko)
+- Extract metering into librefang-kernel-metering subcrate (#2395) (@houko)
+- Extract oauth flows into librefang-runtime-oauth subcrate (#2400) (@houko)
+- Extract mcp into librefang-runtime-mcp subcrate (#2403) (@houko)
+- Extract drivers and llm_driver trait into subcrates (#2404) (@houko)
+- Extract wasm sandbox and kernel-handle trait into subcrates (#2405) (@houko)
+- Extract hand/template router into librefang-kernel-router subcrate (#2406) (@houko)
+- Remove bare SignedManifest::verify() and inline it as private (#2437) (@houko)
+- Rename librefang-runtime-drivers to librefang-llm-drivers (#2467) (@houko)
+- Extract pure helpers and tests out of kernel.rs (#2469) (@houko)
+
+### Documentation
+
+- Describe prompt-injection scanner as a heuristic (#2399) (@houko)
+- Audit chain is tamper-evident only against partial edits (#2415) (@houko)
+- Narrow the secret-zeroization claim to its actual scope (#2416) (@houko)
+- Describe taint tracking as a two-sink pattern match (#2426) (@houko)
+- Document additive penalty assumption in fallback recover (#2465) (@f-liva)
+
+### Maintenance
+
+- Stabilize load_endpoint_latency against shared-runner jitter (#2418) (@houko)
+- Remove stray empty .codex marker file (#2454) (@houko)
+- Broaden issue auto-label coverage and add backfill (#2455) (@houko)
+- Refresh dashboard screenshot and drop unused images (#2456) (@houko)
+- Address houko follow-ups on oga transcode (#2459) (@f-liva)
+- Tidy repo metadata and remove stale api-docs (#2466) (@houko)
+- PR conflict/CI-failure detection and issue status labels (#2481) (@houko)
+- Sync Cargo.lock with librefang-api toml_edit dep (#2500) (@houko)
+- Sync Cargo.lock after librefang-llm-driver dep addition (#2501) (@houko)
+
+
+## [2026.4.13] - 2026-04-13
+
+### Added
+
+- Allow editing hand agent model settings from agents page (#2335) (@leszek3737)
+- Add config-driven session_mode for agent triggers (#2341) (@neo-wanderer)
+- Telegram rich media, polls, interactive commands, and channel_send tool (#2356) (@leszek3737)
+
+### Fixed
+
+- Decryption retry, streaming tag leak, session isolation (#2217) (@f-liva)
+- Inherit kernel default_model instead of hardcoded Anthropic (#2299) (@houko)
+- Per-agent loading state so streaming one agent doesn't block others (#2324) (@houko)
+- Write MCP server config as TOML table, not stringified JSON (#2327) (@houko)
+- Load secrets.env autonomously at boot time (#2359) (@f-liva)
+- Prevent zombie processes on shutdown (#2360) (@f-liva)
+- Refuse direct DELETE on hand-spawned agents + clarify revert warning (#2361) (@houko)
+- Normalize MIME type parameters before allowlist check (#2362) (@f-liva)
+- Resolve LID JIDs to phone numbers for owner detection (#2363) (@f-liva)
+- Harden poll_options parsing and poll context cleanup (#2364) (@houko)
+- Deterministic prompt context ordering and raise truncation cap (#2365) (@houko)
+- Stop Qwen driver from leaking raw JSON into chat (#2366) (@f-liva)
+- Let FallbackDriver recover from transient unhealthiness (#2367) (@f-liva)
+- Clear stale per-agent overrides on provider switch (#2371) (@neo-wanderer)
+- Scrub NO_REPLY sentinel in every reply path (#2373) (@f-liva)
+- Restore /message/send-audio endpoint accidentally removed in #2217 (#2376) (@f-liva)
+- Support "date" metric format and drop ureq from cli (#2382) (@houko)
+
+### Performance
+
+- Shrink dev debug info to line-tables-only (#2378) (@houko)
+
+### Maintenance
+
+- Split Docker image and deploy status (#2323) (@houko)
+- Fix max_tokens assertions after pure-text short-circuit (#2325) (@houko)
+- Strengthen telegram sanitizer coverage (#2334) (@leszek3737)
+- Fix rustfmt on upsert_mcp_server test assert (#2358) (@houko)
+- Replace cat with sleep in process_manager tests to fix flake (#2375) (@houko)
+- Skip security and install-smoke on unrelated PRs (#2377) (@houko)
+- Apply cargo fmt to runtime drivers (#2380) (@houko)
+
+
+## [Unreleased]
+
+### Added
+
+- Config-driven session mode for agent triggers (`session_mode = "new" | "persistent"`) — per-agent default with per-trigger override
+
+### Security
+
+- **BREAKING**: `require_auth_for_reads` now defaults to *enabled* whenever any form of authentication is configured (`api_key`, `user_api_keys`, or dashboard credentials). Previously the flag had to be set explicitly, leaving read endpoints open even on instances with an `api_key`. Operators who deliberately want open reads on an authenticated instance (e.g. behind a trusted reverse proxy) must now set `require_auth_for_reads = false` in `config.toml`. A boot-time INFO log records when the flag is auto-enabled. (#2448)
+
 ## [2026.4.11] - 2026-04-11
 
 ### Added

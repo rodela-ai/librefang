@@ -1,9 +1,8 @@
-import { useQuery } from "@tanstack/react-query";
 import { formatCompact } from "../lib/format";
 import { formatUptime } from "../lib/datetime";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { getMetricsText } from "../api";
+import { useTelemetryMetrics } from "../lib/queries/telemetry";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Card } from "../components/ui/Card";
 import { CardSkeleton } from "../components/ui/Skeleton";
@@ -13,8 +12,6 @@ import {
   Activity, BarChart3, Clock, Globe, TrendingUp, Zap, CheckCircle2,
   ExternalLink, Cpu, DollarSign, Bot, Wrench, MessageSquare, AlertTriangle, RotateCcw, Users,
 } from "lucide-react";
-
-const REFRESH_MS = 5000;
 
 // ── Parsed metric types ──────────────────────────────────────────────
 
@@ -154,17 +151,9 @@ function parseMetrics(text: string): ParsedMetrics {
 
 // ── Component ────────────────────────────────────────────────────────
 
-async function fetchMetrics(): Promise<string> {
-  return getMetricsText();
-}
-
 export function TelemetryPage() {
   const { t } = useTranslation();
-  const metricsQuery = useQuery({
-    queryKey: ["telemetry", "metrics"],
-    queryFn: fetchMetrics,
-    refetchInterval: REFRESH_MS,
-  });
+  const metricsQuery = useTelemetryMetrics();
 
   const parsed = useMemo(
     () =>
@@ -219,7 +208,7 @@ export function TelemetryPage() {
               <Badge variant="brand" className="ml-2">v{parsed.system.version}</Badge>
             )}
           </div>
-          <div className="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-4 xl:grid-cols-8 stagger-children">
+          <div className="grid grid-cols-2 gap-3 sm:gap-4 md:grid-cols-4 xl:grid-cols-8 stagger-children">
             <Card hover padding="md">
               <div className="flex items-center justify-between">
                 <span className="text-[10px] font-black uppercase tracking-widest text-text-dim/60">{t("telemetry.uptime")}</span>
@@ -295,7 +284,7 @@ export function TelemetryPage() {
             <h2 className="text-sm font-black tracking-tight uppercase">{t("telemetry.llm_usage")}</h2>
             <Badge variant="default" className="ml-2">{t("telemetry.tokens_1h")}</Badge>
           </div>
-          <div className="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-5 stagger-children">
+          <div className="grid grid-cols-2 gap-3 sm:gap-4 md:grid-cols-3 lg:grid-cols-5 stagger-children">
             <Card hover padding="md">
               <div className="flex items-center justify-between">
                 <span className="text-[10px] font-black uppercase tracking-widest text-text-dim/60">{t("telemetry.total_tokens")}</span>
@@ -334,7 +323,7 @@ export function TelemetryPage() {
           </div>
 
           {/* ── Per-Agent Table + HTTP Endpoints ── */}
-          <div className="grid gap-6 lg:grid-cols-2 stagger-children">
+          <div className="grid gap-6 md:grid-cols-2 stagger-children">
             {/* Per-Agent Token Usage */}
             <Card padding="lg">
               <div className="flex items-center gap-2 mb-5">

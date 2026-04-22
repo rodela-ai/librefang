@@ -10,6 +10,7 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::Mutex;
 
 /// GitHub tarball URL for the registry (no auth required).
 const REGISTRY_TARBALL_URL: &str =
@@ -24,6 +25,57 @@ const TARBALL_PREFIX: &str = "librefang-registry-main/";
 /// Default cache TTL: how long (in seconds) before we re-download the registry.
 /// Callers without access to `KernelConfig` can use this value directly.
 pub const DEFAULT_CACHE_TTL_SECS: u64 = 24 * 60 * 60; // 24 hours
+
+/// Serialises all writes to `~/.librefang/registry/`.
+///
+/// Without this, a manual `POST /api/catalog/update` firing at the same
+/// time as the 24h background catalog task could have two `git pull`
+/// subprocesses racing on the same working tree, which corrupts the
+/// checkout. Boot-time `sync_registry` and the catalog-only
+/// `refresh_registry_checkout` both acquire it. The lock is held across
+/// the blocking git/tar work; callers already run these via
+/// `spawn_blocking`, so a `std::sync::Mutex` is appropriate.
+static SYNC_LOCK: Mutex<()> = Mutex::new(());
+
+/// Refresh only the `~/.librefang/registry/` checkout from upstream —
+/// no fan-out into `workspaces/`, `providers/`, `workflows/templates/`
+/// etc. Callers like `catalog_sync` want the repo refreshed without
+/// accidentally re-installing agent templates or overwriting workflow
+/// templates every time the user clicks "Update catalog".
+///
+/// Returns `true` when the checkout is in a usable state (fresh pull,
+/// fresh clone, fresh tarball extract, or the on-disk copy from a
+/// previous successful run).
+pub fn refresh_registry_checkout(
+    home_dir: &Path,
+    cache_ttl_secs: u64,
+    registry_mirror: &str,
+) -> bool {
+    let _guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let registry_cache = home_dir.join("registry");
+
+    if should_refresh(&registry_cache, cache_ttl_secs) {
+        // Try git first (faster incremental updates, private fork support)
+        let git_ok = match git_clone_fallback(&registry_cache, registry_mirror) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::debug!("Git sync unavailable: {e} — trying HTTP download");
+                false
+            }
+        };
+
+        // Fall back to HTTP tarball if git failed
+        if !git_ok {
+            if let Err(e) = download_and_extract(&registry_cache, registry_mirror) {
+                tracing::warn!("HTTP registry download also failed: {e}");
+                return registry_cache.exists();
+            }
+        }
+    } else {
+        tracing::debug!("Registry cache is fresh, skipping download");
+    }
+    true
+}
 
 /// Sync all content from the registry to the local librefang home directory.
 ///
@@ -41,11 +93,10 @@ pub const DEFAULT_CACHE_TTL_SECS: u64 = 24 * 60 * 60; // 24 hours
 /// `"https://ghproxy.cn"` rewrites `https://github.com/...` to
 /// `https://ghproxy.cn/https://github.com/...`).
 pub fn sync_registry(home_dir: &Path, cache_ttl_secs: u64, registry_mirror: &str) -> bool {
+    let _guard = SYNC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let registry_cache = home_dir.join("registry");
 
-    if !should_refresh(&registry_cache, cache_ttl_secs) {
-        tracing::debug!("Registry cache is fresh, skipping download");
-    } else {
+    if should_refresh(&registry_cache, cache_ttl_secs) {
         // Try git first (faster incremental updates, private fork support)
         let git_ok = match git_clone_fallback(&registry_cache, registry_mirror) {
             Ok(()) => true,
@@ -64,14 +115,28 @@ pub fn sync_registry(home_dir: &Path, cache_ttl_secs: u64, registry_mirror: &str
                 }
             }
         }
+    } else {
+        tracing::debug!("Registry cache is fresh, skipping download");
     }
 
     // Pre-install core content users need out of the box.
     // Skills and plugins stay in registry — users install via dashboard.
-    for &dir_name in &["providers", "integrations", "channels"] {
+    for &dir_name in &["providers", "channels"] {
         let src_dir = registry_cache.join(dir_name);
         if src_dir.exists() {
             sync_flat_files(&src_dir, &home_dir.join(dir_name), dir_name);
+        }
+    }
+    // MCP catalog templates: upstream publishes them under `mcp/`;
+    // on disk they live as the read-only catalog at `mcp/catalog/`.
+    {
+        let src_dir = registry_cache.join("mcp");
+        if src_dir.exists() {
+            sync_flat_files(
+                &src_dir,
+                &home_dir.join("mcp").join("catalog"),
+                "mcp/catalog",
+            );
         }
     }
 
@@ -269,13 +334,23 @@ fn git_clone_fallback(
     tracing::info!("Attempting git clone fallback");
 
     if registry_cache.join(".git").exists() {
-        // Already a git repo — try pull
+        // Already a git repo — fetch and reset to origin/main so that a
+        // detached HEAD or local branch can never stall the sync.
+        let fetch_ok = Command::new("git")
+            .args(["fetch", "--depth", "1", "-q", "origin", "main"])
+            .current_dir(registry_cache)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !fetch_ok {
+            return Err("git fetch origin main failed".into());
+        }
         let status = Command::new("git")
-            .args(["pull", "--ff-only", "-q"])
+            .args(["reset", "--hard", "origin/main", "-q"])
             .current_dir(registry_cache)
             .status()?;
         if !status.success() {
-            return Err(format!("git pull exited with {status}").into());
+            return Err(format!("git reset exited with {status}").into());
         }
     } else {
         // Clean slate
@@ -346,6 +421,7 @@ fn sync_flat_files(src_dir: &Path, dest_dir: &Path, label: &str) {
     };
 
     let mut synced = 0;
+    let mut updated = 0;
     let mut skipped = 0;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -359,7 +435,18 @@ fn sync_flat_files(src_dir: &Path, dest_dir: &Path, label: &str) {
 
         let dest_file = dest_dir.join(&name);
         if dest_file.exists() {
-            skipped += 1;
+            // Update if content differs — keeps builtin provider metadata (e.g.
+            // supports_thinking, new model entries) in sync with the registry.
+            // User API key config lives in config.toml, not in these TOML files.
+            let src_content = std::fs::read(&path).unwrap_or_default();
+            let dst_content = std::fs::read(&dest_file).unwrap_or_default();
+            if src_content == dst_content {
+                skipped += 1;
+            } else if std::fs::create_dir_all(dest_dir).is_ok()
+                && std::fs::write(&dest_file, &src_content).is_ok()
+            {
+                updated += 1;
+            }
             continue;
         }
 
@@ -368,8 +455,27 @@ fn sync_flat_files(src_dir: &Path, dest_dir: &Path, label: &str) {
         }
     }
 
-    if synced > 0 || skipped > 0 {
-        tracing::info!("{label} synced ({synced} new, {skipped} existing)");
+    // Remove local files that no longer exist in the registry source.
+    // This cleans up defunct providers/integrations after upstream pruning.
+    let mut removed = 0usize;
+    if let Ok(dest_entries) = std::fs::read_dir(dest_dir) {
+        for entry in dest_entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) if n.ends_with(".toml") => n.to_string(),
+                _ => continue,
+            };
+            if !src_dir.join(&name).exists() && std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+
+    if synced > 0 || updated > 0 || removed > 0 || skipped > 0 {
+        tracing::info!("{label} synced ({synced} new, {updated} updated, {removed} removed, {skipped} unchanged)");
     }
 }
 

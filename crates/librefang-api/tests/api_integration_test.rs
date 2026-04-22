@@ -114,6 +114,7 @@ async fn start_test_server_with_provider(
         webhook_router: Arc::new(tokio::sync::RwLock::new(Arc::new(axum::Router::new()))),
         api_key_lock: Arc::new(tokio::sync::RwLock::new(String::new())),
         provider_test_cache: dashmap::DashMap::new(),
+        config_write_lock: tokio::sync::Mutex::new(()),
     });
 
     let app = Router::new()
@@ -170,6 +171,7 @@ async fn start_test_server_with_provider(
         )
         .route("/api/tools", axum::routing::get(routes::list_tools))
         .route("/api/tools/{name}", axum::routing::get(routes::get_tool))
+        .route("/mcp", axum::routing::post(routes::mcp_http))
         .route("/api/shutdown", axum::routing::post(routes::shutdown))
         .layer(axum::middleware::from_fn(middleware::request_logging))
         .layer(TraceLayer::new_for_http())
@@ -432,7 +434,7 @@ async fn test_build_router_serves_dashboard_locales() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_build_router_providers_marks_lemonade_as_local() {
+async fn test_build_router_providers_marks_local_providers() {
     let harness = start_full_router("").await;
 
     let response = harness
@@ -454,12 +456,13 @@ async fn test_build_router_providers_marks_lemonade_as_local() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let providers = json["providers"].as_array().unwrap();
-    let lemonade = providers
+    // Ollama is always in the registry and must be marked as a local provider.
+    let ollama = providers
         .iter()
-        .find(|provider| provider["id"] == "lemonade")
-        .expect("lemonade provider should be present");
+        .find(|provider| provider["id"] == "ollama")
+        .expect("ollama provider should be present");
 
-    assert_eq!(lemonade["is_local"], serde_json::json!(true));
+    assert_eq!(ollama["is_local"], serde_json::json!(true));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1369,6 +1372,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         webhook_router: Arc::new(tokio::sync::RwLock::new(Arc::new(axum::Router::new()))),
         api_key_lock: api_key_lock.clone(),
         provider_test_cache: dashmap::DashMap::new(),
+        config_write_lock: tokio::sync::Mutex::new(()),
     });
 
     let api_key_state = middleware::AuthState {
@@ -1376,6 +1380,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         active_sessions: state.active_sessions.clone(),
         dashboard_auth_enabled: false,
         user_api_keys: Arc::new(Vec::new()),
+        require_auth_for_reads: false,
     };
 
     let app = Router::new()
@@ -1600,4 +1605,332 @@ async fn test_get_tool_not_found() {
 
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["error"].as_str().unwrap().contains("not found"));
+}
+
+// ---------------------------------------------------------------------------
+// Test: /api/hands/active enriched response (Task 1 of chat-picker plan)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_active_hands_includes_definition_metadata() {
+    use std::collections::{BTreeMap, HashMap};
+
+    let harness = start_full_router("").await;
+
+    // Install a fresh hand definition with a known name + icon.
+    let toml_content = r#"
+id = "test-grouping-hand"
+name = "Test Grouping Hand"
+description = "Hand fixture for chat picker grouping integration test"
+category = "productivity"
+icon = "🧪"
+
+[agent]
+name = "test-agent"
+description = "Coordinator role for the test grouping hand"
+system_prompt = "You are a test agent."
+
+[dashboard]
+metrics = []
+"#;
+    harness
+        .state
+        .kernel
+        .hands()
+        .install_from_content(toml_content, "")
+        .expect("install_from_content should succeed");
+
+    // Activate the hand to get an instance, then attach two roles by hand.
+    // (The kernel normally spawns agents; here we simulate that with set_agents
+    // so the test does not depend on the spawner subsystem.)
+    let instance = harness
+        .state
+        .kernel
+        .hands()
+        .activate("test-grouping-hand", HashMap::new())
+        .expect("activate should succeed");
+
+    let main_id = librefang_types::agent::AgentId::new();
+    let linter_id = librefang_types::agent::AgentId::new();
+    let mut agent_ids = BTreeMap::new();
+    agent_ids.insert("main".to_string(), main_id);
+    agent_ids.insert("linter".to_string(), linter_id);
+    harness
+        .state
+        .kernel
+        .hands()
+        .set_agents(instance.instance_id, agent_ids, Some("main".to_string()))
+        .expect("set_agents should succeed");
+
+    // Hit the endpoint via the in-process router.
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/hands/active")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router.oneshot should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("response is JSON");
+    let instances = json["instances"].as_array().expect("instances array");
+    let hand = instances
+        .iter()
+        .find(|i| i["hand_id"] == "test-grouping-hand")
+        .expect("our hand must appear in the active list");
+
+    // Existing fields — regression guard.
+    assert_eq!(hand["hand_id"], "test-grouping-hand");
+    assert!(hand["agent_id"].is_string(), "legacy agent_id must remain");
+    assert!(
+        hand["agent_name"].is_string(),
+        "legacy agent_name must remain"
+    );
+
+    // NEW fields from this plan.
+    assert_eq!(
+        hand["hand_name"], "Test Grouping Hand",
+        "hand_name must be exposed from definition"
+    );
+    assert_eq!(
+        hand["hand_icon"], "🧪",
+        "hand_icon must be exposed from definition"
+    );
+    assert_eq!(
+        hand["coordinator_role"], "main",
+        "coordinator_role must be exposed"
+    );
+
+    let agent_ids_obj = hand["agent_ids"]
+        .as_object()
+        .expect("agent_ids must be a JSON object");
+    assert_eq!(agent_ids_obj.len(), 2, "agent_ids must contain both roles");
+    assert_eq!(agent_ids_obj["main"], main_id.to_string());
+    assert_eq!(agent_ids_obj["linter"], linter_id.to_string());
+}
+
+// ── issue #2699: `/mcp` must rehydrate caller context from the
+// `X-LibreFang-Agent-Id` header so CLI drivers (claude-code) can call
+// workspace/cron/media tools without every invocation failing.
+
+/// Manifest that grants `cron_list` — needed to exercise the caller-
+/// identity path on the `/mcp` endpoint. `TEST_MANIFEST` only grants
+/// `file_read`, which would be rejected by the allowed-tools filter
+/// that the fix correctly activates.
+const MCP_TEST_MANIFEST: &str = r#"
+name = "mcp-test-agent"
+version = "0.1.0"
+description = "Integration test agent for /mcp bridge"
+author = "test"
+module = "builtin:chat"
+
+[model]
+provider = "ollama"
+model = "test-model"
+system_prompt = "You are a test agent."
+
+[capabilities]
+tools = ["cron_list", "cron_create", "cron_cancel"]
+memory_read = ["*"]
+memory_write = ["self.*"]
+"#;
+
+async fn call_mcp_cron_list(
+    server: &TestServer,
+    agent_header: Option<&str>,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let client = reqwest::Client::new();
+    let mut req = client
+        .post(format!("{}/mcp", server.base_url))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "cron_list", "arguments": {}},
+        }));
+    if let Some(id) = agent_header {
+        req = req.header("X-LibreFang-Agent-Id", id);
+    }
+    let resp = req.send().await.expect("mcp request send");
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.expect("mcp body parse");
+    (status, body)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_http_rehydrates_caller_context_from_agent_header() {
+    // Regression guard for issue #2699 — before the fix, the /mcp
+    // endpoint hardcoded `caller_agent_id = None`, so tools that
+    // require an agent identity (cron_*, file_*, media_*, schedule_*)
+    // failed with a generic error even when the call actually came
+    // from the CLI spawned by a registered agent.
+    let server = start_test_server().await;
+
+    // Spawn an agent with cron_* in its capabilities.tools.
+    let client = reqwest::Client::new();
+    let spawn_resp = client
+        .post(format!("{}/api/agents", server.base_url))
+        .json(&serde_json::json!({"manifest_toml": MCP_TEST_MANIFEST}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(spawn_resp.status(), 201);
+    let spawn_body: serde_json::Value = spawn_resp.json().await.unwrap();
+    let agent_id = spawn_body["agent_id"].as_str().unwrap().to_string();
+
+    // No header → cron_list must refuse with the "Agent ID required"
+    // error the tool surfaces when caller_agent_id is None.
+    let (status, body) = call_mcp_cron_list(&server, None).await;
+    assert_eq!(status, 200);
+    let content = body["result"]["content"][0]["text"].as_str().unwrap_or("");
+    let is_error = body["result"]["isError"].as_bool().unwrap_or(false);
+    assert!(
+        is_error,
+        "cron_list without caller_agent_id must surface an error; got content={content}"
+    );
+    assert!(
+        content.contains("Agent ID required") || content.contains("agent_id"),
+        "unexpected error text without header: {content}"
+    );
+
+    // With the header → cron_list resolves the agent, passes the
+    // allowed-tools check, and returns an empty list. This is the
+    // path Claude Code CLI takes after the fix.
+    let (status, body) = call_mcp_cron_list(&server, Some(&agent_id)).await;
+    assert_eq!(status, 200);
+    let is_error = body["result"]["isError"].as_bool().unwrap_or(false);
+    let content = body["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        !is_error,
+        "cron_list with X-LibreFang-Agent-Id must succeed; got error content={content}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_http_invalid_agent_header_falls_back_to_unauthenticated() {
+    // An unparseable or unknown agent ID must degrade gracefully to
+    // the unauthenticated path (same behaviour as no header) rather
+    // than 500-ing. Keeps external MCP clients working even if a
+    // misconfigured bridge stuffs a garbage ID into the header.
+    let server = start_test_server().await;
+
+    let (status, body) = call_mcp_cron_list(&server, Some("not-a-uuid")).await;
+    assert_eq!(status, 200);
+    let is_error = body["result"]["isError"].as_bool().unwrap_or(false);
+    assert!(
+        is_error,
+        "invalid header must still yield the unauthenticated error path"
+    );
+
+    // Well-formed UUID but not a registered agent — same deal.
+    let (status, body) =
+        call_mcp_cron_list(&server, Some("00000000-0000-0000-0000-000000000000")).await;
+    assert_eq!(status, 200);
+    let is_error = body["result"]["isError"].as_bool().unwrap_or(false);
+    assert!(
+        is_error,
+        "unknown agent ID must still yield the unauthenticated error path"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_http_unrestricted_agent_can_call_any_tool() {
+    // Regression guard: a manifest with `capabilities.tools = []`
+    // (or no [capabilities] section at all — same result) means
+    // "unrestricted" on the direct agent-loop path. The bridge must
+    // match that semantics. A naive implementation that passes the
+    // raw `manifest.capabilities.tools` as `allowed_tools` would
+    // produce `Some([])`, which `execute_tool` reads as "deny all"
+    // and every tool invoked through the bridge would return
+    // "Permission denied: agent does not have capability to use tool
+    // 'cron_list'" even though the direct path allows everything.
+    //
+    // The bridge must resolve the allowed-tool set the same way
+    // `kernel::send_message` does: `kernel.available_tools(id)` +
+    // `entry.mode.filter_tools(...)`.
+    const UNRESTRICTED_MANIFEST: &str = r#"
+name = "unrestricted-test-agent"
+version = "0.1.0"
+description = "Agent with no tool restrictions"
+author = "test"
+module = "builtin:chat"
+
+[model]
+provider = "ollama"
+model = "test-model"
+system_prompt = "You are a test agent."
+"#;
+
+    let server = start_test_server().await;
+
+    let client = reqwest::Client::new();
+    let spawn_resp = client
+        .post(format!("{}/api/agents", server.base_url))
+        .json(&serde_json::json!({"manifest_toml": UNRESTRICTED_MANIFEST}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(spawn_resp.status(), 201);
+    let spawn_body: serde_json::Value = spawn_resp.json().await.unwrap();
+    let agent_id = spawn_body["agent_id"].as_str().unwrap().to_string();
+
+    let (status, body) = call_mcp_cron_list(&server, Some(&agent_id)).await;
+    assert_eq!(status, 200);
+    let is_error = body["result"]["isError"].as_bool().unwrap_or(false);
+    let content = body["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        !is_error,
+        "unrestricted agent must be able to call cron_list through the bridge; got content={content}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mcp_http_enforces_agent_tool_allowlist() {
+    // The caller-context rehydration must ALSO propagate the agent's
+    // `capabilities.tools` allowlist so the bridge can't be used to
+    // privilege-escalate: if the agent didn't have a tool in its
+    // manifest, invoking it through `/mcp` with the agent's own ID
+    // must still be rejected. (TEST_MANIFEST only grants `file_read`,
+    // so `cron_list` must be denied.)
+    let server = start_test_server().await;
+
+    let client = reqwest::Client::new();
+    let spawn_resp = client
+        .post(format!("{}/api/agents", server.base_url))
+        .json(&serde_json::json!({"manifest_toml": TEST_MANIFEST}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(spawn_resp.status(), 201);
+    let spawn_body: serde_json::Value = spawn_resp.json().await.unwrap();
+    let agent_id = spawn_body["agent_id"].as_str().unwrap().to_string();
+
+    let (status, body) = call_mcp_cron_list(&server, Some(&agent_id)).await;
+    assert_eq!(status, 200);
+    let is_error = body["result"]["isError"].as_bool().unwrap_or(false);
+    let content = body["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        is_error,
+        "cron_list must be denied for an agent whose manifest omits it; got content={content}"
+    );
+    assert!(
+        content.contains("Permission denied") || content.contains("capability"),
+        "denial must mention permission/capability; got: {content}"
+    );
 }

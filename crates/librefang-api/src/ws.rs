@@ -22,17 +22,18 @@ use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
 use librefang_channels::types::SenderContext;
 use librefang_runtime::kernel_handle::KernelHandle;
-use librefang_runtime::llm_driver::StreamEvent;
+use librefang_runtime::llm_driver::{StreamEvent, PHASE_RESPONSE_COMPLETE};
 use librefang_runtime::llm_errors;
 use librefang_types::agent::AgentId;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+use url::Url;
 
 // ---------------------------------------------------------------------------
 // Verbose Level
@@ -135,6 +136,152 @@ pub fn ws_auth_token(headers: &HeaderMap, uri: &Uri) -> Option<String> {
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(ToOwned::to_owned)
         .or_else(|| ws_query_param(uri, "token"))
+}
+
+/// Validates the WebSocket `Origin` header against allowed origins.
+/// Returns Ok(()) if: (a) no Origin header (non-browser client), or (b) Origin matches.
+/// Returns Err(reason) if Origin is present but doesn't match any allowed origin.
+pub fn validate_ws_origin(
+    headers: &HeaderMap,
+    listen_port: Option<u16>,
+    extra_origins: &[String],
+    allow_remote: bool,
+) -> Result<(), String> {
+    let origin = match headers.get("origin") {
+        Some(v) => v.to_str().map_err(|_| "Invalid origin header encoding")?,
+        None => return Ok(()),
+    };
+
+    let parsed = Url::parse(origin).map_err(|_| format!("Invalid origin URL: {origin}"))?;
+    let origin_scheme = parsed.scheme();
+    let origin_host = parsed
+        .host_str()
+        .ok_or_else(|| format!("Origin missing host: {origin}"))?;
+    if origin_scheme != "http" && origin_scheme != "https" {
+        return Err(format!("Origin {origin} not in allowed list"));
+    }
+
+    let origin_port = if origin_scheme == "https" {
+        parsed.port().unwrap_or(443)
+    } else {
+        parsed.port().unwrap_or(80)
+    };
+
+    // Only loopback hosts (localhost / 127.0.0.1 / ::1) on the same port
+    // are auto-allowed. Fail closed when listen_port is unknown — otherwise
+    // a malformed api_listen would cause us to trust the wrong localhost:port.
+    if let Some(lp) = listen_port {
+        if origin_port == lp {
+            let normalized = normalize_origin_host(origin_host);
+            if normalized.eq_ignore_ascii_case("localhost") {
+                return Ok(());
+            }
+        }
+    }
+
+    // Wildcard "*" means allow all origins — only permitted when allow_remote is true.
+    // NOTE: The scheme check above (http/https only) runs before this wildcard path,
+    // so non-http schemes are always rejected regardless of wildcard.
+    if allow_remote && extra_origins.iter().any(|o| o == "*") {
+        return Ok(());
+    }
+
+    for extra in extra_origins {
+        let extra_parsed =
+            Url::parse(extra).map_err(|_| format!("Invalid extra origin URL: {extra}"))?;
+        let extra_scheme = extra_parsed.scheme();
+        let extra_host = extra_parsed
+            .host_str()
+            .ok_or_else(|| format!("Origin missing host in allowed origin: {extra}"))?;
+        let extra_port = if extra_scheme == "https" {
+            extra_parsed.port().unwrap_or(443)
+        } else {
+            extra_parsed.port().unwrap_or(80)
+        };
+
+        let normalized_extra_host = normalize_origin_host(extra_host);
+
+        if normalized_extra_host.eq_ignore_ascii_case(normalize_origin_host(origin_host))
+            && extra_scheme == origin_scheme
+            && origin_port == extra_port
+        {
+            return Ok(());
+        }
+    }
+
+    Err(format!("Origin {origin} not in allowed list"))
+}
+
+fn normalize_origin_host(host: &str) -> &str {
+    match host {
+        "localhost" | "127.0.0.1" | "::1" | "[::1]" => "localhost",
+        _ => host,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection Locality Detection
+// ---------------------------------------------------------------------------
+
+pub struct ConnectionLocality {
+    pub source_ip: IpAddr,
+    pub is_loopback: bool,
+    pub is_proxied: bool,
+    pub forwarded_ip: Option<IpAddr>,
+}
+
+impl ConnectionLocality {
+    pub fn is_local(&self) -> bool {
+        self.is_loopback && !self.is_proxied
+    }
+}
+
+pub fn detect_connection_locality(addr: &SocketAddr, headers: &HeaderMap) -> ConnectionLocality {
+    let source_ip = addr.ip();
+    let is_loopback = source_ip.is_loopback();
+
+    let proxy_headers = [
+        "x-forwarded-for",
+        "x-real-ip",
+        "cf-connecting-ip",
+        "fly-client-ip",
+        "true-client-ip",
+    ];
+
+    let is_proxied = proxy_headers.iter().any(|h| headers.contains_key(*h));
+
+    let forwarded_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .and_then(|v| v.trim().parse().ok())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .or_else(|| {
+            headers
+                .get("cf-connecting-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse().ok())
+        });
+
+    debug!(
+        source_ip = %source_ip,
+        is_loopback,
+        is_proxied,
+        forwarded_ip = ?forwarded_ip,
+        "WS connection locality detected"
+    );
+
+    ConnectionLocality {
+        source_ip,
+        is_loopback,
+        is_proxied,
+        forwarded_ip,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +596,12 @@ async fn handle_text_message(
                 }
             };
 
+            // Per-message toggles from the chat UI.
+            // `thinking`: override deep-thinking for this call (None = manifest default).
+            // `show_thinking`: whether to surface thinking deltas/content to the UI.
+            let thinking_override: Option<bool> = parsed["thinking"].as_bool();
+            let show_thinking: bool = parsed["show_thinking"].as_bool().unwrap_or(true);
+
             // Sanitize inbound user input
             let content = sanitize_user_input(&raw_content);
             if content.is_empty() {
@@ -582,15 +735,20 @@ async fn handle_text_message(
                 was_mentioned: false,
                 thread_id: None,
                 account_id: None,
+                // Dashboard chat shares storage with canonical `entry.session_id`
+                // so GET /session, list_agent_sessions, switch_agent_session,
+                // and agent_send all see the same conversation history.
+                use_canonical_session: true,
                 ..Default::default()
             };
             match state
                 .kernel
-                .send_message_streaming_with_sender_context_and_routing(
+                .send_message_streaming_with_sender_context_routing_and_thinking(
                     agent_id,
                     &content,
                     Some(kernel_handle),
                     &sender_ctx,
+                    thinking_override,
                 )
                 .await
             {
@@ -601,6 +759,14 @@ async fn handle_text_message(
                     let rl = state.kernel.config_ref();
                     let debounce_chars = rl.rate_limit.ws_debounce_chars;
                     let debounce_ms = rl.rate_limit.ws_debounce_ms;
+                    let show_thinking_stream = show_thinking;
+                    // Set by the stream forwarder when it maps the runtime's
+                    // `response_complete` phase to an early `typing:stop`.
+                    // The post-handle branch reads it to avoid sending a
+                    // duplicate `typing:stop` (an idempotent no-op on the
+                    // client, but a wasted WS frame + re-render).
+                    let early_stop_sent = Arc::new(AtomicBool::new(false));
+                    let early_stop_sent_stream = Arc::clone(&early_stop_sent);
                     let stream_task = tokio::spawn(async move {
                         let mut text_buffer = String::new();
                         let far_future = tokio::time::Instant::now() + Duration::from_secs(86400);
@@ -666,9 +832,17 @@ async fn handle_text_message(
                                                 }
 
                                                 // Map event to JSON with verbose filtering
-                                                if let Some(json) =
-                                                    map_stream_event(&ev, vlevel)
-                                                {
+                                                if let Some(json) = map_stream_event(
+                                                    &ev,
+                                                    vlevel,
+                                                    show_thinking_stream,
+                                                ) {
+                                                    if let StreamEvent::PhaseChange { phase, .. } = &ev {
+                                                        if phase == PHASE_RESPONSE_COMPLETE {
+                                                            early_stop_sent_stream
+                                                                .store(true, Ordering::Release);
+                                                        }
+                                                    }
                                                     if send_json(&sender_stream, &json)
                                                         .await
                                                         .is_err()
@@ -702,21 +876,29 @@ async fn handle_text_message(
                             // `rx.recv()` return `None` and the task exits
                             // naturally.  We give it up to 5 s before aborting
                             // as a safety net.
-                            let drain_result =
-                                tokio::time::timeout(Duration::from_secs(30), stream_task).await;
-                            if drain_result.is_err() {
-                                warn!("stream forwarder did not finish within 30 s — sending response before abort");
+                            match tokio::time::timeout(Duration::from_secs(30), stream_task).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(join_err)) => {
+                                    warn!(error = %join_err, "stream forwarder join failed");
+                                }
+                                Err(_) => {
+                                    warn!("stream forwarder did not finish within 30 s — aborting before sending response");
+                                }
                             }
 
-                            // Send typing lifecycle: stop
-                            let _ = send_json(
-                                sender,
-                                &serde_json::json!({
-                                    "type": "typing",
-                                    "state": "stop",
-                                }),
-                            )
-                            .await;
+                            // Send typing lifecycle: stop (skipped if the
+                            // stream forwarder already emitted it via the
+                            // `response_complete` phase).
+                            if !early_stop_sent.load(Ordering::Acquire) {
+                                let _ = send_json(
+                                    sender,
+                                    &serde_json::json!({
+                                        "type": "typing",
+                                        "state": "stop",
+                                    }),
+                                )
+                                .await;
+                            }
 
                             // NO_REPLY: agent intentionally chose not to reply
                             if result.silent {
@@ -732,8 +914,14 @@ async fn handle_text_message(
                                 return;
                             }
 
-                            // Strip <think>...</think> blocks from model output
-                            // (e.g. MiniMax, DeepSeek reasoning tokens)
+                            // Extract reasoning trace (optional) and strip
+                            // <think>...</think> blocks from model output
+                            // (e.g. MiniMax, DeepSeek reasoning tokens).
+                            let thinking_trace = if show_thinking {
+                                extract_think_content(&result.response)
+                            } else {
+                                None
+                            };
                             let cleaned_response = strip_think_tags(&result.response);
 
                             // Guard: ensure we never send an empty response
@@ -785,6 +973,9 @@ async fn handle_text_message(
                             if !result.memory_conflicts.is_empty() {
                                 resp_json["memory_conflicts"] =
                                     serde_json::json!(result.memory_conflicts);
+                            }
+                            if let Some(ref t) = thinking_trace {
+                                resp_json["thinking"] = serde_json::json!(t);
                             }
                             let _ = send_json(sender, &resp_json).await;
                         }
@@ -1079,9 +1270,23 @@ async fn handle_command(
 // ---------------------------------------------------------------------------
 
 /// Map a stream event to a JSON value, applying verbose filtering.
-fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_json::Value> {
+fn map_stream_event(
+    event: &StreamEvent,
+    verbose: VerboseLevel,
+    show_thinking: bool,
+) -> Option<serde_json::Value> {
     match event {
         StreamEvent::TextDelta { .. } => None, // Handled by debounce buffer
+        StreamEvent::ThinkingDelta { text } => {
+            if show_thinking {
+                Some(serde_json::json!({
+                    "type": "thinking_delta",
+                    "content": text,
+                }))
+            } else {
+                None
+            }
+        }
         StreamEvent::ToolUseStart { id, name } => Some(serde_json::json!({
             "type": "tool_start",
             "id": id,
@@ -1155,11 +1360,25 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
                 "is_error": is_error,
             })),
         },
-        StreamEvent::PhaseChange { phase, detail } => Some(serde_json::json!({
-            "type": "phase",
-            "phase": phase,
-            "detail": detail,
-        })),
+        StreamEvent::PhaseChange { phase, detail } => {
+            // Special case: `response_complete` fires when the LLM has emitted
+            // the final text but the agent loop is still doing post-processing
+            // (session save, proactive memory). Map to an early `typing:stop`
+            // so the dashboard can unblock the input while the later
+            // `response` event (with tokens/cost) is still in flight.
+            if phase == PHASE_RESPONSE_COMPLETE {
+                Some(serde_json::json!({
+                    "type": "typing",
+                    "state": "stop",
+                }))
+            } else {
+                Some(serde_json::json!({
+                    "type": "phase",
+                    "phase": phase,
+                    "detail": detail,
+                }))
+            }
+        }
         _ => None, // Skip ToolInputDelta, ContentComplete
     }
 }
@@ -1348,6 +1567,38 @@ pub fn strip_think_tags(text: &str) -> String {
     result
 }
 
+/// Extract the concatenated content of all `<think>...</think>` blocks from
+/// a model response. Returns `None` when no thinking blocks are present.
+///
+/// Paired with [`strip_think_tags`] so callers can surface the reasoning to
+/// the UI separately from the final answer.
+pub fn extract_think_content(text: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find("<think>") {
+        let after_open = &remaining[start + 7..]; // 7 = "<think>".len()
+        if let Some(end) = after_open.find("</think>") {
+            let thought = after_open[..end].trim();
+            if !thought.is_empty() {
+                parts.push(thought);
+            }
+            remaining = &after_open[end + 8..]; // 8 = "</think>".len()
+        } else {
+            // Unclosed — take everything after the opener as the thought.
+            let thought = after_open.trim();
+            if !thought.is_empty() {
+                parts.push(thought);
+            }
+            break;
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1360,6 +1611,46 @@ mod tests {
     fn test_ws_module_loads() {
         // Verify module compiles and loads correctly
         let _ = VerboseLevel::Off;
+    }
+
+    #[test]
+    fn test_extract_think_content_none_when_absent() {
+        assert!(extract_think_content("plain answer").is_none());
+        assert!(extract_think_content("").is_none());
+    }
+
+    #[test]
+    fn test_extract_think_content_single_block() {
+        let raw = "before<think>reasoning here</think>after";
+        assert_eq!(
+            extract_think_content(raw).as_deref(),
+            Some("reasoning here")
+        );
+    }
+
+    #[test]
+    fn test_extract_think_content_multiple_blocks() {
+        let raw = "<think>step one</think>mid<think>step two</think>end";
+        assert_eq!(
+            extract_think_content(raw).as_deref(),
+            Some("step one\n\nstep two")
+        );
+    }
+
+    #[test]
+    fn test_extract_think_content_unclosed_tag() {
+        let raw = "intro<think>tail thoughts never closed";
+        assert_eq!(
+            extract_think_content(raw).as_deref(),
+            Some("tail thoughts never closed")
+        );
+    }
+
+    #[test]
+    fn test_extract_and_strip_are_complementary() {
+        let raw = "hello <think>secret</think> world";
+        assert_eq!(strip_think_tags(raw), "hello  world");
+        assert_eq!(extract_think_content(raw).as_deref(), Some("secret"));
     }
 
     #[test]
@@ -1468,6 +1759,230 @@ mod tests {
             "Hello  world"
         );
         assert_eq!(strip_think_tags("No thinking here"), "No thinking here");
-        assert_eq!(strip_think_tags("<think>all thinking</think>"), "");
+        assert_eq!(
+            strip_think_tags(
+                "<think>all thinking
+</think>"
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn validate_ws_origin_missing_origin_allowed() {
+        let headers = HeaderMap::new();
+        let result = validate_ws_origin(&headers, Some(4545), &[], false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_ws_origin_localhost_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://localhost:4545".parse().unwrap());
+        let result = validate_ws_origin(&headers, Some(4545), &[], false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_ws_origin_127_0_0_1_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://127.0.0.1:4545".parse().unwrap());
+        let result = validate_ws_origin(&headers, Some(4545), &[], false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_ws_origin_ipv6_loopback_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://[::1]:4545".parse().unwrap());
+        let result = validate_ws_origin(&headers, Some(4545), &[], false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_ws_origin_wrong_host_port_mismatch_rejected() {
+        // Port mismatch: origin port 9999 != listen_port 4545
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://evil.com:9999".parse().unwrap());
+        let result = validate_ws_origin(&headers, Some(4545), &[], false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_ws_origin_lan_ip_same_port_rejected() {
+        // LAN IP with matching port should be rejected without explicit allowed_origins.
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://192.168.1.5:4545".parse().unwrap());
+        let result = validate_ws_origin(&headers, Some(4545), &[], false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_ws_origin_arbitrary_host_same_port_rejected() {
+        // Any hostname with matching port is rejected without explicit allowed_origins.
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://myserver.local:8080".parse().unwrap());
+        let result = validate_ws_origin(&headers, Some(8080), &[], false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_ws_origin_lan_ip_allowed_via_extra_origins() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://192.168.1.5:4545".parse().unwrap());
+        let result = validate_ws_origin(
+            &headers,
+            Some(4545),
+            &["http://192.168.1.5:4545".to_string()],
+            false,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_ws_origin_port_mismatch_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://localhost:9999".parse().unwrap());
+        let result = validate_ws_origin(&headers, Some(4545), &[], false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_ws_origin_https_with_default_port_allowed() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "https://localhost".parse().unwrap());
+        let result = validate_ws_origin(&headers, Some(443), &[], false);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_ws_origin_extra_origins_valid() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://my.domain.com:8080".parse().unwrap());
+        let result = validate_ws_origin(
+            &headers,
+            Some(4545),
+            &["http://my.domain.com:8080".to_string()],
+            false,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_ws_origin_extra_origins_scheme_mismatch() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://my.domain.com".parse().unwrap());
+        let result = validate_ws_origin(
+            &headers,
+            Some(4545),
+            &["https://my.domain.com".to_string()],
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_ws_origin_wildcard_allows_any_http_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "http://evil.example:9999".parse().unwrap());
+        // Wildcard + allow_remote=false should be rejected
+        let result = validate_ws_origin(&headers, Some(4545), &["*".to_string()], false);
+        assert!(result.is_err());
+        // Wildcard + allow_remote=true should be allowed
+        let result = validate_ws_origin(&headers, Some(4545), &["*".to_string()], true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_ws_origin_wildcard_allows_any_https_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "https://evil.example".parse().unwrap());
+        // Wildcard + allow_remote=false should be rejected
+        let result = validate_ws_origin(&headers, Some(4545), &["*".to_string()], false);
+        assert!(result.is_err());
+        // Wildcard + allow_remote=true should be allowed
+        let result = validate_ws_origin(&headers, Some(4545), &["*".to_string()], true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_ws_origin_wildcard_rejects_non_http_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "file://evil.example".parse().unwrap());
+        let result = validate_ws_origin(&headers, Some(4545), &["*".to_string()], true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_ws_origin_wildcard_rejects_malformed_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "not-a-url".parse().unwrap());
+        let result = validate_ws_origin(&headers, Some(4545), &["*".to_string()], true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn detect_locality_direct_loopback() {
+        use std::net::SocketAddr;
+        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let headers = HeaderMap::new();
+        let locality = detect_connection_locality(&addr, &headers);
+        assert!(locality.is_local());
+        assert!(!locality.is_proxied);
+        assert!(locality.forwarded_ip.is_none());
+    }
+
+    #[test]
+    fn detect_locality_loopback_with_xff() {
+        use std::net::SocketAddr;
+        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "8.8.8.8".parse().unwrap());
+        let locality = detect_connection_locality(&addr, &headers);
+        assert!(!locality.is_local());
+        assert!(locality.is_proxied);
+    }
+
+    #[test]
+    fn detect_locality_direct_remote() {
+        use std::net::SocketAddr;
+        let addr: SocketAddr = "8.8.8.8:12345".parse().unwrap();
+        let headers = HeaderMap::new();
+        let locality = detect_connection_locality(&addr, &headers);
+        assert!(!locality.is_local());
+        assert!(!locality.is_proxied);
+    }
+
+    #[test]
+    fn detect_locality_ipv6_loopback() {
+        use std::net::SocketAddr;
+        let addr: SocketAddr = "[::1]:12345".parse().unwrap();
+        let headers = HeaderMap::new();
+        let locality = detect_connection_locality(&addr, &headers);
+        assert!(locality.is_local());
+    }
+
+    #[test]
+    fn detect_locality_x_real_ip_sets_forwarded() {
+        use std::net::SocketAddr;
+        let addr: SocketAddr = "10.0.0.1:12345".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "1.2.3.4".parse().unwrap());
+        let locality = detect_connection_locality(&addr, &headers);
+        assert!(locality.is_proxied);
+        assert_eq!(locality.forwarded_ip.unwrap().to_string(), "1.2.3.4");
+    }
+
+    #[test]
+    fn detect_locality_xff_first_ip_parsed() {
+        use std::net::SocketAddr;
+        let addr: SocketAddr = "10.0.0.1:12345".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "1.1.1.1, 8.8.8.8, 9.9.9.9".parse().unwrap(),
+        );
+        let locality = detect_connection_locality(&addr, &headers);
+        assert_eq!(locality.forwarded_ip.unwrap().to_string(), "1.1.1.1");
     }
 }

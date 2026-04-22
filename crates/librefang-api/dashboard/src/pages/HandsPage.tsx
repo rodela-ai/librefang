@@ -1,32 +1,16 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { formatCost } from "../lib/format";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "@tanstack/react-router";
 import { router } from "../router";
 import {
-  activateHand,
-  deactivateHand,
-  listActiveHands,
-  listHands,
-  pauseHand,
-  resumeHand,
-  uninstallHand,
-  getHandStats,
-  getHandDetail,
-  getHandSettings,
-  setHandSecret,
-  updateHandSettings,
-  getHandSession,
-  sendHandMessage,
-  listCronJobs,
   type HandDefinitionItem,
   type HandInstanceItem,
   type HandStatsResponse,
   type HandSettingsResponse,
   type HandSessionMessage,
   type CronJobItem,
-} from "../api";
+} from "../lib/http/client";
 import { Badge } from "../components/ui/Badge";
 import { useUIStore } from "../lib/store";
 import { Input } from "../components/ui/Input";
@@ -47,14 +31,36 @@ import {
   Bot,
   User,
   AlertCircle,
+  FileText,
 } from "lucide-react";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Skeleton } from "../components/ui/Skeleton";
 import { EmptyState } from "../components/ui/EmptyState";
 import { MarkdownContent } from "../components/ui/MarkdownContent";
 import { truncateId } from "../lib/string";
-
-const REFRESH_MS = 15000;
+import {
+  useHands,
+  useActiveHands,
+  useHandDetail,
+  useHandSettings as useHandSettingsQuery,
+  useHandStats,
+  useHandStatsBatch,
+  useHandSession,
+  useHandManifestToml,
+} from "../lib/queries/hands";
+import { TomlViewer } from "../components/TomlViewer";
+import {
+  useActivateHand,
+  useDeactivateHand,
+  usePauseHand,
+  useResumeHand,
+  useUninstallHand,
+  useSetHandSecret,
+  useUpdateHandSettings,
+  useSendHandMessage,
+} from "../lib/mutations/hands";
+import { useUpdateSchedule, useDeleteSchedule } from "../lib/mutations/schedules";
+import { useCronJobs } from "../lib/queries/runtime";
 
 /* ── Inject slideInRight keyframes once at module level ──── */
 if (typeof document !== "undefined" && !document.getElementById("hands-keyframes")) {
@@ -124,32 +130,50 @@ function HandChatPanel({
   const [sending, setSending] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const hydratedInstanceIdRef = useRef<string | null>(null);
+  const sendHandMessageMutation = useSendHandMessage();
+
+  const { data: sessionData } = useHandSession(instanceId);
 
   useEffect(() => {
-    getHandSession(instanceId)
-      .then((data) => {
-        if (data.messages?.length) {
-          const hist: ChatMsg[] = data.messages.map((m: HandSessionMessage, i: number) => ({
-            id: `hist-${i}`,
-            role: m.role === "user" ? "user" as const : "assistant" as const,
-            content: m.content || "",
-            timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
-            blocks: m.blocks,
-          }));
-          setMessages(hist);
-        }
-      })
-      .catch(() => {});
+    if (hydratedInstanceIdRef.current !== instanceId) {
+      hydratedInstanceIdRef.current = instanceId;
+      setMessages([]);
+    }
   }, [instanceId]);
 
   useEffect(() => {
-    if (messages.length > 0) {
-      setTimeout(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), 60);
+    if (sessionData?.messages) {
+      const hist: ChatMsg[] = sessionData.messages.map(
+        (m: HandSessionMessage, i: number) => ({
+          id: `hist-${i}`,
+          role: m.role === "user" ? ("user" as const) : ("assistant" as const),
+          content: m.content || "",
+          timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+          blocks: m.blocks,
+        }),
+      );
+      setMessages((current) => {
+        if (current.some((msg) => msg.isLoading || msg.error)) {
+          return current;
+        }
+        if (hist.length > 0 || current.length === 0) {
+          return hist;
+        }
+        return current;
+      });
     }
+  }, [sessionData?.messages]);
+
+  useEffect(() => {
+    if (messages.length === 0) return;
+    const id = setTimeout(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), 60);
+    return () => clearTimeout(id);
   }, [messages]);
 
   useEffect(() => {
-    setTimeout(() => inputRef.current?.focus(), 100);
+    const id = setTimeout(() => inputRef.current?.focus(), 100);
+    return () => clearTimeout(id);
   }, []);
 
   const handleSend = useCallback(async () => {
@@ -175,7 +199,10 @@ function HandChatPanel({
     setSending(true);
 
     try {
-      const res = await sendHandMessage(instanceId, text);
+      const res = await sendHandMessageMutation.mutateAsync({
+        instanceId,
+        message: text,
+      });
       setMessages((prev) =>
         prev.map((m) =>
           m.id === botMsg.id
@@ -200,7 +227,7 @@ function HandChatPanel({
       setSending(false);
       setTimeout(() => inputRef.current?.focus(), 50);
     }
-  }, [input, sending, instanceId]);
+  }, [input, sending, instanceId, sendHandMessageMutation]);
 
   return (
     <div
@@ -419,18 +446,12 @@ function HandDetailPanel({
   const { t } = useTranslation();
   const isPaused = instance?.status === "paused";
 
-  const settingsQuery = useQuery({
-    queryKey: ["hands", "settings", hand.id],
-    queryFn: () => getHandSettings(hand.id),
-    enabled: !!hand.id,
-  });
+  const [showManifest, setShowManifest] = useState(false);
+  const manifestQuery = useHandManifestToml(hand.id, showManifest);
 
-  const statsQuery = useQuery({
-    queryKey: ["hands", "stats", instance?.instance_id],
-    queryFn: () => getHandStats(instance!.instance_id),
-    refetchInterval: REFRESH_MS,
-    enabled: !!instance?.instance_id,
-  });
+  const settingsQuery = useHandSettingsQuery(hand.id);
+
+  const statsQuery = useHandStats(instance?.instance_id ?? "");
 
   const settings: HandSettingsResponse = settingsQuery.data ?? {};
   const stats: HandStatsResponse = statsQuery.data ?? {};
@@ -512,6 +533,17 @@ function HandDetailPanel({
             {hand.description && (
               <p className="text-sm text-text-dim leading-relaxed">{hand.description}</p>
             )}
+
+            {/* View raw manifest — discreet link, useful for debugging /
+                code review without leaving the panel. */}
+            <button
+              type="button"
+              onClick={() => setShowManifest(true)}
+              className="text-[11px] font-bold text-text-dim hover:text-brand inline-flex items-center gap-1"
+            >
+              <FileText className="w-3.5 h-3.5" />
+              {t("hands.view_manifest")}
+            </button>
 
             {/* Primary action bar */}
             <div className="flex items-center gap-2">
@@ -604,6 +636,18 @@ function HandDetailPanel({
           </div>
         </div>
       </div>
+      <TomlViewer
+        isOpen={showManifest}
+        onClose={() => setShowManifest(false)}
+        title={t("hands.manifest_title", { name: hand.name || hand.id })}
+        toml={manifestQuery.data}
+        downloadName={`${hand.id}.HAND.toml`}
+        error={
+          manifestQuery.error
+            ? (manifestQuery.error as Error).message ?? t("hands.manifest_error")
+            : null
+        }
+      />
     </div>
   );
 }
@@ -614,8 +658,8 @@ function HandDetailPanel({
 
 function RequirementsForm({ handId, requirements }: { handId: string; requirements: HandDefinitionItem["requirements"] }) {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
   const addToast = useUIStore((s) => s.addToast);
+  const setSecret = useSetHandSecret();
   const [values, setValues] = useState<Record<string, string>>(() => {
     const init: Record<string, string> = {};
     for (const r of requirements ?? []) {
@@ -632,9 +676,8 @@ function RequirementsForm({ handId, requirements }: { handId: string; requiremen
     if (!val) return;
     setSaving(key);
     try {
-      await setHandSecret(handId, key, val);
+      await setSecret.mutateAsync({ handId, key, value: val });
       addToast(t("common.success"), "success");
-      queryClient.invalidateQueries({ queryKey: ["hands"] });
     } catch (e: unknown) {
       addToast(e instanceof Error ? e.message : t("common.error"), "error");
     } finally {
@@ -693,22 +736,13 @@ function DetailTabs({ hand, instance, isActive, settings, settingsQuery, stats, 
     Object.entries(stats.metrics).some(([, m]) => m.value != null && String(m.value) !== "-" && String(m.value) !== "");
 
   // Fetch hand detail with agents list
-  const detailQuery = useQuery({
-    queryKey: ["hands", "detail", hand.id],
-    queryFn: () => getHandDetail(hand.id),
-    enabled: !!hand.id,
-  });
+  const detailQuery = useHandDetail(hand.id);
   const detail = detailQuery.data as Record<string, unknown> | undefined;
   const workspaceAgents = (detail?.agents as { role: string; name: string; description?: string; coordinator?: boolean; provider: string; model: string; steps?: string[] }[] | undefined) ?? [];
 
   // Fetch cron jobs for this hand's agent
   const agentId = instance?.agent_id;
-  const cronJobsQuery = useQuery({
-    queryKey: ["cron-jobs", "hand", agentId],
-    queryFn: () => listCronJobs(agentId!),
-    enabled: isActive && !!agentId,
-    refetchInterval: 30000,
-  });
+  const cronJobsQuery = useCronJobs(isActive ? agentId : undefined);
   const cronJobs = cronJobsQuery.data ?? [];
 
   type Tab = "agents" | "settings" | "requirements" | "tools" | "schedules";
@@ -833,34 +867,18 @@ function HandSettingsEditor({
   isActive: boolean;
 }) {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
 
-  // Local draft — seeded from current_values, mutated by inputs, cleared on save.
   const [draft, setDraft] = useState<Record<string, string>>({});
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveOk, setSaveOk] = useState(false);
 
-  // Reset draft whenever the underlying settings change (e.g. after a refetch).
   useEffect(() => {
     setDraft({});
     setSaveOk(false);
     setSaveError(null);
   }, [settings]);
 
-  const saveMutation = useMutation({
-    mutationFn: (payload: Record<string, unknown>) => updateHandSettings(handId, payload),
-    onSuccess: () => {
-      setSaveOk(true);
-      setSaveError(null);
-      setDraft({});
-      queryClient.invalidateQueries({ queryKey: ["hands", "settings", handId] });
-      setTimeout(() => setSaveOk(false), 2500);
-    },
-    onError: (err: Error) => {
-      setSaveError(err.message || String(err));
-      setSaveOk(false);
-    },
-  });
+  const saveMutation = useUpdateHandSettings();
 
   if (isLoading) {
     return (
@@ -885,12 +903,25 @@ function HandSettingsEditor({
   };
 
   const handleSave = () => {
-    // Only send the keys the user actually changed.
     const payload: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(draft)) {
       payload[k] = v;
     }
-    saveMutation.mutate(payload);
+    saveMutation.mutate(
+      { handId, config: payload },
+      {
+        onSuccess: () => {
+          setSaveOk(true);
+          setSaveError(null);
+          setDraft({});
+          setTimeout(() => setSaveOk(false), 2500);
+        },
+        onError: (err: Error) => {
+          setSaveError(err.message || String(err));
+          setSaveOk(false);
+        },
+      },
+    );
   };
 
   return (
@@ -1004,16 +1035,15 @@ function HandSchedulesTab({ cronJobs, isLoading, onRefresh }: {
   onRefresh: () => void;
 }) {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
   const addToast = useUIStore((s) => s.addToast);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const toggleSchedule = useUpdateSchedule();
+  const deleteScheduleMut = useDeleteSchedule();
 
   const handleToggle = async (job: CronJobItem) => {
     if (!job.id) return;
     try {
-      const { updateSchedule } = await import("../api");
-      await updateSchedule(job.id, { enabled: !job.enabled });
-      queryClient.invalidateQueries({ queryKey: ["cron-jobs", "hand"] });
+      await toggleSchedule.mutateAsync({ id: job.id, data: { enabled: !job.enabled } });
       onRefresh();
     } catch (err: any) { addToast(err.message || t("common.error"), "error"); }
   };
@@ -1022,9 +1052,7 @@ function HandSchedulesTab({ cronJobs, isLoading, onRefresh }: {
     if (confirmDeleteId !== id) { setConfirmDeleteId(id); return; }
     setConfirmDeleteId(null);
     try {
-      const { deleteSchedule } = await import("../api");
-      await deleteSchedule(id);
-      queryClient.invalidateQueries({ queryKey: ["cron-jobs", "hand"] });
+      await deleteScheduleMut.mutateAsync(id);
       onRefresh();
     } catch (err: any) { addToast(err.message || t("common.error"), "error"); }
   };
@@ -1096,7 +1124,7 @@ function ActiveHandChip({
 
   return (
     <div
-      className={`group relative flex flex-col gap-2 p-3 rounded-2xl border cursor-pointer transition-colors shrink-0 w-[260px] ${
+      className={`group relative flex flex-col gap-2 p-3 rounded-2xl border cursor-pointer transition-colors shrink-0 w-[320px] sm:w-[360px] ${
         warnState
           ? "border-warning/40 bg-warning/[0.06] hover:border-warning/60"
           : "border-success/40 bg-success/[0.06] hover:border-success/60"
@@ -1158,7 +1186,7 @@ function ActiveHandChip({
 
 function HandCardGridSkeleton() {
   return (
-    <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
+    <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 3xl:grid-cols-6">
       {Array.from({ length: 6 }).map((_, i) => (
         <div key={i} className="flex flex-col rounded-2xl border border-border-subtle bg-surface">
           <div className="flex items-start gap-3 p-4 pb-3">
@@ -1365,7 +1393,6 @@ function HandCard({
 
 export function HandsPage() {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
   const addToast = useUIStore((s) => s.addToast);
   const [pendingId, setPendingId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -1373,52 +1400,23 @@ export function HandsPage() {
   const [detailHand, setDetailHand] = useState<HandDefinitionItem | null>(null);
   const navigate = useNavigate();
 
-  // Preload ChatPage chunk so navigate is instant
   useEffect(() => {
     router.preloadRoute({ to: "/chat", search: { agentId: undefined } }).catch(() => {});
   }, []);
 
-  const handsQuery = useQuery({
-    queryKey: ["hands", "list"],
-    queryFn: listHands,
-    refetchInterval: REFRESH_MS,
-  });
-  const activeQuery = useQuery({
-    queryKey: ["hands", "active"],
-    queryFn: listActiveHands,
-    refetchInterval: REFRESH_MS,
-  });
-
-  const activateMutation = useMutation({
-    mutationFn: (id: string) => activateHand(id),
-  });
-  const deactivateMutation = useMutation({
-    mutationFn: (id: string) => deactivateHand(id),
-  });
-  const pauseMutation = useMutation({
-    mutationFn: (id: string) => pauseHand(id),
-  });
-  const resumeMutation = useMutation({
-    mutationFn: (id: string) => resumeHand(id),
-  });
+  const handsQuery = useHands();
+  const activeQuery = useActiveHands();
+  const activateMutation = useActivateHand();
+  const deactivateMutation = useDeactivateHand();
+  const pauseMutation = usePauseHand();
+  const resumeMutation = useResumeHand();
+  const uninstallMutation = useUninstallHand();
 
   const hands = handsQuery.data ?? [];
   const instances = activeQuery.data ?? [];
 
-  // Batch-fetch stats for all active instances (avoids N+1 queries)
   const activeInstanceIds = useMemo(() => instances.map(i => i.instance_id).filter(Boolean), [instances]);
-  const allStatsQuery = useQuery({
-    queryKey: ["hands", "stats", "batch", activeInstanceIds],
-    queryFn: async () => {
-      const results: Record<string, HandStatsResponse> = {};
-      await Promise.all(activeInstanceIds.map(async id => {
-        try { results[id] = await getHandStats(id); } catch { /* skip */ }
-      }));
-      return results;
-    },
-    refetchInterval: REFRESH_MS,
-    enabled: activeInstanceIds.length > 0,
-  });
+  const allStatsQuery = useHandStatsBatch(activeInstanceIds);
   const statsByInstance = allStatsQuery.data ?? {};
 
   const activeHandIds = useMemo(
@@ -1482,7 +1480,6 @@ export function HandsPage() {
     setPendingId(id);
     try {
       await activateMutation.mutateAsync(id);
-      await queryClient.invalidateQueries({ queryKey: ["hands"] });
       addToast(t("common.success"), "success");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : t("common.error");
@@ -1496,7 +1493,6 @@ export function HandsPage() {
     setPendingId(id);
     try {
       await deactivateMutation.mutateAsync(id);
-      await queryClient.invalidateQueries({ queryKey: ["hands"] });
       addToast(t("common.success"), "success");
       setDetailHand(null);
     } catch (e: unknown) {
@@ -1514,8 +1510,7 @@ export function HandsPage() {
     if (!window.confirm(confirmMsg)) return;
     setPendingId(handId);
     try {
-      await uninstallHand(handId);
-      await queryClient.invalidateQueries({ queryKey: ["hands"] });
+      await uninstallMutation.mutateAsync(handId);
       addToast(t("common.success"), "success");
       setDetailHand(null);
     } catch (e: unknown) {
@@ -1530,7 +1525,6 @@ export function HandsPage() {
     setPendingId(id);
     try {
       await pauseMutation.mutateAsync(id);
-      await queryClient.invalidateQueries({ queryKey: ["hands"] });
       addToast(t("common.success"), "success");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : t("common.error");
@@ -1544,7 +1538,6 @@ export function HandsPage() {
     setPendingId(id);
     try {
       await resumeMutation.mutateAsync(id);
-      await queryClient.invalidateQueries({ queryKey: ["hands"] });
       addToast(t("common.success"), "success");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : t("common.error");
@@ -1692,7 +1685,7 @@ export function HandsPage() {
           }
         />
       ) : (
-        <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 stagger-children">
+        <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 3xl:grid-cols-6 stagger-children">
           {filtered.map((h) => {
             const isActive = activeHandIds.has(h.id);
             const instance = instanceByHandId.get(h.id);

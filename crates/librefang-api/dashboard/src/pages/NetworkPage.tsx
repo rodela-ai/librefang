@@ -1,7 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
 import { formatDateTime } from "../lib/datetime";
 import { useTranslation } from "react-i18next";
-import { getNetworkStatus, listPeers } from "../api";
+import { useNetworkStatus, usePeers } from "../lib/queries/network";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Card } from "../components/ui/Card";
 import { Badge } from "../components/ui/Badge";
@@ -9,22 +8,11 @@ import { EmptyState } from "../components/ui/EmptyState";
 import { CardSkeleton } from "../components/ui/Skeleton";
 import { Network, Globe, Server, Wifi, WifiOff, Hash, Clock } from "lucide-react";
 
-const REFRESH_MS = 10000;
-
 export function NetworkPage() {
   const { t } = useTranslation();
 
-  const statusQuery = useQuery({
-    queryKey: ["network", "status"],
-    queryFn: getNetworkStatus,
-    refetchInterval: REFRESH_MS,
-  });
-
-  const peersQuery = useQuery({
-    queryKey: ["peers", "list"],
-    queryFn: listPeers,
-    refetchInterval: REFRESH_MS,
-  });
+  const statusQuery = useNetworkStatus();
+  const peersQuery = usePeers();
 
   const status = statusQuery.data;
   const peers = peersQuery.data ?? [];
@@ -124,7 +112,7 @@ export function NetworkPage() {
                   <Card key={peer.id} hover padding="md">
                     <div className="flex items-start justify-between">
                       <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-brand/20 to-accent/20 flex items-center justify-center">
+                        <div className="w-10 h-10 rounded-xl bg-linear-to-br from-brand/20 to-accent/20 flex items-center justify-center">
                           <Server className="w-5 h-5 text-brand" />
                         </div>
                         <div className="min-w-0">

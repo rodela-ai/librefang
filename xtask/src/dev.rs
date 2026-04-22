@@ -73,15 +73,27 @@ pub fn run(args: DevArgs) -> Result<(), Box<dyn std::error::Error>> {
     let dashboard_dir = root.join("crates/librefang-api/dashboard");
     let mut _dashboard_child = None;
     if !args.no_dashboard && dashboard_dir.join("package.json").exists() {
-        println!("Installing dashboard dependencies...");
-        let _ = Command::new("pnpm")
-            .arg("install")
+        // Detect available package manager: prefer pnpm, fall back to npm.
+        let pm = if Command::new("pnpm")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            "pnpm"
+        } else {
+            "npm"
+        };
+
+        println!("Installing dashboard dependencies (using {pm})...");
+        let _ = Command::new("sh")
+            .args(["-c", &format!("{pm} install")])
             .current_dir(&dashboard_dir)
             .status();
 
-        println!("Starting dashboard dev server...");
-        let child = Command::new("pnpm")
-            .arg("dev")
+        println!("Starting dashboard dev server (using {pm})...");
+        let child = Command::new("sh")
+            .args(["-c", &format!("{pm} run dev")])
             .current_dir(&dashboard_dir)
             .spawn();
         match child {
@@ -414,8 +426,32 @@ fn run_watch(
         let _ = Command::new("stty").arg("sane").status();
     });
 
+    // Watch the Rust workspace only. The dashboard lives under
+    // `crates/librefang-api/dashboard/` but has its own vite HMR via
+    // `pnpm dev`, so changes there must NOT trigger a Rust rebuild +
+    // daemon restart. Ignore the dashboard directory and any editor
+    // scratch files that could otherwise bounce cargo-watch in a loop.
+    // `--postpone` skips cargo-watch's default "run once at startup" behavior.
+    // Without it the initial daemon (started above) races this first invocation,
+    // and whichever reaches run_daemon's daemon.json check second errors out
+    // with "Another daemon (PID X) is already running" (see server.rs:1077).
     let cargo_watch_status = Command::new("cargo")
-        .args(["watch", "--watch", "crates", "-s", &rebuild_and_restart])
+        .args([
+            "watch",
+            "--postpone",
+            "--watch",
+            "crates",
+            "--ignore",
+            "crates/librefang-api/dashboard/**",
+            "--ignore",
+            "**/node_modules/**",
+            "--ignore",
+            "**/target/**",
+            "--ignore",
+            "**/*.md",
+            "-s",
+            &rebuild_and_restart,
+        ])
         .current_dir(root)
         .status()?;
 

@@ -90,6 +90,14 @@ pub struct ChannelOverrides {
     /// `group_policy` is `mention_only`.
     #[serde(default)]
     pub group_trigger_patterns: Vec<String>,
+    /// Enable LLM-based reply-intent precheck for group messages.
+    /// When true and group_policy is "all", a lightweight classifier decides
+    /// whether to reply before running the full agent loop.
+    #[serde(default)]
+    pub reply_precheck: bool,
+    /// Model override for the reply precheck classifier (default: agent's model).
+    #[serde(default)]
+    pub reply_precheck_model: Option<String>,
     /// Global rate limit for this channel (messages per minute, 0 = unlimited).
     #[serde(default)]
     pub rate_limit_per_minute: u32,
@@ -175,6 +183,8 @@ impl Default for ChannelOverrides {
             dm_policy: DmPolicy::default(),
             group_policy: GroupPolicy::default(),
             group_trigger_patterns: Vec::new(),
+            reply_precheck: false,
+            reply_precheck_model: None,
             rate_limit_per_minute: 0,
             rate_limit_per_user: 0,
             threading: false,
@@ -597,6 +607,18 @@ pub struct RateLimitConfig {
     /// Maximum WebSocket messages per minute per connection. Default: 10.
     #[serde(default = "default_ws_messages_per_minute")]
     pub ws_messages_per_minute: u32,
+    /// Maximum terminal WebSocket input messages per minute per connection.
+    /// Default: 3600.
+    ///
+    /// Terminal sessions send one WebSocket message per keystroke, so the
+    /// generic `ws_messages_per_minute = 10` (sized for chat WS where a
+    /// "message" is a whole utterance) is two orders of magnitude too low
+    /// for an interactive PTY — typing `vim` + `:wq` in vim already
+    /// exhausts the budget and the session appears to freeze. 3600/min
+    /// (60/sec ≈ 720 WPM) covers any human typing speed plus TUI
+    /// navigation bursts while still capping pathological floods.
+    #[serde(default = "default_ws_terminal_messages_per_minute")]
+    pub ws_terminal_messages_per_minute: u32,
     /// WebSocket idle timeout in seconds (close after inactivity). Default: 1800.
     #[serde(default = "default_ws_idle_timeout_secs")]
     pub ws_idle_timeout_secs: u64,
@@ -620,6 +642,9 @@ fn default_max_ws_per_ip() -> usize {
 fn default_ws_messages_per_minute() -> u32 {
     10
 }
+fn default_ws_terminal_messages_per_minute() -> u32 {
+    3600
+}
 fn default_ws_idle_timeout_secs() -> u64 {
     1800
 }
@@ -637,6 +662,7 @@ impl Default for RateLimitConfig {
             retry_after_secs: default_retry_after_secs(),
             max_ws_per_ip: default_max_ws_per_ip(),
             ws_messages_per_minute: default_ws_messages_per_minute(),
+            ws_terminal_messages_per_minute: default_ws_terminal_messages_per_minute(),
             ws_idle_timeout_secs: default_ws_idle_timeout_secs(),
             ws_debounce_ms: default_ws_debounce_ms(),
             ws_debounce_chars: default_ws_debounce_chars(),
@@ -928,9 +954,15 @@ pub struct SkillsConfig {
     /// Whether user-installed skills from the skills directory are loaded. Default: true.
     pub load_user: bool,
     /// Extra skill directories to scan in addition to `~/.librefang/skills/`.
-    /// Each entry must be an absolute path.
+    /// Each entry must be an absolute path. Scanned read-only after the
+    /// primary skills dir; local skills with the same name win.
     #[serde(default)]
     pub extra_dirs: Vec<std::path::PathBuf>,
+    /// Names of skills to skip at load time. Useful for quickly disabling
+    /// a skill (agent-evolved or marketplace-installed) without deleting
+    /// its directory. Matching is case-sensitive on the skill manifest name.
+    #[serde(default)]
+    pub disabled: Vec<String>,
 }
 
 impl Default for SkillsConfig {
@@ -938,6 +970,7 @@ impl Default for SkillsConfig {
         Self {
             load_user: true,
             extra_dirs: Vec::new(),
+            disabled: Vec::new(),
         }
     }
 }
@@ -1434,6 +1467,88 @@ pub struct SidecarChannelConfig {
     pub channel_type: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Session auto-reset policy types
+// ---------------------------------------------------------------------------
+
+/// Which automatic-reset strategy is active for a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionResetMode {
+    /// No automatic reset. Sessions persist indefinitely. (default)
+    #[default]
+    Off,
+    /// Reset after `idle_minutes` of inactivity.
+    Idle,
+    /// Reset once per day at `daily_at_hour` (local clock, 0-23).
+    Daily,
+    /// Reset when *either* idle or daily condition is satisfied.
+    Both,
+}
+
+/// Why a session was last reset (stored on [`AgentEntry`] for observability).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionResetReason {
+    /// Last-active exceeded `idle_minutes`.
+    Idle,
+    /// The daily fixed-time boundary was crossed.
+    Daily,
+    /// Session was flagged `suspended` (forced by operator / stuck-loop recovery).
+    Suspended,
+    /// Manual reset requested via API or CLI.
+    Manual,
+}
+
+impl std::fmt::Display for SessionResetReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => f.write_str("idle"),
+            Self::Daily => f.write_str("daily"),
+            Self::Suspended => f.write_str("suspended"),
+            Self::Manual => f.write_str("manual"),
+        }
+    }
+}
+
+/// Per-session auto-reset policy.
+///
+/// Configured inside `[session.reset]` in `config.toml`:
+/// ```toml
+/// [session.reset]
+/// mode = "idle"
+/// idle_minutes = 1440   # 24 h
+///
+/// # or
+/// mode = "both"
+/// idle_minutes = 60
+/// daily_at_hour = 4
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionResetPolicy {
+    /// Which reset strategy (or strategies) to apply.
+    pub mode: SessionResetMode,
+    /// Inactivity threshold in minutes for `Idle` / `Both` modes.
+    /// Default: 1440 (24 hours).
+    pub idle_minutes: u64,
+    /// Hour of day (0–23, local clock) at which the `Daily` / `Both` reset fires.
+    /// Default: 4 (04:00 local).
+    pub daily_at_hour: u8,
+}
+
+impl Default for SessionResetPolicy {
+    fn default() -> Self {
+        Self {
+            mode: SessionResetMode::Off,
+            idle_minutes: 1440,
+            daily_at_hour: 4,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 /// Session retention policy configuration.
 ///
 /// Controls automatic cleanup of idle or excess sessions and optional
@@ -1467,6 +1582,10 @@ pub struct SessionConfig {
     /// Optional shell script to run when a new session is created (fire-and-forget).
     #[serde(default)]
     pub on_session_start_script: Option<String>,
+    /// Automatic session-reset policy (idle timeout and/or daily fixed-time reset).
+    /// Default: `mode = "off"` — no automatic resets, fully backward-compatible.
+    #[serde(default)]
+    pub reset: SessionResetPolicy,
 }
 
 impl Default for SessionConfig {
@@ -1478,6 +1597,7 @@ impl Default for SessionConfig {
             reset_prompt: None,
             context_injection: Vec::new(),
             on_session_start_script: None,
+            reset: SessionResetPolicy::default(),
         }
     }
 }
@@ -1766,6 +1886,16 @@ pub struct KernelConfig {
     /// like `"https://dash.example.com"`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cors_origin: Vec<String>,
+    /// Hostnames allowed to drive the OAuth `redirect_uri` when starting an
+    /// MCP auth flow. The MCP auth-start handler derives the callback URL
+    /// from the incoming request's `Origin` / `X-Forwarded-Host` / `Host`
+    /// headers; without an allowlist a spoofed Host header could redirect
+    /// the authorization code to an attacker-controlled origin. Loopback
+    /// addresses (`localhost`, `127.0.0.1`, `::1`) are always accepted so
+    /// local development keeps working with an empty list. Entries are
+    /// hostnames without port, e.g. `"dash.example.com"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_hosts: Vec<String>,
     /// Whether to enable the OFP network layer.
     pub network_enabled: bool,
     /// Default LLM provider configuration.
@@ -1780,6 +1910,47 @@ pub struct KernelConfig {
     /// require a `Authorization: Bearer <key>` header.
     /// If empty, the API is unauthenticated (local development only).
     pub api_key: String,
+    /// Controls whether the dashboard read-endpoint allowlist (agents,
+    /// config, budget, sessions, approvals, hands, skills, workflows, …)
+    /// requires a bearer token.
+    ///
+    /// * `None` (default, unset in config.toml) — **derive from
+    ///   configured auth**: the reads allowlist is collapsed *automatically*
+    ///   whenever any authentication is configured (non-empty `api_key`,
+    ///   per-user keys, or dashboard credentials). This is the safe
+    ///   default: operators who already set an `api_key` shouldn't also
+    ///   have to remember a separate flag before their read endpoints
+    ///   stop leaking agent IDs to the LAN.
+    /// * `Some(true)` — state the intent explicitly. The daemon logs a
+    ///   boot-time warning if no authentication is actually configured
+    ///   (so an accidental `api_key = ""` redeploy is visible in the
+    ///   logs), but the middleware itself only enforces the closed
+    ///   allowlist when some form of auth is also configured: with no
+    ///   `api_key`, user keys, or dashboard credentials there is nothing
+    ///   to authenticate against and reads fall through to the
+    ///   unauthenticated local-development bypass. Configure an
+    ///   `api_key` (or per-user keys / dashboard credentials) alongside
+    ///   this flag to actually close the allowlist.
+    /// * `Some(false)` — force the allowlist open even when `api_key`
+    ///   is set. Provided as an explicit escape hatch for deployments
+    ///   that front the daemon with an external auth proxy and want the
+    ///   in-tree dashboard to keep rendering before the reverse proxy
+    ///   has attached its own credentials.
+    ///
+    /// Unauthenticated static assets, OAuth flow endpoints, and
+    /// `/api/health*` stay reachable in every mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_auth_for_reads: Option<bool>,
+    /// Hex-encoded Ed25519 public keys (32 bytes → 64 hex chars) allowed to
+    /// sign agent manifests. `verify_signed_manifest` requires the envelope's
+    /// `signer_public_key` to be on this list before accepting a signature —
+    /// without a trust anchor, a self-signed envelope from any attacker
+    /// passes internal-consistency checks and would be indistinguishable
+    /// from a legitimate one. When empty, `SignedManifest` JSON payloads are
+    /// rejected outright (fail-closed). Raw unsigned TOML manifests are
+    /// unaffected; this list only gates the signed-envelope path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_manifest_signers: Vec<String>,
     /// Dashboard login username. When both dashboard_user and dashboard_pass
     /// are set, the dashboard requires username/password login.
     /// Can also be set via `LIBREFANG_DASHBOARD_USER` env var.
@@ -1914,6 +2085,11 @@ pub struct KernelConfig {
     /// e.g. `ollama = "http://192.168.1.100:11434/v1"`
     #[serde(default)]
     pub provider_urls: HashMap<String, String>,
+    /// Per-provider proxy URL overrides (provider ID → proxy URL).
+    /// Allows routing specific providers through a proxy while others connect directly.
+    /// e.g. `openai = "http://proxy.corp:8080"`, `ollama = ""` (direct)
+    #[serde(default)]
+    pub provider_proxy_urls: HashMap<String, String>,
     /// Provider region selection (provider ID → region name).
     /// Selects a regional endpoint from the provider's `[provider.regions]` map.
     /// e.g. `qwen = "us"` to use the US endpoint instead of China mainland.
@@ -1966,6 +2142,9 @@ pub struct KernelConfig {
     /// Proactive memory (mem0-style) configuration.
     #[serde(default)]
     pub proactive_memory: crate::memory::ProactiveMemoryConfig,
+    /// Auto-dream (background memory consolidation) configuration.
+    #[serde(default)]
+    pub auto_dream: AutoDreamConfig,
     /// Pluggable context engine configuration.
     #[serde(default)]
     pub context_engine: ContextEngineTomlConfig,
@@ -2043,6 +2222,9 @@ pub struct KernelConfig {
     /// Individual endpoints may enforce tighter limits.
     #[serde(default = "default_max_request_body_bytes")]
     pub max_request_body_bytes: usize,
+    /// Terminal / CLI access control configuration.
+    #[serde(default)]
+    pub terminal: TerminalConfig,
 }
 
 /// Input sanitization mode for channel messages.
@@ -2217,7 +2399,14 @@ pub struct VertexAiConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContextEngineTomlConfig {
-    /// Built-in engine name. Default: `"default"`.
+    /// Built-in engine name. Supported values:
+    /// - `"default"`: plain [`DefaultContextEngine`] with no additional wrapping
+    /// - `"summary"`: [`SummaryContextEngine`] — threshold-gated LLM summarisation
+    ///   that fires when prompt tokens cross ~80 % of the context window
+    /// - `"no_compact"`: [`NoCompactContextEngine`] — disables automatic compaction
+    ///   while wiring all other lifecycle hooks
+    ///
+    /// Default: `"default"`.
     pub engine: String,
     /// Plugin name. Resolves to `~/.librefang/plugins/<name>/plugin.toml`.
     /// Takes precedence over manual `hooks` if set.
@@ -2889,6 +3078,26 @@ pub struct OAuthConfig {
     pub slack_client_id: Option<String>,
 }
 
+/// Per-provider spending limits.
+///
+/// Lets you cap spend on paid providers (e.g. Moonshot, OpenAI) without
+/// throttling free local providers (e.g. litellm, ollama). All limits
+/// default to 0 which means "unlimited" — only non-zero limits are enforced.
+/// Keyed by the provider id in `BudgetConfig.providers`, which must match
+/// the `model.provider` field of the agent's `ModelConfig`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProviderBudget {
+    /// Maximum cost in USD per hour for this provider (0.0 = unlimited).
+    pub max_cost_per_hour_usd: f64,
+    /// Maximum cost in USD per day for this provider (0.0 = unlimited).
+    pub max_cost_per_day_usd: f64,
+    /// Maximum cost in USD per month for this provider (0.0 = unlimited).
+    pub max_cost_per_month_usd: f64,
+    /// Maximum total tokens per hour for this provider (0 = unlimited).
+    pub max_tokens_per_hour: u64,
+}
+
 /// Global spending budget configuration.
 ///
 /// Set limits to 0.0 for unlimited. All limits apply across all agents.
@@ -2907,6 +3116,10 @@ pub struct BudgetConfig {
     /// will be overridden to this value. Set to 0 to keep each agent's own limit.
     /// Use this to globally raise or lower the token budget for all agents.
     pub default_max_llm_tokens_per_hour: u64,
+    /// Per-provider spending caps, keyed by provider id (e.g. `"moonshot"`,
+    /// `"openai"`, `"litellm"`). Missing providers are unlimited.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub providers: std::collections::HashMap<String, ProviderBudget>,
 }
 
 impl Default for BudgetConfig {
@@ -2917,6 +3130,7 @@ impl Default for BudgetConfig {
             max_monthly_usd: 0.0,
             alert_threshold: 0.8,
             default_max_llm_tokens_per_hour: 0,
+            providers: std::collections::HashMap::new(),
         }
     }
 }
@@ -2956,17 +3170,36 @@ fn default_max_request_body_bytes() -> usize {
 /// ```toml
 /// [audit]
 /// retention_days = 90
+/// # Optional override for the external tip-anchor path. Relative
+/// # paths resolve against `data_dir`. Leave unset for the default
+/// # `data_dir/audit.anchor`.
+/// anchor_path = "/var/log/librefang/audit.anchor"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuditConfig {
     /// How many days to retain audit log entries. Default: 90. Set to 0 for unlimited.
     pub retention_days: u32,
+    /// Optional override for the external Merkle-tip anchor file that
+    /// `AuditLog::with_db_anchored` uses to detect full rewrites of
+    /// `audit_entries`. When unset the daemon writes to
+    /// `data_dir/audit.anchor`, which catches most casual tampering but
+    /// sits in the same filesystem namespace as the SQLite file it is
+    /// meant to verify. Operators who want a stronger boundary can
+    /// point this at a path the daemon can write to but unprivileged
+    /// code cannot — a chmod-0400 file owned by a dedicated user, a
+    /// `systemd ReadOnlyPaths=` mount, an NFS share, or a pipe to
+    /// `logger`. Relative paths are resolved against `data_dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_path: Option<PathBuf>,
 }
 
 impl Default for AuditConfig {
     fn default() -> Self {
-        Self { retention_days: 90 }
+        Self {
+            retention_days: 90,
+            anchor_path: None,
+        }
     }
 }
 
@@ -3072,6 +3305,95 @@ impl Default for HeartbeatTomlConfig {
     }
 }
 
+/// Auto-dream (background memory consolidation) configuration.
+///
+/// Global toggle and scheduling knobs for the per-agent auto-dream system.
+/// Individual agents still opt in via `auto_dream_enabled = true` on their
+/// manifest — this config only governs *when* the scheduler looks and what
+/// thresholds apply. A dream fires for an agent when all of these hold:
+///
+///   * `[auto_dream] enabled = true` (this struct)
+///   * agent manifest has `auto_dream_enabled = true`
+///   * at least `min_hours` have passed since that agent's last dream
+///   * at least `min_sessions` sessions were touched since then
+///
+/// Configure in config.toml:
+/// ```toml
+/// [auto_dream]
+/// enabled = false
+/// min_hours = 24
+/// min_sessions = 5
+/// check_interval_secs = 86400
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoDreamConfig {
+    /// Master toggle. Default: disabled — when false, no dream fires regardless
+    /// of per-agent opt-in.
+    pub enabled: bool,
+    /// Minimum hours since that agent's last consolidation before the next
+    /// one fires. Default: 24.
+    #[serde(default = "default_auto_dream_min_hours")]
+    pub min_hours: f64,
+    /// Minimum number of sessions touched since that agent's last
+    /// consolidation before the next one fires. Default: 5. Set to 0 to
+    /// disable the session-count gate entirely.
+    #[serde(default = "default_auto_dream_min_sessions")]
+    pub min_sessions: u32,
+    /// How often the *backstop* scheduler loop wakes up to check gates, in
+    /// seconds. Default: 86400 (1 day). The primary trigger is the
+    /// `AgentLoopEnd` hook that fires the moment a turn completes — the
+    /// scheduler only catches opted-in agents that may go a long time
+    /// without any turn (e.g., a channel bot waiting for inbound traffic).
+    /// Lowering this just increases the rate of stat/SQL probes that mostly
+    /// find nothing to do; raising it delays dreams only for the idle
+    /// never-turned case.
+    #[serde(default = "default_auto_dream_check_interval_secs")]
+    pub check_interval_secs: u64,
+    /// Optional override for the lock directory. When empty, defaults to
+    /// `<data_dir>/auto_dream/`. Per-agent locks are stored as
+    /// `<dir>/<agent_id>.lock`.
+    #[serde(default)]
+    pub lock_dir: String,
+    /// Timeout for a single dream invocation in seconds. Default: 600.
+    #[serde(default = "default_auto_dream_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_auto_dream_min_hours() -> f64 {
+    24.0
+}
+
+fn default_auto_dream_min_sessions() -> u32 {
+    5
+}
+
+fn default_auto_dream_check_interval_secs() -> u64 {
+    // 1 day. Dreams are primarily triggered by the AgentLoopEnd hook the
+    // moment a turn ends, not by this scheduler. The scheduler exists to
+    // catch the "agent is opted-in but has no activity" edge case (e.g.
+    // channel bots) where no turn ever fires. 1 day is frequent enough for
+    // that fallback without wasting 144× more stat calls per day.
+    86_400
+}
+
+fn default_auto_dream_timeout_secs() -> u64 {
+    600
+}
+
+impl Default for AutoDreamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_hours: default_auto_dream_min_hours(),
+            min_sessions: default_auto_dream_min_sessions(),
+            check_interval_secs: default_auto_dream_check_interval_secs(),
+            lock_dir: String::new(),
+            timeout_secs: default_auto_dream_timeout_secs(),
+        }
+    }
+}
+
 /// Registry sync configuration.
 ///
 /// Configure in config.toml:
@@ -3142,6 +3464,18 @@ fn default_prompt_caching() -> bool {
 pub struct McpServerConfigEntry {
     /// Display name for this server.
     pub name: String,
+    /// Catalog template this server was installed from, if any.
+    ///
+    /// Set when the user installs a server via `POST /api/mcp/servers` with
+    /// `{template_id, credentials}` or the CLI `librefang mcp add <id>` flow.
+    /// Stays `None` for manually-authored entries. Used by the dashboard to
+    /// render the catalog badge and by the migrator.
+    // `skip_serializing_if = "Option::is_none"` mirrors the `oauth` field —
+    // `upsert_mcp_server_config` round-trips through serde_json → TOML and
+    // null values would serialize as `template_id = ""`, which fails to
+    // deserialize back into `Option<String>` on reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
     /// Transport configuration. Optional — entries without transport are skipped at boot.
     pub transport: Option<McpTransportEntry>,
     /// Request timeout in seconds.
@@ -3154,6 +3488,24 @@ pub struct McpServerConfigEntry {
     /// Each entry is `"Header-Name: value"` (e.g., `"Authorization: Bearer <token>"`).
     #[serde(default)]
     pub headers: Vec<String>,
+    /// Optional OAuth configuration for this MCP server.
+    // `skip_serializing_if` is load-bearing: `upsert_mcp_server_config` goes
+    // serde_json → TOML, and the null round-trip writes `oauth = ""` which
+    // fails to deserialize back into `Option<McpOAuthConfig>` on reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<McpOAuthConfig>,
+    /// Enable outbound taint scanning for this MCP server (default: true).
+    ///
+    /// Set to `false` to disable the credential/PII content heuristic for
+    /// trusted local servers (e.g. browser automation, database adapters)
+    /// whose tool results contain opaque session handles that would otherwise
+    /// trip the scanner. Key-name blocking remains active regardless.
+    #[serde(default = "default_taint_scanning")]
+    pub taint_scanning: bool,
+}
+
+fn default_taint_scanning() -> bool {
+    true
 }
 
 fn default_mcp_timeout() -> u64 {
@@ -3246,6 +3598,41 @@ pub enum McpTransportEntry {
     },
 }
 
+/// Optional OAuth configuration for an MCP server.
+///
+/// Used as fallback when the server doesn't support `.well-known` discovery,
+/// or to override specific values from discovery. All fields are optional —
+/// discovery results fill gaps, config values take precedence.
+///
+/// # Example (config.toml)
+///
+/// ```toml
+/// [[mcp_servers]]
+/// name = "custom-server"
+/// transport = { type = "http", url = "https://my-server.com/mcp" }
+///
+/// [mcp_servers.oauth]
+/// auth_url = "https://my-server.com/oauth/authorize"
+/// token_url = "https://my-server.com/oauth/token"
+/// client_id = "my-client-id"
+/// scopes = ["read", "write"]
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct McpOAuthConfig {
+    #[serde(default)]
+    pub auth_url: Option<String>,
+    #[serde(default)]
+    pub token_url: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Slack-style user scopes, appended to the authorization URL as
+    /// `&user_scope=...`. Most OAuth servers don't use this.
+    #[serde(default)]
+    pub user_scopes: Vec<String>,
+}
+
 /// A2A (Agent-to-Agent) protocol configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -3333,6 +3720,8 @@ impl Default for KernelConfig {
             network: NetworkConfig::default(),
             channels: ChannelsConfig::default(),
             api_key: String::new(),
+            require_auth_for_reads: None,
+            trusted_manifest_signers: Vec::new(),
             dashboard_user: String::new(),
             dashboard_pass: String::new(),
             dashboard_pass_hash: String::new(),
@@ -3372,6 +3761,7 @@ impl Default for KernelConfig {
             thinking: None,
             budget: BudgetConfig::default(),
             provider_urls: HashMap::new(),
+            provider_proxy_urls: HashMap::new(),
             provider_regions: HashMap::new(),
             provider_api_keys: HashMap::new(),
             vertex_ai: VertexAiConfig::default(),
@@ -3386,6 +3776,7 @@ impl Default for KernelConfig {
             external_auth: ExternalAuthConfig::default(),
             tool_policy: crate::tool_policy::ToolPolicy::default(),
             proactive_memory: crate::memory::ProactiveMemoryConfig::default(),
+            auto_dream: AutoDreamConfig::default(),
             context_engine: ContextEngineTomlConfig::default(),
             audit: AuditConfig::default(),
             health_check: HealthCheckConfig::default(),
@@ -3393,6 +3784,7 @@ impl Default for KernelConfig {
             plugins: PluginsConfig::default(),
             registry: RegistryConfig::default(),
             cors_origin: Vec::new(),
+            trusted_hosts: Vec::new(),
             privacy: PrivacyConfig::default(),
             strict_config: false,
             qwen_code_path: None,
@@ -3407,6 +3799,7 @@ impl Default for KernelConfig {
             max_concurrent_bg_llm: default_max_concurrent_bg_llm(),
             max_agent_call_depth: default_max_agent_call_depth(),
             max_request_body_bytes: default_max_request_body_bytes(),
+            terminal: TerminalConfig::default(),
         }
     }
 }
@@ -3427,6 +3820,18 @@ impl KernelConfig {
     /// Resolved directory for hand workspaces.
     pub fn effective_hands_workspaces_dir(&self) -> PathBuf {
         self.effective_workspaces_dir().join("hands")
+    }
+
+    /// Parse the TCP port number from `api_listen`.
+    ///
+    /// Returns `None` when the address string is malformed. Callers that rely
+    /// on the port for security-relevant decisions (e.g. Origin validation)
+    /// MUST fail closed in the `None` case rather than assume a default.
+    pub fn listen_port(&self) -> Option<u16> {
+        self.api_listen
+            .rsplit(':')
+            .next()
+            .and_then(|s| s.parse::<u16>().ok())
     }
 
     /// Resolve the API key env var name for a provider.
@@ -3621,7 +4026,7 @@ pub struct MemoryConfig {
     /// Maximum memories before consolidation is triggered.
     pub consolidation_threshold: u64,
     /// Memory decay rate (0.0 = no decay, 1.0 = aggressive decay).
-    pub decay_rate: f32,
+    pub decay_rate: f64,
     /// Embedding provider. Valid values: `"openai"`, `"groq"`, `"mistral"`,
     /// `"together"`, `"fireworks"`, `"cohere"`, `"ollama"`, `"bedrock"`,
     /// `"vllm"`, `"lmstudio"`, or `"auto"`.
@@ -5641,6 +6046,87 @@ impl Default for LinkedInConfig {
     }
 }
 
+/// Terminal / CLI access control configuration.
+///
+/// Controls which clients may connect to the interactive terminal (WebSocket)
+/// and how locality is determined.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalConfig {
+    /// Master switch — set to false to disable the terminal entirely.
+    #[serde(default = "default_terminal_enabled")]
+    pub enabled: bool,
+
+    /// Additional allowed WebSocket origins beyond auto-detected localhost.
+    /// Use when the dashboard is served from a custom domain (e.g. "https://my.domain.com").
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+
+    /// Allow terminal access from remote/proxied connections when no auth is configured.
+    /// Default: false (local-only when unauthenticated).
+    #[serde(default)]
+    pub allow_remote: bool,
+
+    /// When true, bare-loopback connections (127.0.0.1 / ::1 with no proxy
+    /// headers) are rejected at auth time — only connections that arrived via
+    /// a reverse proxy (carrying X-Forwarded-For / X-Real-IP) are considered
+    /// "local". Enable only when running behind a reverse proxy that strips
+    /// direct loopback access. Default: false.
+    ///
+    /// (Historically named `trust_proxy_headers`; the old name is still
+    /// accepted for backward compatibility via `serde(alias)`.)
+    #[serde(default, alias = "trust_proxy_headers")]
+    pub require_proxy_headers: bool,
+
+    /// Hard-override for the "remote + no authentication" combination.
+    /// When `allow_remote` is true and no auth is configured, the terminal
+    /// will still refuse every connection unless this flag is explicitly
+    /// set to `true`. Intended as a foot-gun guard: enabling `allow_remote`
+    /// alone is not enough to expose an unauthenticated shell to the network.
+    /// Default: false.
+    #[serde(default)]
+    pub allow_unauthenticated_remote: bool,
+
+    /// Enable tmux-backed multi-window terminal. Only effective when `tmux` binary is available.
+    #[serde(default = "default_tmux_enabled")]
+    pub tmux_enabled: bool,
+
+    /// Maximum number of tmux windows that may exist simultaneously. Guards against DoS.
+    #[serde(default = "default_max_windows")]
+    pub max_windows: u32,
+
+    /// Optional explicit path to the `tmux` binary. If None, resolve via PATH.
+    #[serde(default)]
+    pub tmux_binary_path: Option<String>,
+}
+
+fn default_terminal_enabled() -> bool {
+    true
+}
+
+fn default_tmux_enabled() -> bool {
+    true
+}
+
+fn default_max_windows() -> u32 {
+    16
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowed_origins: Vec::new(),
+            allow_remote: false,
+            require_proxy_headers: false,
+            allow_unauthenticated_remote: false,
+            tmux_enabled: true,
+            max_windows: 16,
+            tmux_binary_path: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5839,5 +6325,88 @@ type = "number"
             toml_str, toml_str2,
             "KernelConfig default roundtrip mismatch — a field may be missing from Default impl"
         );
+    }
+
+    /// Per-provider budget TOML roundtrip (issue #2316).
+    #[test]
+    fn test_budget_config_per_provider_roundtrip() {
+        let toml_str = r#"
+max_hourly_usd = 0.0
+max_daily_usd = 10.0
+max_monthly_usd = 0.0
+alert_threshold = 0.8
+default_max_llm_tokens_per_hour = 0
+
+[providers.moonshot]
+max_cost_per_day_usd = 2.0
+max_tokens_per_hour = 500000
+
+[providers.litellm]
+# all zeros -> unlimited
+"#;
+        let cfg: BudgetConfig = toml::from_str(toml_str).expect("parse budget TOML");
+        assert_eq!(cfg.providers.len(), 2);
+
+        let moonshot = cfg.providers.get("moonshot").expect("moonshot entry");
+        assert!((moonshot.max_cost_per_day_usd - 2.0).abs() < f64::EPSILON);
+        assert_eq!(moonshot.max_tokens_per_hour, 500_000);
+        // Unset fields default to 0 (unlimited).
+        assert_eq!(moonshot.max_cost_per_hour_usd, 0.0);
+        assert_eq!(moonshot.max_cost_per_month_usd, 0.0);
+
+        let litellm = cfg.providers.get("litellm").expect("litellm entry");
+        assert_eq!(*litellm, ProviderBudget::default());
+
+        // Round-trip: serialize then re-parse, structs should match.
+        let reserialized = toml::to_string(&cfg).expect("serialize budget");
+        let cfg2: BudgetConfig = toml::from_str(&reserialized).expect("reparse budget");
+        assert_eq!(cfg2.providers, cfg.providers);
+    }
+
+    #[test]
+    fn test_budget_config_default_has_empty_providers() {
+        let b = BudgetConfig::default();
+        assert!(b.providers.is_empty());
+        // An empty providers map must not appear in serialized output so that
+        // users who never configured per-provider caps see a clean config.
+        let s = toml::to_string(&b).expect("serialize");
+        assert!(
+            !s.contains("providers"),
+            "empty providers map should be skipped: {s}"
+        );
+    }
+
+    // ---- TerminalConfig tmux fields tests ----
+
+    #[test]
+    fn test_terminal_config_tmux_defaults() {
+        let tc = TerminalConfig::default();
+        assert!(tc.tmux_enabled, "tmux_enabled should default to true");
+        assert_eq!(tc.max_windows, 16, "max_windows should default to 16");
+        assert!(
+            tc.tmux_binary_path.is_none(),
+            "tmux_binary_path should default to None"
+        );
+    }
+
+    #[test]
+    fn test_terminal_config_empty_toml_uses_defaults() {
+        let tc: TerminalConfig = toml::from_str("").unwrap();
+        assert!(tc.tmux_enabled);
+        assert_eq!(tc.max_windows, 16);
+        assert!(tc.tmux_binary_path.is_none());
+    }
+
+    #[test]
+    fn test_terminal_config_toml_roundtrip() {
+        let toml_str = r#"
+            tmux_enabled = false
+            max_windows = 4
+            tmux_binary_path = "/usr/bin/tmux"
+        "#;
+        let tc: TerminalConfig = toml::from_str(toml_str).unwrap();
+        assert!(!tc.tmux_enabled);
+        assert_eq!(tc.max_windows, 4);
+        assert_eq!(tc.tmux_binary_path.as_deref(), Some("/usr/bin/tmux"));
     }
 }

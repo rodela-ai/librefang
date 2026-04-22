@@ -1,8 +1,8 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { formatCompact, formatCost } from "../lib/format";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { getUsageSummary, listUsageByAgent, listUsageByModel, getUsageDaily, getBudgetStatus, updateBudget, getUsageByModelPerformance } from "../api";
+import { useUsageSummary, useUsageByAgent, useUsageByModel, useUsageDaily, useModelPerformance, useBudgetStatus } from "../lib/queries/analytics";
+import { useUpdateBudget } from "../lib/mutations/analytics";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { PageHeader } from "../components/ui/PageHeader";
@@ -11,19 +11,16 @@ import { BarChart3, DollarSign, Shield, Save, Loader2, Cpu, Users, Zap, Trending
 import { CardSkeleton } from "../components/ui/Skeleton";
 import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend } from "recharts";
 
-const REFRESH_MS = 30000;
-
 export function AnalyticsPage() {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
 
-  const usageQuery = useQuery({ queryKey: ["usage", "summary"], queryFn: getUsageSummary, refetchInterval: REFRESH_MS });
-  const usageByAgentQuery = useQuery({ queryKey: ["usage", "byAgent"], queryFn: listUsageByAgent, refetchInterval: REFRESH_MS });
-  const usageByModelQuery = useQuery({ queryKey: ["usage", "byModel"], queryFn: listUsageByModel, refetchInterval: REFRESH_MS });
-  const dailyQuery = useQuery({ queryKey: ["usage", "daily"], queryFn: getUsageDaily, refetchInterval: REFRESH_MS });
-  const budgetQuery = useQuery({ queryKey: ["budget"], queryFn: getBudgetStatus, refetchInterval: REFRESH_MS });
-  const modelPerformanceQuery = useQuery({ queryKey: ["usage", "modelPerformance"], queryFn: getUsageByModelPerformance, refetchInterval: REFRESH_MS });
-  const budgetMutation = useMutation({ mutationFn: updateBudget, onSuccess: () => queryClient.invalidateQueries({ queryKey: ["budget"] }) });
+  const usageQuery = useUsageSummary();
+  const usageByAgentQuery = useUsageByAgent();
+  const usageByModelQuery = useUsageByModel();
+  const dailyQuery = useUsageDaily();
+  const budgetQuery = useBudgetStatus();
+  const modelPerformanceQuery = useModelPerformance();
+  const budgetMutation = useUpdateBudget();
 
   const usage = usageQuery.data ?? null;
   const usageByAgent = useMemo(() => [...(usageByAgentQuery.data ?? [])].filter((a: any) => !a.is_hand).sort((a: any, b: any) => (b.total_cost_usd ?? 0) - (a.total_cost_usd ?? 0)), [usageByAgentQuery.data]);
@@ -148,7 +145,7 @@ export function AnalyticsPage() {
                     <CartesianGrid strokeDasharray="3 3" opacity={0.2} horizontal={false} />
                     <XAxis type="number" tick={{ fontSize: 10 }} tickFormatter={v => `$${v}`} axisLine={false} tickLine={false} />
                     <YAxis type="category" dataKey="name" tick={{ fontSize: 10 }} width={100} axisLine={false} tickLine={false} />
-                    <Tooltip contentStyle={{ borderRadius: 12, fontSize: 12 }} formatter={(v: any) => [formatCost(v), "Cost"]} />
+                    <Tooltip contentStyle={{ borderRadius: 12, fontSize: 12 }} formatter={(v: any) => [formatCost(v), t("analytics.cost")]} />
                     <Bar dataKey="cost" radius={[0, 6, 6, 0]} fill="#3b82f6" />
                   </BarChart>
                 </ResponsiveContainer>
@@ -167,7 +164,7 @@ export function AnalyticsPage() {
                     <CartesianGrid strokeDasharray="3 3" opacity={0.2} horizontal={false} />
                     <XAxis type="number" tick={{ fontSize: 10 }} tickFormatter={v => `$${v}`} axisLine={false} tickLine={false} />
                     <YAxis type="category" dataKey="name" tick={{ fontSize: 10 }} width={120} axisLine={false} tickLine={false} />
-                    <Tooltip contentStyle={{ borderRadius: 12, fontSize: 12 }} formatter={(v: any) => [formatCost(v), "Cost"]} />
+                    <Tooltip contentStyle={{ borderRadius: 12, fontSize: 12 }} formatter={(v: any) => [formatCost(v), t("analytics.cost")]} />
                     <Bar dataKey="cost" radius={[0, 6, 6, 0]} fill="#a855f7" />
                   </BarChart>
                 </ResponsiveContainer>
@@ -234,7 +231,7 @@ export function AnalyticsPage() {
                   </h2>
                   <ResponsiveContainer width="100%" height={Math.max(modelPerformance.slice(0, 8).length * 40, 120)}>
                     <BarChart data={modelPerformance.slice(0, 8).map(m => ({ 
-                      name: m.model?.slice(0, 18) ?? "Unknown", 
+                      name: m.model?.slice(0, 18) ?? t("common.unknown"), 
                       avg: m.avg_latency_ms ?? 0,
                       min: m.min_latency_ms ?? 0,
                       max: m.max_latency_ms ?? 0,
@@ -244,9 +241,9 @@ export function AnalyticsPage() {
                       <YAxis type="category" dataKey="name" tick={{ fontSize: 10 }} width={120} axisLine={false} tickLine={false} />
                       <Tooltip contentStyle={{ borderRadius: 12, fontSize: 12 }} formatter={(v: any, name: any) => [`${v}ms`, name]} />
                       <Legend />
-                      <Bar dataKey="avg" name="Avg" radius={[0, 4, 4, 0]} fill="#3b82f6" />
-                      <Bar dataKey="min" name="Min" radius={[0, 4, 4, 0]} fill="#22c55e" />
-                      <Bar dataKey="max" name="Max" radius={[0, 4, 4, 0]} fill="#ef4444" />
+                      <Bar dataKey="avg" name={t("analytics.avg")} radius={[0, 4, 4, 0]} fill="#3b82f6" />
+                      <Bar dataKey="min" name={t("analytics.min")} radius={[0, 4, 4, 0]} fill="#22c55e" />
+                      <Bar dataKey="max" name={t("analytics.max")} radius={[0, 4, 4, 0]} fill="#ef4444" />
                     </BarChart>
                   </ResponsiveContainer>
                 </Card>
@@ -257,14 +254,14 @@ export function AnalyticsPage() {
                   </h2>
                   <ResponsiveContainer width="100%" height={Math.max(modelPerformance.slice(0, 8).length * 40, 120)}>
                     <BarChart data={modelPerformance.slice(0, 8).map(m => ({ 
-                      name: m.model?.slice(0, 18) ?? "Unknown", 
+                      name: m.model?.slice(0, 18) ?? t("common.unknown"), 
                       costPerCall: m.cost_per_call ?? 0,
                     }))} layout="vertical" margin={{ left: 0, right: 20 }}>
                       <CartesianGrid strokeDasharray="3 3" opacity={0.2} horizontal={false} />
                       <XAxis type="number" tick={{ fontSize: 10 }} tickFormatter={v => `$${v.toFixed(4)}`} axisLine={false} tickLine={false} />
                       <YAxis type="category" dataKey="name" tick={{ fontSize: 10 }} width={120} axisLine={false} tickLine={false} />
-                      <Tooltip contentStyle={{ borderRadius: 12, fontSize: 12 }} formatter={(v: any) => [`$${v.toFixed(4)}`, "Cost/Call"]} />
-                      <Bar dataKey="costPerCall" name="Cost/Call" radius={[0, 4, 4, 0]} fill="#a855f7" />
+                      <Tooltip contentStyle={{ borderRadius: 12, fontSize: 12 }} formatter={(v: any) => [`$${v.toFixed(4)}`, t("analytics.cost_per_call_label")]} />
+                      <Bar dataKey="costPerCall" name={t("analytics.cost_per_call_label")} radius={[0, 4, 4, 0]} fill="#a855f7" />
                     </BarChart>
                   </ResponsiveContainer>
                 </Card>

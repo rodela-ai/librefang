@@ -1,6 +1,7 @@
 //! Audit, logging, tools, profiles, templates, memory, approvals,
 //! bindings, pairing, webhooks, and miscellaneous system handlers.
 
+use super::skills::write_secret_env;
 use super::AppState;
 
 /// Build routes for the system miscellaneous domain (audit, logs, tools, sessions, approvals, pairing, etc.).
@@ -61,6 +62,18 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
             axum::routing::get(list_approvals).post(create_approval),
         )
         .route("/approvals/batch", axum::routing::post(batch_resolve))
+        .route(
+            "/approvals/session/{session_id}",
+            axum::routing::get(list_approvals_for_session),
+        )
+        .route(
+            "/approvals/session/{session_id}/approve_all",
+            axum::routing::post(approve_all_for_session),
+        )
+        .route(
+            "/approvals/session/{session_id}/reject_all",
+            axum::routing::post(reject_all_for_session),
+        )
         .route("/approvals/audit", axum::routing::get(audit_log))
         .route("/approvals/count", axum::routing::get(approval_count))
         .route("/approvals/totp/setup", axum::routing::post(totp_setup))
@@ -290,6 +303,67 @@ pub async fn get_profile(
 // Template endpoints
 // ---------------------------------------------------------------------------
 
+/// Validate a template name supplied via URL path before joining it onto the
+/// templates directory. Only permits `[A-Za-z0-9_-]` to guarantee the result
+/// cannot escape the base directory through `..`, absolute paths, or platform
+/// separators (`/`, `\`). Rejects empty names and anything longer than 64
+/// chars to cap log noise.
+fn validate_template_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() || name.len() > 64 {
+        return Err("invalid template name");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("invalid template name");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod template_name_validation_tests {
+    use super::validate_template_name;
+
+    #[test]
+    fn accepts_simple_names() {
+        assert!(validate_template_name("assistant").is_ok());
+        assert!(validate_template_name("customer-support").is_ok());
+        assert!(validate_template_name("coder_v2").is_ok());
+        assert!(validate_template_name("a1").is_ok());
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        assert!(validate_template_name("..").is_err());
+        assert!(validate_template_name("../../etc").is_err());
+        assert!(validate_template_name("foo/../bar").is_err());
+        assert!(validate_template_name("..\\..\\tmp").is_err());
+    }
+
+    #[test]
+    fn rejects_separators_and_absolute_paths() {
+        assert!(validate_template_name("foo/bar").is_err());
+        assert!(validate_template_name("foo\\bar").is_err());
+        assert!(validate_template_name("/etc/passwd").is_err());
+        assert!(validate_template_name("C:\\Windows").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_and_oversized() {
+        assert!(validate_template_name("").is_err());
+        assert!(validate_template_name(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn rejects_null_and_special_chars() {
+        assert!(validate_template_name("foo\0bar").is_err());
+        assert!(validate_template_name("foo bar").is_err());
+        assert!(validate_template_name("foo.bar").is_err());
+        assert!(validate_template_name("foo%2fbar").is_err());
+    }
+}
+
 /// GET /api/templates — List available agent templates.
 #[utoipa::path(get, path = "/api/templates", tag = "system", operation_id = "list_agent_templates", responses((status = 200, description = "List templates", body = Vec<serde_json::Value>)))]
 pub async fn list_agent_templates() -> impl IntoResponse {
@@ -338,6 +412,9 @@ pub async fn get_agent_template(
     lang: Option<axum::Extension<RequestLanguage>>,
 ) -> impl IntoResponse {
     let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+    if validate_template_name(&name).is_err() {
+        return ApiErrorResponse::not_found(t.t("api-error-template-not-found")).into_json_tuple();
+    }
     let agents_dir = librefang_kernel::config::librefang_home()
         .join("workspaces")
         .join("agents");
@@ -390,6 +467,14 @@ pub async fn get_agent_template_toml(
     lang: Option<axum::Extension<RequestLanguage>>,
 ) -> impl IntoResponse {
     let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+    if validate_template_name(&name).is_err() {
+        return (
+            StatusCode::NOT_FOUND,
+            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+            t.t("api-error-template-not-found"),
+        )
+            .into_response();
+    }
     let agents_dir = librefang_kernel::config::librefang_home()
         .join("workspaces")
         .join("agents");
@@ -1277,6 +1362,7 @@ fn approval_to_json(
         "requested_at": a.requested_at,
         "created_at": a.requested_at,
         "timeout_secs": a.timeout_secs,
+        "session_id": a.session_id,
         "status": "pending"
     })
 }
@@ -1388,6 +1474,10 @@ pub struct CreateApprovalRequest {
     pub description: String,
     #[serde(default)]
     pub action_summary: String,
+    /// Optional session ID — when set, this request participates in
+    /// per-session batch resolve via `/api/approvals/session/{session_id}/approve_all`.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[utoipa::path(post, path = "/api/approvals", tag = "approvals", request_body = serde_json::Value, responses((status = 200, description = "Approval created", body = serde_json::Value)))]
@@ -1420,6 +1510,7 @@ pub async fn create_approval(
         channel: None,
         route_to: Vec::new(),
         escalation_count: 0,
+        session_id: req.session_id,
     };
 
     // Spawn the request in the background (it will block until resolved or timed out)
@@ -1769,6 +1860,278 @@ pub async fn batch_resolve(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Per-session approval helpers
+// ---------------------------------------------------------------------------
+
+/// GET /api/approvals/session/{session_id} — List pending approvals for a session.
+///
+/// Mirrors `has_blocking_approval(session_key)` from Hermes-Agent: returns all
+/// pending `ApprovalRequest`s whose `session_id` field matches the path param.
+#[utoipa::path(
+    get,
+    path = "/api/approvals/session/{session_id}",
+    tag = "approvals",
+    params(("session_id" = String, Path, description = "Session ID")),
+    responses(
+        (status = 200, description = "Pending approvals for session", body = serde_json::Value)
+    )
+)]
+pub async fn list_approvals_for_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    // Validate session_id is not empty/whitespace.
+    if session_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "session_id must not be empty or whitespace"})),
+        );
+    }
+    // Reject excessively long session_id values to prevent DoS via memory/log amplification.
+    if session_id.len() > 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "session_id must not exceed 256 bytes"})),
+        );
+    }
+    let registry_agents = state.kernel.agent_registry().list();
+    let pending = state
+        .kernel
+        .approvals()
+        .list_pending_for_session(&session_id);
+    let items: Vec<serde_json::Value> = pending
+        .iter()
+        .map(|a| approval_to_json(a, &registry_agents))
+        .collect();
+    let count = items.len();
+    let has_pending = !items.is_empty();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "session_id": session_id,
+            "pending": items,
+            "count": count,
+            "has_pending": has_pending,
+        })),
+    )
+}
+
+/// POST /api/approvals/session/{session_id}/approve_all — Approve all pending
+/// approvals for the given session atomically.
+///
+/// Mirrors Hermes-Agent's `resolve_gateway_approval(session_key, "once",
+/// resolve_all=True)`.  TOTP pre-check is enforced — if any pending request
+/// requires TOTP, the entire batch is rejected before any mutation.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct ApproveAllForSessionRequest {
+    /// Optional count of approvals the caller expects to be pending.
+    /// If provided, the server verifies the actual pending count matches
+    /// before approving.  Returns 409 Conflict if the count changed.
+    #[serde(default)]
+    pub expected_count: Option<usize>,
+    /// Optional list of approval IDs the caller expects to be pending.
+    /// If provided, the server verifies the actual pending set matches before
+    /// approving.  Returns 409 Conflict if a new high-risk approval landed
+    /// between the operator viewing the list and clicking approve_all.
+    #[serde(default)]
+    #[schema(value_type = Option<Vec<String>>)]
+    pub expected_ids: Option<Vec<uuid::Uuid>>,
+}
+
+/// POST /api/approvals/session/{session_id}/approve_all — Approve all pending
+/// approvals for the given session atomically.
+#[utoipa::path(
+    post,
+    path = "/api/approvals/session/{session_id}/approve_all",
+    tag = "approvals",
+    params(("session_id" = String, Path, description = "Session ID")),
+    request_body = ApproveAllForSessionRequest,
+    responses(
+        (status = 200, description = "All pending session approvals approved", body = serde_json::Value),
+        (status = 400, description = "TOTP required for one or more items", body = serde_json::Value),
+        (status = 409, description = "Pending set changed since request was issued", body = serde_json::Value),
+    )
+)]
+pub async fn approve_all_for_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    body: Option<Json<ApproveAllForSessionRequest>>,
+) -> impl IntoResponse {
+    let req = body
+        .map(|Json(r)| r)
+        .unwrap_or(ApproveAllForSessionRequest {
+            expected_count: None,
+            expected_ids: None,
+        });
+    // Validate session_id is not empty/whitespace.
+    if session_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "session_id must not be empty or whitespace"})),
+        );
+    }
+    // Reject excessively long session_id values to prevent DoS via memory/log amplification.
+    if session_id.len() > 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "session_id must not exceed 256 bytes"})),
+        );
+    }
+
+    // Collect pending IDs and pre-check for TOTP blockers.
+    let pending = state
+        .kernel
+        .approvals()
+        .list_pending_for_session(&session_id);
+
+    // Confirmation check: verify pending count matches expected_count if provided.
+    if let Some(expected_count) = req.expected_count {
+        if pending.len() != expected_count {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "Pending approval count has changed since this request was issued. Refresh and try again.",
+                    "pending_count": pending.len(),
+                    "expected_count": expected_count,
+                })),
+            );
+        }
+    }
+
+    // Confirmation check: verify pending set matches expected_ids if provided.
+    // Always validate when expected_ids is Some(…), even for an empty slice —
+    // a caller asserting "there are zero pending approvals" must be protected too.
+    if let Some(ref expected) = req.expected_ids {
+        let pending_ids: std::collections::HashSet<_> = pending.iter().map(|r| r.id).collect();
+        let expected_set: std::collections::HashSet<_> = expected.iter().cloned().collect();
+        if pending_ids != expected_set {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "Pending approval set has changed since this request was issued. Refresh and try again.",
+                    "pending_ids": pending_ids,
+                    "expected_ids": expected_set,
+                })),
+            );
+        }
+    }
+
+    // TOTP pre-check: reject entire batch if any item requires TOTP.
+    let policy = state.kernel.approvals().policy();
+    if pending
+        .iter()
+        .any(|req| policy.tool_requires_totp(&req.tool_name))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Session contains approvals that require TOTP. Approve those individually.",
+            })),
+        );
+    }
+
+    // Resolve each pending request through the kernel so deferred executions
+    // are properly spawned (resolve_tool_approval calls handle_approval_resolution
+    // for each deferred payload).
+    // Reuse the `pending` list collected above — avoids a TOCTOU race where the
+    // set could change between the pre-check and the resolve loop.
+    let mut resolved = 0usize;
+    for pending_req in pending {
+        if state
+            .kernel
+            .resolve_tool_approval(
+                pending_req.id,
+                librefang_types::approval::ApprovalDecision::Approved,
+                Some("api".to_string()),
+                false,
+                None,
+            )
+            .await
+            .is_ok()
+        {
+            // Non-existent / already-resolved items are skipped silently.
+            resolved += 1;
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "session_id": session_id,
+            "resolved": resolved,
+            "decision": "approved",
+        })),
+    )
+}
+
+/// POST /api/approvals/session/{session_id}/reject_all — Reject all pending
+/// approvals for the given session atomically.
+///
+/// Mirrors Hermes-Agent's `resolve_gateway_approval(session_key, "deny",
+/// resolve_all=True)`.
+#[utoipa::path(
+    post,
+    path = "/api/approvals/session/{session_id}/reject_all",
+    tag = "approvals",
+    params(("session_id" = String, Path, description = "Session ID")),
+    responses(
+        (status = 200, description = "All pending session approvals rejected", body = serde_json::Value)
+    )
+)]
+pub async fn reject_all_for_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    // Validate session_id is not empty/whitespace.
+    if session_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "session_id must not be empty or whitespace"})),
+        );
+    }
+    // Reject excessively long session_id values to prevent DoS via memory/log amplification.
+    if session_id.len() > 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "session_id must not exceed 256 bytes"})),
+        );
+    }
+
+    // Route through resolve_tool_approval for each request so deferred
+    // executions are properly handled (even though rejection means the deferred
+    // will never run, this keeps the code path consistent).
+    let mut resolved = 0usize;
+    for pending_req in state
+        .kernel
+        .approvals()
+        .list_pending_for_session(&session_id)
+    {
+        if state
+            .kernel
+            .resolve_tool_approval(
+                pending_req.id,
+                librefang_types::approval::ApprovalDecision::Denied,
+                Some("api".to_string()),
+                false,
+                None,
+            )
+            .await
+            .is_ok()
+        {
+            resolved += 1;
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "session_id": session_id,
+            "resolved": resolved,
+            "decision": "rejected",
+        })),
+    )
+}
+
 /// GET /api/approvals/audit — Query the persistent approval audit log.
 #[derive(serde::Deserialize)]
 pub struct AuditQueryParams {
@@ -1997,7 +2360,8 @@ pub async fn totp_status(State(state): State<Arc<AppState>>) -> impl IntoRespons
         .is_some_and(|s| !s.is_empty());
     let confirmed = state.kernel.vault_get("totp_confirmed").as_deref() == Some("true");
     let policy = state.kernel.approvals().policy();
-    let enforced = policy.second_factor == librefang_types::approval::SecondFactor::Totp;
+    let sf = policy.second_factor;
+    let enforced = sf != librefang_types::approval::SecondFactor::None;
 
     let remaining_recovery = state
         .kernel
@@ -2010,6 +2374,7 @@ pub async fn totp_status(State(state): State<Arc<AppState>>) -> impl IntoRespons
         "enrolled": has_secret,
         "confirmed": confirmed,
         "enforced": enforced,
+        "scope": serde_json::to_value(sf).unwrap_or(serde_json::json!("none")),
         "remaining_recovery_codes": remaining_recovery,
     }))
 }
@@ -2698,30 +3063,30 @@ pub async fn create_backup(
         }
     }
 
-    // 2. cron_jobs.json
-    let cron_path = home_dir.join("cron_jobs.json");
+    // 2. data/cron_jobs.json
+    let cron_path = home_dir.join("data").join("cron_jobs.json");
     if cron_path.exists() {
-        if let Err(e) = add_file(&mut zip, &cron_path, "cron_jobs.json") {
+        if let Err(e) = add_file(&mut zip, &cron_path, "data/cron_jobs.json") {
             tracing::warn!("Backup: skipping cron_jobs.json: {e}");
         } else {
             components.push("cron_jobs".to_string());
         }
     }
 
-    // 3. hand_state.json
-    let hand_state_path = home_dir.join("hand_state.json");
+    // 3. data/hand_state.json
+    let hand_state_path = home_dir.join("data").join("hand_state.json");
     if hand_state_path.exists() {
-        if let Err(e) = add_file(&mut zip, &hand_state_path, "hand_state.json") {
+        if let Err(e) = add_file(&mut zip, &hand_state_path, "data/hand_state.json") {
             tracing::warn!("Backup: skipping hand_state.json: {e}");
         } else {
             components.push("hand_state".to_string());
         }
     }
 
-    // 4. custom_models.json
-    let custom_models_path = home_dir.join("custom_models.json");
+    // 4. data/custom_models.json
+    let custom_models_path = home_dir.join("data").join("custom_models.json");
     if custom_models_path.exists() {
-        if let Err(e) = add_file(&mut zip, &custom_models_path, "custom_models.json") {
+        if let Err(e) = add_file(&mut zip, &custom_models_path, "data/custom_models.json") {
             tracing::warn!("Backup: skipping custom_models.json: {e}");
         } else {
             components.push("custom_models".to_string());
@@ -3890,8 +4255,9 @@ async fn create_registry_content(
             .join(&identifier)
             .join("agent.toml"),
         "hand" => home_dir.join("hands").join(&identifier).join("HAND.toml"),
-        "integration" => home_dir
-            .join("integrations")
+        "mcp" => home_dir
+            .join("mcp")
+            .join("catalog")
             .join(format!("{identifier}.toml")),
         "skill" => home_dir.join("skills").join(&identifier).join("skill.toml"),
         "plugin" => home_dir
@@ -3914,15 +4280,45 @@ async fn create_registry_content(
         .into_response();
     }
 
+    // For providers: extract the `api_key` value (if present) before writing TOML.
+    // The actual key is stored in secrets.env, NOT in the provider TOML file.
+    let api_key_to_save: Option<(String, String)> = if content_type == "provider" {
+        let obj = body.as_object();
+        let api_key = obj
+            .and_then(|m| m.get("api_key"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string());
+        let api_key_env = obj
+            .and_then(|m| m.get("api_key_env"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{}_API_KEY", identifier.to_uppercase().replace('-', "_")));
+        api_key.map(|k| (api_key_env, k))
+    } else {
+        None
+    };
+
     // Convert JSON values to TOML.
     // For providers: the catalog TOML format requires a `[provider]` section header.
     // If the body is a flat object (fields at the top level), restructure it so that
     // non-`models` fields are nested under a `"provider"` key, producing the correct
     // `[provider] … [[models]] …` layout that `ModelCatalogFile` expects.
-    let body_for_toml = if content_type == "provider" {
-        normalize_provider_body(&body)
+    // Strip `api_key` from the body so the secret is not written to the TOML file.
+    let body_without_secret = if content_type == "provider" {
+        let mut b = body.clone();
+        if let Some(obj) = b.as_object_mut() {
+            obj.remove("api_key");
+        }
+        b
     } else {
         body.clone()
+    };
+    let body_for_toml = if content_type == "provider" {
+        normalize_provider_body(&body_without_secret)
+    } else {
+        body_without_secret
     };
     let toml_value = json_to_toml_value(&body_for_toml);
     let toml_string = match toml::to_string_pretty(&toml_value) {
@@ -3951,6 +4347,16 @@ async fn create_registry_content(
     // For provider files, refresh the in-memory model catalog so new models
     // and provider config changes are available immediately.
     if content_type == "provider" {
+        // Save the API key to secrets.env before detect_auth so the provider
+        // is immediately recognized as configured.
+        if let Some((env_var, key_value)) = &api_key_to_save {
+            let secrets_path = state.kernel.home_dir().join("secrets.env");
+            if let Err(e) = write_secret_env(&secrets_path, env_var, key_value) {
+                tracing::warn!("Failed to write API key to secrets.env: {e}");
+            }
+            std::env::set_var(env_var, key_value);
+        }
+
         let mut catalog = state
             .kernel
             .model_catalog_ref()
@@ -3963,6 +4369,10 @@ async fn create_registry_content(
         // Invalidate cached LLM drivers — URLs/keys may have changed.
         drop(catalog);
         state.kernel.clear_driver_cache();
+
+        if api_key_to_save.is_some() {
+            state.kernel.clone().spawn_key_validation();
+        }
     }
 
     Json(serde_json::json!({

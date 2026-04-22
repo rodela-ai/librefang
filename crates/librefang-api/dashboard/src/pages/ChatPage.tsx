@@ -1,25 +1,44 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { formatCost } from "../lib/format";
 import { memo, useEffect, useMemo, useRef, useState, useCallback } from "react";
 import rehypeKatex from "rehype-katex";
 import remarkMath from "remark-math";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import { buildAuthenticatedWebSocketUrl, listAgents, sendAgentMessage, loadAgentSession, listPendingApprovals, resolveApproval, getFullConfig, listAgentSessions, createAgentSession, switchAgentSession, deleteSession, listModels, patchAgentConfig, listMediaProviders } from "../api";
-import type { ApprovalItem, SessionListItem, ModelItem, AgentTool } from "../api";
+import { buildAuthenticatedWebSocketUrl, sendAgentMessage, loadAgentSession } from "../api";
+import { useQueryClient } from "@tanstack/react-query";
+import type { ApprovalItem, SessionListItem, ModelItem, AgentTool, AgentItem } from "../api";
+import { clearAgentHistory } from "../lib/http/client";
+import { useFullConfig } from "../lib/queries/config";
+import { useMediaProviders } from "../lib/queries/media";
+import { useModels } from "../lib/queries/models";
+import { usePendingApprovals } from "../lib/queries/approvals";
+import { useAgents, useAgentSessions } from "../lib/queries/agents";
+import { useActiveHandsWhen } from "../lib/queries/hands";
+import { approvalKeys } from "../lib/queries/keys";
+import { groupedPicker } from "../lib/chatPicker";
 import { normalizeToolOutput } from "../lib/chat";
 import { useTtsManager } from "../lib/tts";
-import { MessageCircle, Send, Bot, User, RefreshCw, AlertCircle, Wifi, Sparkles, X, ArrowRight, Zap, ShieldAlert, CheckCircle, XCircle, Clock, Plus, Trash2, ChevronDown, Loader2, Copy, Volume2, Pause, Download } from "lucide-react";
+import { MessageCircle, Send, Square, Bot, User, RefreshCw, AlertCircle, Wifi, Sparkles, X, ArrowRight, ArrowLeft, Zap, ShieldAlert, CheckCircle, XCircle, Clock, Plus, Trash2, ChevronDown, Loader2, Copy, Volume2, Pause, Download, Brain, Eye, EyeOff, Mic, MicOff, Globe } from "lucide-react";
 import { Badge } from "../components/ui/Badge";
 import { MarkdownContent } from "../components/ui/MarkdownContent";
 import { useUIStore } from "../lib/store";
+import { copyToClipboard } from "../lib/clipboard";
 import { ToolCallCard } from "../components/ui/ToolCallCard";
 import { filterVisible } from "../lib/hiddenModels";
+import { useVoiceInput } from "../lib/useVoiceInput";
 import { Typewriter_v2 } from "../components/Typewriter_v2";
+import {
+  useCreateAgentSession,
+  useDeleteAgentSession,
+  usePatchAgentConfig,
+  useResolveApproval,
+  useStopAgent,
+  useSwitchAgentSession,
+} from "../lib/mutations/agents";
 import "katex/dist/katex.min.css";
 
 const isAuthUnavailable = (status?: string) =>
-  !!status && status !== "configured" && status !== "validated_key" && status !== "configured_cli" && status !== "not_required";
+  !!status && status !== "configured" && status !== "validated_key" && status !== "configured_cli" && status !== "not_required" && status !== "auto_detected";
 
 interface ChatToolCall extends AgentTool {
   _call_id?: string;
@@ -37,31 +56,45 @@ interface ChatMessage {
   memories_saved?: string[];
   memories_used?: string[];
   tools?: ChatToolCall[];
+  /** Accumulated reasoning trace streamed via `thinking_delta` events. */
+  thinking?: string;
+  /** Whether the thinking block is collapsed in the UI. */
+  thinkingCollapsed?: boolean;
 }
 
-// Slash commands
+// Slash commands — desc is an i18n key under "chat.cmd_*"
+// noArgs: clicking fills + sends immediately; argsHint: shown as placeholder after completion
 const SLASH_COMMANDS = [
-  { cmd: "/help", desc: "Show available commands" },
-  { cmd: "/clear", desc: "Clear chat history" },
-  { cmd: "/agents", desc: "List available agents" },
-  { cmd: "/info", desc: "Show current agent info" },
-  { cmd: "/new", desc: "Reset session (clear history)" },
-  { cmd: "/compact", desc: "Compress context to save space" },
-  { cmd: "/reset", desc: "Reset session (clear history)" },
-  { cmd: "/reboot", desc: "Reboot session (clear context)" },
-  { cmd: "/stop", desc: "Cancel current run" },
-  { cmd: "/model", desc: "Show or switch model" },
-  { cmd: "/usage", desc: "Show session token usage" },
-  { cmd: "/context", desc: "Show context pressure" },
-  { cmd: "/verbose", desc: "Toggle verbose level" },
-  { cmd: "/budget", desc: "Show budget status" },
-  { cmd: "/peers", desc: "Show connected peers" },
-  { cmd: "/a2a", desc: "Show A2A agents" },
-  { cmd: "/queue", desc: "Show agent queue status" },
+  { cmd: "/help",    descKey: "cmd_help",    noArgs: true },
+  { cmd: "/clear",   descKey: "cmd_clear",   noArgs: true },
+  { cmd: "/agents",  descKey: "cmd_agents",  noArgs: true },
+  { cmd: "/info",    descKey: "cmd_info",    noArgs: true },
+  { cmd: "/new",     descKey: "cmd_new",     noArgs: true, backend: true },
+  { cmd: "/compact", descKey: "cmd_compact", noArgs: true, backend: true },
+  { cmd: "/reset",   descKey: "cmd_reset",   noArgs: true, backend: true },
+  { cmd: "/reboot",  descKey: "cmd_reboot",  noArgs: true, backend: true },
+  { cmd: "/stop",    descKey: "cmd_stop",    noArgs: true, backend: true },
+  { cmd: "/model",   descKey: "cmd_model",   argsHint: "<provider/model>", backend: true },
+  { cmd: "/usage",   descKey: "cmd_usage",   noArgs: true, backend: true },
+  { cmd: "/context", descKey: "cmd_context", noArgs: true, backend: true },
+  { cmd: "/verbose", descKey: "cmd_verbose", argsHint: "[level]", backend: true },
+  { cmd: "/budget",  descKey: "cmd_budget",  noArgs: true, backend: true },
+  { cmd: "/peers",   descKey: "cmd_peers",   noArgs: true, backend: true },
+  { cmd: "/a2a",     descKey: "cmd_a2a",     noArgs: true, backend: true },
+  { cmd: "/queue",   descKey: "cmd_queue",   noArgs: true, backend: true },
 ];
 
 // Commands that require backend processing via WebSocket command protocol
-const BACKEND_COMMANDS = ["new", "reset", "reboot", "compact", "stop", "model", "usage", "context", "verbose", "budget", "peers", "a2a", "queue"];
+const BACKEND_COMMANDS = SLASH_COMMANDS.filter(c => c.backend).map(c => c.cmd.slice(1));
+
+const REMARK_PLUGINS = [remarkMath];
+const REHYPE_PLUGINS = [rehypeKatex];
+
+let _nextMessageId = 0;
+function makeMessageId(prefix: string): string {
+  _nextMessageId += 1;
+  return `${prefix}-${Date.now()}-${_nextMessageId}`;
+}
 
 
 // WebSocket hook with auto-reconnect
@@ -142,11 +175,90 @@ const sessionCache = new Map<string, ChatMessage[]>();
 
 // Chat message management - includes history loading and sending (with WS streaming)
 // sessionVersion: bump to force reload after session switch
-function useChatMessages(agentId: string | null, agents: any[] = [], sessionVersion = 0) {
+function useChatMessages(agentId: string | null, agents: AgentItem[] = [], sessionVersion = 0, onModelSwitch?: () => void, onClearError?: (message: string) => void) {
+  const { t } = useTranslation();
+  const stopAgentMutation = useStopAgent();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
+  // Per-agent loading state. A single shared `isLoading` would freeze the
+  // ChatInput on every agent while one of them is streaming (#2322). Keyed
+  // by agentId so switching away from a busy agent unblocks the new one,
+  // and coming back still reflects the in-flight status of the original.
+  const [loadingAgents, setLoadingAgents] = useState<Record<string, boolean>>({});
+  const isLoading = agentId ? loadingAgents[agentId] === true : false;
+  const setAgentLoading = useCallback((id: string, on: boolean) => {
+    setLoadingAgents(prev => {
+      if ((prev[id] ?? false) === on) return prev;
+      const next = { ...prev };
+      if (on) next[id] = true; else delete next[id];
+      return next;
+    });
+  }, []);
+  // Tracks the bot message id of the most recent send per agent. Message
+  // handlers for an older turn must NOT clear `isLoading` when a newer turn
+  // is already in flight (user can now type + send while the previous turn's
+  // `response` event is still pending — see `ChatInput` inputDisabled split).
+  const latestTurnRef = useRef<Record<string, string>>({});
+  // Per-agent in-flight turn lifecycle state, hoisted out of sendMessage's
+  // closure so stopMessage can reach `cleanup`, `fallbackTimer`, and
+  // `responded`. Without this, stopMessage POSTs /stop but the WS fallback
+  // watchdog stays armed and 180s later re-sends the stopped message over
+  // HTTP (#2787 review).
+  const activeTurnsRef = useRef<Record<string, {
+    cleanup?: () => void;
+    fallbackTimer?: ReturnType<typeof setTimeout> | null;
+    responded: boolean;
+  }>>({});
+  const finishTurnIfCurrent = useCallback((agent: string, botId: string) => {
+    if (latestTurnRef.current[agent] === botId) {
+      setAgentLoading(agent, false);
+      delete latestTurnRef.current[agent];
+    }
+  }, [setAgentLoading]);
+  // Garbage-collect loading flags for agents that no longer exist so the
+  // map doesn't accumulate dead entries over a long session.
+  useEffect(() => {
+    const alive = new Set(agents.map(a => a.id));
+    setLoadingAgents(prev => {
+      const next: Record<string, boolean> = {};
+      let changed = false;
+      for (const [id, on] of Object.entries(prev)) {
+        if (alive.has(id)) next[id] = on; else changed = true;
+      }
+      return changed ? next : prev;
+    });
+
+    const latestTurns = latestTurnRef.current;
+    for (const id of Object.keys(latestTurns)) {
+      if (!alive.has(id)) delete latestTurns[id];
+    }
+  }, [agents]);
   const { ws, wsConnected, onDropRef } = useWebSocket(agentId);
   const addSkillOutput = useUIStore((s) => s.addSkillOutput);
+  const deepThinking = useUIStore((s) => s.deepThinking);
+  const showThinkingProcess = useUIStore((s) => s.showThinkingProcess);
+
+  // Track the currently-viewed agent in a ref so async handlers registered
+  // during a previous render can tell whether their target is still on screen.
+  const currentAgentRef = useRef<string | null>(agentId);
+  useEffect(() => { currentAgentRef.current = agentId; }, [agentId]);
+
+  // Route a message update to either live React state (when the target agent
+  // is on screen) or straight to the session cache (when the user has
+  // switched away). Without this, updates against a swapped-out agent fall
+  // into `setMessages(prev => prev.map(...))` whose `prev` is the OTHER
+  // agent's array — the update becomes a silent no-op and the in-flight
+  // response is lost once the user switches back.
+  const updateAgentMessages = useCallback((
+    id: string,
+    updater: (msgs: ChatMessage[]) => ChatMessage[],
+  ) => {
+    if (id === currentAgentRef.current) {
+      setMessages(updater);
+    } else {
+      const current = sessionCache.get(id) ?? [];
+      sessionCache.set(id, updater(current));
+    }
+  }, []);
 
   // Save current messages to cache when switching away. The cleanup must
   // read the LATEST messages at unmount/agent-swap time, so we keep a
@@ -156,13 +268,18 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
   const messagesRef = useRef<ChatMessage[]>(messages);
   messagesRef.current = messages;
   useEffect(() => {
+    if (!agentId) {
+      prevAgentRef.current = null;
+      return;
+    }
+
+    prevAgentRef.current = agentId;
+    const ownedAgentId = agentId;
+
     return () => {
-      if (prevAgentRef.current) {
-        sessionCache.set(prevAgentRef.current, messagesRef.current);
-      }
+      sessionCache.set(ownedAgentId, messagesRef.current);
     };
   }, [agentId]);
-  useEffect(() => { prevAgentRef.current = agentId; }, [agentId]);
 
   // Load history — use cache if available, otherwise fetch
   // sessionVersion changes force a fresh load (skip cache)
@@ -180,8 +297,9 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
     }
 
     setMessages([]);
-    setIsLoading(true);
-    loadAgentSession(agentId)
+    const loadId = agentId;
+    setAgentLoading(loadId, true);
+    loadAgentSession(loadId)
       .then(session => {
         if (session.messages?.length) {
           const historical: ChatMessage[] = session.messages.flatMap((msg, idx) => {
@@ -213,13 +331,36 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
               tools: msg.tools,
             }];
           });
-          setMessages(historical);
-          sessionCache.set(agentId, historical);
+          // Refresh the cache unconditionally — the data is still correct
+          // for loadId. Only touch live React state when the user is still
+          // viewing loadId; otherwise a slow A load resolving after the
+          // user has swapped to B would overwrite B's displayed messages.
+          sessionCache.set(loadId, historical);
+          if (loadId === currentAgentRef.current) {
+            setMessages(historical);
+          }
         }
       })
-      .catch(() => {})
-      .finally(() => setIsLoading(false));
+      .catch(() => { /* Session load failure — user will see empty chat */ })
+      .finally(() => setAgentLoading(loadId, false));
   }, [agentId, sessionVersion]);
+
+  const clearHistory = useCallback(async () => {
+    if (!agentId) {
+      setMessages([]);
+      return;
+    }
+    try {
+      await clearAgentHistory(agentId);
+      sessionCache.delete(agentId);
+      if (prevAgentRef.current === agentId) {
+        messagesRef.current = [];
+      }
+      setMessages([]);
+    } catch (error) {
+      onClearError?.(error instanceof Error ? error.message : t("common.error"));
+    }
+  }, [agentId, onClearError, t]);
 
   // Send message - WS first, HTTP fallback
   const sendMessage = useCallback(async (content: string) => {
@@ -230,23 +371,28 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
     if (trimmed.startsWith("/")) {
       const sysMsg = (text: string) => {
         setMessages(prev => [...prev,
-          { id: `user-${Date.now()}`, role: "user" as const, content: trimmed, timestamp: new Date() },
-          { id: `sys-${Date.now()}`, role: "system" as const, content: text, timestamp: new Date() }
+          { id: makeMessageId("user"), role: "user" as const, content: trimmed, timestamp: new Date() },
+          { id: makeMessageId("sys"), role: "system" as const, content: text, timestamp: new Date() }
         ]);
       };
       if (trimmed === "/help") {
-        sysMsg(SLASH_COMMANDS.map(c => `**${c.cmd}** — ${c.desc}`).join("\n"));
+        sysMsg(SLASH_COMMANDS.map(c =>
+          `- \`${c.cmd}${c.argsHint ? " " + c.argsHint : ""}\` — ${t(`chat.${c.descKey}`)}`
+        ).join("\n"));
         return;
       }
-      if (trimmed === "/clear") { setMessages([]); return; }
+      if (trimmed === "/clear") {
+        void clearHistory();
+        return;
+      }
       if (trimmed === "/agents") {
         const names = agents.map(a => `- **${a.name}** (${a.state || "unknown"})`).join("\n");
-        sysMsg(names || "No agents available.");
+        sysMsg(names || t("chat.no_agents_available"));
         return;
       }
       if (trimmed === "/info") {
         const a = agents.find(a => a.id === agentId);
-        sysMsg(a ? `**${a.name}**\nModel: ${a.model_name || "-"}\nProvider: ${a.model_provider || "-"}\nState: ${a.state}` : "No agent selected.");
+        sysMsg(a ? `**${a.name}**\n${t("chat.info_model")}: ${a.model_name || "-"}\n${t("chat.info_provider")}: ${a.model_provider || "-"}\n${t("chat.info_state")}: ${a.state}` : t("chat.no_agent_selected"));
         return;
       }
 
@@ -256,7 +402,7 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
       const cmdArgs = trimmed.slice(1 + cmd.length).trim();
       if (BACKEND_COMMANDS.includes(cmd)) {
         setMessages(prev => [...prev,
-          { id: `user-${Date.now()}`, role: "user" as const, content: trimmed, timestamp: new Date() },
+          { id: makeMessageId("user"), role: "user" as const, content: trimmed, timestamp: new Date() },
         ]);
         if (ws.current && ws.current.readyState === WebSocket.OPEN) {
           const handleCmdResponse = (event: MessageEvent) => {
@@ -268,12 +414,16 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
                 // /new and /reset clear the backend session, so clear frontend too
                 if (data.type === "command_result" && (cmd === "new" || cmd === "reset")) {
                   setMessages([
-                    { id: `sys-${Date.now()}`, role: "system" as const, content: responseText, timestamp: new Date() },
+                    { id: makeMessageId("sys"), role: "system" as const, content: responseText, timestamp: new Date() },
                   ]);
                 } else {
                   setMessages(prev => [...prev,
-                    { id: `sys-${Date.now()}`, role: "system" as const, content: responseText, timestamp: new Date() },
+                    { id: makeMessageId("sys"), role: "system" as const, content: responseText, timestamp: new Date() },
                   ]);
+                }
+                // Refresh agent data so model/provider badge reflects the change
+                if (data.type === "command_result" && cmd === "model") {
+                  onModelSwitch?.();
                 }
               }
             } catch { /* ignore non-JSON */ }
@@ -281,23 +431,28 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
           ws.current.addEventListener("message", handleCmdResponse);
           ws.current.send(JSON.stringify({ type: "command", command: cmd, args: cmdArgs }));
         } else {
-          sysMsg("WebSocket not connected. Please refresh the page.");
+          sysMsg(t("chat.ws_not_connected"));
         }
         return;
       }
     }
 
     if (!agentId) return;
+    // Snapshot the agent at send time. The user may switch agents before
+    // the response finishes; all completion/cleanup paths must still target
+    // the original sender so we don't flip loading state / HTTP routes on
+    // the agent the user is now looking at.
+    const sendAgentId = agentId;
 
     const userMsg: ChatMessage = {
-      id: `user-${Date.now()}`,
+      id: makeMessageId("user"),
       role: "user",
       content: trimmed,
       timestamp: new Date(),
     };
 
     const botMsg: ChatMessage = {
-      id: `bot-${Date.now()}`,
+      id: makeMessageId("bot"),
       role: "assistant",
       content: "",
       timestamp: new Date(),
@@ -305,14 +460,18 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
     };
 
     setMessages(prev => [...prev, userMsg, botMsg]);
-    setIsLoading(true);
+    setAgentLoading(sendAgentId, true);
+    latestTurnRef.current[sendAgentId] = botMsg.id;
 
     // Helper: send via HTTP (used as primary fallback and WS drop recovery)
     const sendViaHttp = async () => {
       try {
-        const response = await sendAgentMessage(agentId, trimmed);
+        const response = await sendAgentMessage(sendAgentId, trimmed, {
+          thinking: deepThinking,
+          show_thinking: showThinkingProcess,
+        });
         const fullContent = response.response || "";
-        setMessages(prev => prev.map(m =>
+        updateAgentMessages(sendAgentId, prev => prev.map(m =>
           m.id === botMsg.id
             ? {
                 ...m, content: fullContent, isStreaming: false,
@@ -320,35 +479,51 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
                 cost_usd: response.cost_usd,
                 memories_saved: response.memories_saved,
                 memories_used: response.memories_used,
+                thinking: response.thinking ?? m.thinking,
+                thinkingCollapsed: m.thinkingCollapsed ?? true,
               }
             : m
         ));
         if (response.memories_saved?.length) {
-          const agentName = agents.find(a => a.id === agentId)?.name;
+          const agentName = agents.find(a => a.id === sendAgentId)?.name;
           response.memories_saved.forEach((mem: string) => {
-            addSkillOutput({ skillName: "memory", agentId: agentId || undefined, agentName, content: mem });
+            addSkillOutput({ skillName: "memory", agentId: sendAgentId, agentName, content: mem });
           });
         }
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : "Unknown error";
-        setMessages(prev => prev.map(m =>
+        updateAgentMessages(sendAgentId, prev => prev.map(m =>
           m.id === botMsg.id ? { ...m, isStreaming: false, error: errorMsg } : m
         ));
       } finally {
-        setIsLoading(false);
+        finishTurnIfCurrent(sendAgentId, botMsg.id);
       }
     };
 
     // Try WebSocket streaming first
     if (wsConnected && ws.current && ws.current.readyState === WebSocket.OPEN) {
       try {
-        let responded = false;
-        let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+        // Hoist per-turn lifecycle state onto the ref so stopMessage can tear
+        // down the WS listener + watchdog. Any prior entry for this agent
+        // should already have been cleaned up by its own terminal path, but
+        // be defensive and clear it.
+        const prevTurn = activeTurnsRef.current[sendAgentId];
+        if (prevTurn) {
+          prevTurn.responded = true;
+          if (prevTurn.fallbackTimer) clearTimeout(prevTurn.fallbackTimer);
+          prevTurn.cleanup?.();
+        }
+        const turn: {
+          cleanup?: () => void;
+          fallbackTimer?: ReturnType<typeof setTimeout> | null;
+          responded: boolean;
+        } = { responded: false, fallbackTimer: null };
+        activeTurnsRef.current[sendAgentId] = turn;
 
         const resetFallbackTimer = () => {
-          if (fallbackTimer) clearTimeout(fallbackTimer);
-          fallbackTimer = setTimeout(() => {
-            if (!responded) {
+          if (turn.fallbackTimer) clearTimeout(turn.fallbackTimer);
+          turn.fallbackTimer = setTimeout(() => {
+            if (!turn.responded) {
               cleanup();
               sendViaHttp();
             }
@@ -356,11 +531,15 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
         };
 
         const cleanup = () => {
-          responded = true;
-          if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
+          turn.responded = true;
+          if (turn.fallbackTimer) { clearTimeout(turn.fallbackTimer); turn.fallbackTimer = null; }
           onDropRef.current = null;
           ws.current?.removeEventListener("message", handleMessage);
+          if (activeTurnsRef.current[sendAgentId] === turn) {
+            delete activeTurnsRef.current[sendAgentId];
+          }
         };
+        turn.cleanup = cleanup;
 
         // Set up message handler for this response
         const handleMessage = (event: MessageEvent) => {
@@ -370,20 +549,31 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
             const data = JSON.parse(event.data as string);
             if (data.type === "text_delta") {
               const chunk = data.content || "";
-              setMessages(prev => prev.map(m =>
+              updateAgentMessages(sendAgentId, prev => prev.map(m =>
                 m.id === botMsg.id ? { ...m, content: m.content + chunk, error: undefined } : m
+              ));
+            } else if (data.type === "thinking_delta") {
+              const chunk = data.content || "";
+              updateAgentMessages(sendAgentId, prev => prev.map(m =>
+                m.id === botMsg.id
+                  ? {
+                      ...m,
+                      thinking: (m.thinking ?? "") + chunk,
+                      thinkingCollapsed: m.thinkingCollapsed ?? false,
+                    }
+                  : m
               ));
             } else if (data.type === "typing") {
               if (data.state === "stop") {
-                setMessages(prev => prev.map(m =>
+                updateAgentMessages(sendAgentId, prev => prev.map(m =>
                   m.id === botMsg.id ? { ...m, isStreaming: false } : m
                 ));
               }
             } else if (data.type === "tool_start") {
               // Agent started a tool call — add a running tool entry
               const toolName = typeof data.tool === "string" ? data.tool : "unknown";
-              const toolId = data.id || `tool-${Date.now()}`;
-              setMessages(prev => prev.map(m =>
+              const toolId = data.id || makeMessageId("tool");
+              updateAgentMessages(sendAgentId, prev => prev.map(m =>
                 m.id === botMsg.id
                   ? { ...m, tools: [...(m.tools || []), { name: toolName, running: true, expanded: false, is_error: false, input: undefined, result: undefined, _call_id: toolId }] }
                   : m
@@ -395,7 +585,7 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
               const toolId = data.id;
               let parsedInput: unknown;
               try { parsedInput = typeof data.input === "string" ? JSON.parse(data.input) : data.input; } catch { parsedInput = data.input; }
-              setMessages(prev => prev.map(m => {
+              updateAgentMessages(sendAgentId, prev => prev.map(m => {
                 if (m.id !== botMsg.id) return m;
                 const tools = (m.tools || []).map(t =>
                   t._call_id === toolId ? { ...t, input: parsedInput } : t
@@ -407,7 +597,7 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
               const toolName = typeof data.tool === "string" ? data.tool : "";
               const isError = Boolean(data.is_error);
               const result = typeof data.result === "string" ? data.result : data.result != null ? JSON.stringify(data.result) : "";
-              setMessages(prev => prev.map(m => {
+              updateAgentMessages(sendAgentId, prev => prev.map(m => {
                 if (m.id !== botMsg.id) return m;
                 const tools = [...(m.tools || [])];
                 // Find last tool with this name that has no result yet
@@ -422,26 +612,35 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
               // Also keep the skill output panel behavior
               const entry = normalizeToolOutput(data);
               if (entry) {
-                addSkillOutput({ skillName: entry.tool, agentId: agentId || undefined, content: entry.content });
+                addSkillOutput({ skillName: entry.tool, agentId: sendAgentId, content: entry.content });
               }
             } else if (data.type === "silent_complete") {
-              setMessages(prev => prev.filter(m => m.id !== botMsg.id));
-              setIsLoading(false);
+              updateAgentMessages(sendAgentId, prev => prev.filter(m => m.id !== botMsg.id));
+              finishTurnIfCurrent(sendAgentId, botMsg.id);
               cleanup();
             } else if (data.type === "error") {
               const error = data.content || "WebSocket error";
-              setMessages(prev => prev.map(m =>
+              updateAgentMessages(sendAgentId, prev => prev.map(m =>
                 m.id === botMsg.id ? { ...m, isStreaming: false, error } : m
               ));
-              // Don't cleanup immediately — the agent may recover and send a final
-              // response. Shorten the inactivity window to 30s so the user isn't
-              // blocked forever if the agent truly failed.
-              if (fallbackTimer) clearTimeout(fallbackTimer);
-              fallbackTimer = setTimeout(() => {
-                if (!responded) { cleanup(); sendViaHttp(); }
+              // Release the loading flag so the send button re-enables and the
+              // "streaming" badge drops — the user just saw an error and
+              // should be able to retry immediately (#2745). Keep the WS
+              // listener + recovery fallback timer alive in case the agent
+              // does send a late `response` event; those handlers operate on
+              // the same botMsg.id and will overwrite the error state if
+              // recovery actually happens.
+              finishTurnIfCurrent(sendAgentId, botMsg.id);
+              // Don't cleanup the listener immediately — the agent may recover
+              // and send a final response. Shorten the inactivity window to
+              // 30s so the WS doesn't stay half-open forever if the failure
+              // is terminal.
+              if (turn.fallbackTimer) clearTimeout(turn.fallbackTimer);
+              turn.fallbackTimer = setTimeout(() => {
+                if (!turn.responded) { cleanup(); sendViaHttp(); }
               }, 30_000);
             } else if (data.type === "response") {
-              setMessages(prev => prev.map(m =>
+              updateAgentMessages(sendAgentId, prev => prev.map(m =>
                 m.id === botMsg.id
                   ? {
                       ...m, content: data.content || m.content, isStreaming: false,
@@ -449,15 +648,17 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
                       cost_usd: data.cost_usd,
                       memories_saved: data.memories_saved,
                       memories_used: data.memories_used,
+                      thinking: typeof data.thinking === "string" ? data.thinking : m.thinking,
+                      thinkingCollapsed: m.thinkingCollapsed ?? true,
                     }
                   : m
               ));
-              setIsLoading(false);
+              finishTurnIfCurrent(sendAgentId, botMsg.id);
               cleanup();
             }
           } catch {
             // Non-JSON text chunk
-            setMessages(prev => prev.map(m =>
+            updateAgentMessages(sendAgentId, prev => prev.map(m =>
               m.id === botMsg.id ? { ...m, content: m.content + event.data } : m
             ));
           }
@@ -465,14 +666,22 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
 
         // Register fallback: if WS drops mid-stream, retry via HTTP
         onDropRef.current = () => {
-          if (!responded) {
+          if (!turn.responded) {
             ws.current?.removeEventListener("message", handleMessage);
+            if (activeTurnsRef.current[sendAgentId] === turn) {
+              delete activeTurnsRef.current[sendAgentId];
+            }
             sendViaHttp();
           }
         };
 
         ws.current.addEventListener("message", handleMessage);
-        ws.current.send(JSON.stringify({ type: "message", content: trimmed }));
+        ws.current.send(JSON.stringify({
+          type: "message",
+          content: trimmed,
+          thinking: deepThinking,
+          show_thinking: showThinkingProcess,
+        }));
 
         // Start inactivity timeout — resets on every received event
         resetFallbackTimer();
@@ -485,11 +694,45 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
 
     // HTTP fallback — direct, no fake streaming
     await sendViaHttp();
-  }, [agentId, agents, wsConnected, ws]);
+  }, [agentId, agents, wsConnected, ws, deepThinking, showThinkingProcess, finishTurnIfCurrent, clearHistory]);
 
-  const clearHistory = useCallback(() => setMessages([]), []);
+  // Abort an in-flight agent run. Hits the backend stop endpoint (which aborts
+  // the tokio task on the kernel side) and optimistically finalizes any
+  // streaming messages for this agent so the input re-enables immediately —
+  // we don't wait for the WS to emit a terminal event.
+  const stopMessage = useCallback(async () => {
+    if (!agentId) return;
+    const targetId = agentId;
+    updateAgentMessages(targetId, prev => prev.map(m =>
+      m.isStreaming ? { ...m, isStreaming: false } : m,
+    ));
+    const pendingBotId = latestTurnRef.current[targetId];
+    if (pendingBotId) finishTurnIfCurrent(targetId, pendingBotId);
+    // Tear down the in-flight WS turn: mark responded, clear the 180s/30s
+    // watchdog, and detach the message listener. Without this the watchdog
+    // would fire after the backend aborts (WS goes silent) and re-send the
+    // stopped message over HTTP (#2787 review).
+    const turn = activeTurnsRef.current[targetId];
+    if (turn) {
+      turn.responded = true;
+      if (turn.fallbackTimer) {
+        clearTimeout(turn.fallbackTimer);
+        turn.fallbackTimer = null;
+      }
+      turn.cleanup?.();
+      // cleanup() deletes the entry itself, but guard against custom
+      // cleanup implementations.
+      delete activeTurnsRef.current[targetId];
+    }
+    try {
+      await stopAgentMutation.mutateAsync(targetId);
+    } catch {
+      // Backend stop failure is non-fatal for the UI — the run may have
+      // completed between user click and request. UI is already unblocked.
+    }
+  }, [agentId, updateAgentMessages, finishTurnIfCurrent, stopAgentMutation]);
 
-  return { messages, isLoading, sendMessage, clearHistory, wsConnected };
+  return { messages, isLoading, sendMessage, stopMessage, clearHistory, wsConnected };
 }
 
 // Message bubble component — memoized to skip re-render during streaming of other messages
@@ -507,14 +750,25 @@ interface MessageBubbleProps {
 const MessageBubble = memo(function MessageBubble({ message, usageFooter, onCopy, copied, onSpeak, isSpeaking, ttsStatus, ttsAvailable }: MessageBubbleProps) {
   const { t } = useTranslation();
   const isUser = message.role === "user";
+  const [thinkingExpanded, setThinkingExpanded] = useState(() => !(message.thinkingCollapsed ?? false));
 
   if (message.role === "system") {
+    const isMultiLine = message.content.includes("\n");
+    if (isMultiLine) {
+      return (
+        <div className="flex justify-start py-2">
+          <div className="max-w-[min(90%,56ch)] text-xs text-text-dim/70 [&_code]:text-brand [&_code]:font-mono [&_ul]:space-y-1 [&_ul>li]:list-none [&_ul>li]:flex [&_ul>li]:gap-2">
+            <MarkdownContent>{message.content}</MarkdownContent>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="flex justify-center py-6">
         <div className="flex items-center gap-4">
-          <div className="h-px w-16 bg-gradient-to-r from-transparent to-border-subtle" />
+          <div className="h-px w-16 bg-linear-to-r from-transparent to-border-subtle" />
           <span className="text-[10px] font-medium text-text-dim/40 tracking-[0.2em] uppercase">{message.content}</span>
-          <div className="h-px w-16 bg-gradient-to-l from-transparent to-border-subtle" />
+          <div className="h-px w-16 bg-linear-to-l from-transparent to-border-subtle" />
         </div>
       </div>
     );
@@ -530,12 +784,12 @@ const MessageBubble = memo(function MessageBubble({ message, usageFooter, onCopy
   }, [message.content, isUser]);
 
   return (
-    <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
-      <div className={`flex flex-col max-w-[90%] sm:max-w-[75%] ${isUser ? "items-end" : "items-start"}`}>
+    <div className={`flex animate-message-in ${isUser ? "justify-end" : "justify-start"}`}>
+      <div className={`flex flex-col min-w-0 w-fit max-w-[90%] sm:max-w-[min(75%,70ch)] ${isUser ? "items-end" : "items-start"}`}>
         {/* Avatar + name */}
         <div className={`flex items-center gap-2 mb-1.5 ${isUser ? "self-end flex-row-reverse" : "self-start"}`}>
           <div className={`h-7 w-7 rounded-lg flex items-center justify-center ${
-            isUser ? "bg-gradient-to-br from-brand to-accent text-white shadow-md" : "bg-surface border border-border-subtle"
+            isUser ? "bg-brand text-white shadow-sm" : "bg-surface border border-border-subtle"
           }`}>
             {isUser ? <User className="h-3.5 w-3.5" /> : <Bot className="h-3.5 w-3.5 text-brand" />}
           </div>
@@ -543,6 +797,28 @@ const MessageBubble = memo(function MessageBubble({ message, usageFooter, onCopy
             {isUser ? t("chat.you") : t("chat.bot")}
           </span>
         </div>
+
+        {/* Thinking trace — collapsible, above tools */}
+        {!isUser && message.thinking && message.thinking.trim().length > 0 && (
+          <div className="w-full mb-1.5">
+            <button
+              type="button"
+              onClick={() => setThinkingExpanded((v) => !v)}
+              className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md border border-border-subtle bg-surface text-[10px] font-medium text-text-dim hover:text-text hover:border-border transition-colors"
+            >
+              <Brain className="h-3 w-3" />
+              <span>{t("chat.thinking_label")}</span>
+              <ChevronDown
+                className={`h-3 w-3 transition-transform ${thinkingExpanded ? "rotate-180" : ""}`}
+              />
+            </button>
+            {thinkingExpanded && (
+              <div className="mt-1 px-3 py-2 rounded-lg border border-border-subtle bg-surface/50 text-[12px] leading-relaxed text-text-dim break-words prose-sm">
+                <MarkdownContent>{message.thinking ?? ""}</MarkdownContent>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Tool calls — rendered above text for assistant messages */}
         {!isUser && message.tools && message.tools.length > 0 && (
@@ -555,9 +831,9 @@ const MessageBubble = memo(function MessageBubble({ message, usageFooter, onCopy
 
         {/* Message content */}
         {(displayContent || isUser || message.isStreaming || message.error) && (
-        <div className={`relative px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm transition-colors ${
+        <div className={`relative px-3.5 py-2.5 rounded-2xl text-sm leading-relaxed shadow-sm min-w-0 [overflow-wrap:anywhere] ${
           isUser
-            ? "bg-gradient-to-br from-brand to-brand/90 text-white rounded-tr-md"
+            ? "bg-brand text-white rounded-tr-md"
             : message.error
               ? "bg-error/10 border border-error/20 text-error rounded-tl-md"
               : "bg-surface border border-border-subtle rounded-tl-md"
@@ -566,7 +842,7 @@ const MessageBubble = memo(function MessageBubble({ message, usageFooter, onCopy
             displayContent ? (
               <Typewriter_v2 text={displayContent} speed={10} />
             ) : (
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-1 py-0.5">
                 <span className="w-1.5 h-1.5 bg-brand/60 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
                 <span className="w-1.5 h-1.5 bg-brand/60 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
                 <span className="w-1.5 h-1.5 bg-brand/60 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
@@ -578,11 +854,16 @@ const MessageBubble = memo(function MessageBubble({ message, usageFooter, onCopy
               <span>{message.error}</span>
             </div>
           ) : isUser ? (
-            <p className="whitespace-pre-line break-words">{displayContent}</p>
+            // `break-words` only splits on spaces, so a bare URL/token
+            // long enough to overflow its parent used to push the whole
+            // 75%-wide bubble out of frame. `overflow-wrap: anywhere` is
+            // the standard safe-wrap value that only kicks in when the
+            // word would otherwise overflow, so normal text is untouched.
+            <p className="whitespace-pre-line [overflow-wrap:anywhere]">{displayContent}</p>
           ) : (
             <MarkdownContent
-              remarkPlugins={[remarkMath]}
-              rehypePlugins={[rehypeKatex]}
+              remarkPlugins={REMARK_PLUGINS}
+              rehypePlugins={REHYPE_PLUGINS}
             >
               {displayContent}
             </MarkdownContent>
@@ -616,11 +897,7 @@ const MessageBubble = memo(function MessageBubble({ message, usageFooter, onCopy
             {!message.isStreaming && !message.error && message.role === "assistant" && ttsAvailable && onSpeak && (
               <button
                 onClick={() => onSpeak(message.id, message.content)}
-                className={`h-6 w-6 rounded-md flex items-center justify-center transition-colors ${
-                  isUser
-                    ? "bg-gradient-to-br from-brand to-accent text-white shadow-sm hover:shadow-md"
-                    : "bg-surface border border-border-subtle text-brand hover:bg-surface-hover"
-                }`}
+                className="h-6 w-6 rounded-md flex items-center justify-center text-text-dim/60 hover:text-brand hover:bg-surface-hover transition-colors"
                 title={
                   ttsStatus === "loading" ? t("chat.tts_generating") :
                   isSpeaking && ttsStatus === "playing" ? t("chat.pause") :
@@ -642,9 +919,9 @@ const MessageBubble = memo(function MessageBubble({ message, usageFooter, onCopy
               <button
                 onClick={() => onCopy(message.id, message.content)}
                 className={`h-6 w-6 rounded-md flex items-center justify-center transition-colors ${
-                  isUser
-                    ? "bg-gradient-to-br from-brand to-accent text-white shadow-sm hover:shadow-md"
-                    : "bg-surface border border-border-subtle text-brand hover:bg-surface-hover"
+                  copied
+                    ? "text-success"
+                    : "text-text-dim/60 hover:text-brand hover:bg-surface-hover"
                 }`}
                 title={copied ? t("chat.copied") : t("chat.copy")}
               >
@@ -668,10 +945,86 @@ const MessageBubble = memo(function MessageBubble({ message, usageFooter, onCopy
 });
 
 // Input box - with shortcut hints
-function ChatInput({ onSend, disabled, placeholder, authMissing, providerName }: { onSend: (msg: string) => void; disabled: boolean; placeholder: string; authMissing?: boolean; providerName?: string }) {
+function ChatInput({ onSend, onStop, isStreaming, disabled, inputDisabled, placeholder, authMissing, authStatus, providerName, supportsThinking, sttAvailable }: { onSend: (msg: string) => void; onStop?: () => void; isStreaming?: boolean; disabled: boolean; inputDisabled?: boolean; placeholder: string; authMissing?: boolean; authStatus?: string; providerName?: string; supportsThinking?: boolean; sttAvailable?: boolean }) {
   const { t } = useTranslation();
   const [message, setMessage] = useState("");
+  const [activeIndex, setActiveIndex] = useState(-1);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const deepThinking = useUIStore((s) => s.deepThinking);
+  const showThinkingProcess = useUIStore((s) => s.showThinkingProcess);
+  const setDeepThinking = useUIStore((s) => s.setDeepThinking);
+  const setShowThinkingProcess = useUIStore((s) => s.setShowThinkingProcess);
+
+  const voiceInput = useVoiceInput(useCallback((text: string) => {
+    setMessage((prev) => (prev ? prev + " " + text : text));
+  }, []));
+
+  // ── Slash command completion ──────────────────────────────────────────────
+  const isSlashPrefix = message.startsWith("/") && !message.includes(" ");
+  const isModelArg = /^\/model\s/i.test(message);
+
+  const filteredCmds = useMemo(
+    () => isSlashPrefix ? SLASH_COMMANDS.filter(c => c.cmd.startsWith(message.toLowerCase())) : [],
+    [isSlashPrefix, message],
+  );
+
+  const modelQuery = useModels({}, { enabled: isModelArg });
+
+  const modelArg = isModelArg ? message.slice(message.indexOf(" ") + 1).toLowerCase() : "";
+  const filteredModels = useMemo(() => {
+    if (!isModelArg || !modelQuery.data?.models) return [];
+    const all = modelQuery.data.models;
+    const q = modelArg.trim();
+    const matched = q
+      ? all.filter(m =>
+          m.id.toLowerCase().includes(q) ||
+          m.provider.toLowerCase().includes(q) ||
+          (m.display_name || "").toLowerCase().includes(q),
+        )
+      : all;
+    return matched.slice(0, 12);
+  }, [isModelArg, modelQuery.data, modelArg]);
+
+  const hasDropdown = (isSlashPrefix && filteredCmds.length > 0) || (isModelArg && filteredModels.length > 0);
+  const dropdownLen = isSlashPrefix ? filteredCmds.length : filteredModels.length;
+
+  // Reset selection when list changes
+  useEffect(() => { setActiveIndex(-1); }, [message]);
+
+  const selectCmd = useCallback((c: typeof SLASH_COMMANDS[number]) => {
+    if (c.noArgs) {
+      onSend(c.cmd);
+      setMessage("");
+    } else {
+      setMessage(c.cmd + " ");
+      setTimeout(() => textareaRef.current?.focus(), 0);
+    }
+  }, [onSend]);
+
+  const selectModel = useCallback((m: ModelItem) => {
+    onSend(`/model ${m.provider}/${m.id}`);
+    setMessage("");
+  }, [onSend]);
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (!hasDropdown) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActiveIndex(i => Math.min(i + 1, dropdownLen - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActiveIndex(i => Math.max(i - 1, 0));
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      setMessage("");
+    } else if ((e.key === "Enter" || e.key === "Tab") && activeIndex >= 0) {
+      e.preventDefault();
+      if (isSlashPrefix) selectCmd(filteredCmds[activeIndex]);
+      else if (isModelArg) selectModel(filteredModels[activeIndex]);
+    }
+  }, [hasDropdown, dropdownLen, activeIndex, isSlashPrefix, isModelArg, filteredCmds, filteredModels, selectCmd, selectModel]);
+
+  // ─────────────────────────────────────────────────────────────────────────
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -688,32 +1041,84 @@ function ChatInput({ onSend, disabled, placeholder, authMissing, providerName }:
     }
   }, [message]);
 
-  const showingSlash = message.startsWith("/") && !message.includes(" ");
-  const filteredCmds = showingSlash ? SLASH_COMMANDS.filter(c => c.cmd.startsWith(message)) : [];
-
   const effectiveDisabled = disabled || !!authMissing;
+  // Textarea only locked while the agent is actively streaming text. Once the
+  // model emits `typing:stop` the user can start composing the next message
+  // even while background post-processing (memory save) is still running —
+  // the send button stays gated on `effectiveDisabled` until the `response`
+  // event arrives with final tokens/cost.
+  const textareaDisabled = (inputDisabled ?? disabled) || !!authMissing;
 
   return (
     <form onSubmit={handleSubmit} className="space-y-2">
       {/* Auth missing warning */}
       {authMissing && (
         <div className="flex items-center gap-2 rounded-xl border border-warning/30 bg-warning/5 px-4 py-2.5 text-sm text-warning">
-          <AlertCircle className="h-4 w-4 flex-shrink-0" />
-          <span>{t("chat.auth_missing", { provider: providerName || "unknown" })}</span>
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span>{authStatus === "local_offline"
+            ? t("chat.provider_offline", { provider: providerName || "unknown" })
+            : t("chat.auth_missing", { provider: providerName || "unknown" })}</span>
         </div>
       )}
       {/* Slash command autocomplete */}
-      {showingSlash && filteredCmds.length > 0 && (
+      {isSlashPrefix && filteredCmds.length > 0 && (
         <div className="rounded-xl border border-border-subtle bg-surface shadow-lg p-1 mb-1">
-          {filteredCmds.map(c => (
+          {filteredCmds.map((c, i) => (
             <button key={c.cmd} type="button"
-              onClick={() => { setMessage(c.cmd); onSend(c.cmd); setMessage(""); }}
-              className="w-full flex items-center gap-2 px-3 py-1.5 rounded-lg hover:bg-main text-left transition-colors">
+              onClick={() => selectCmd(c)}
+              className={`w-full flex items-center gap-2 px-3 py-1.5 rounded-lg text-left transition-colors ${i === activeIndex ? "bg-main" : "hover:bg-main"}`}>
               <span className="text-xs font-mono font-bold text-brand">{c.cmd}</span>
-              <span className="text-[10px] text-text-dim">{c.desc}</span>
+              {c.argsHint && <span className="text-[10px] font-mono text-text-dim/60">{c.argsHint}</span>}
+              <span className="text-[10px] text-text-dim ml-auto">{t(`chat.${c.descKey}`)}</span>
             </button>
           ))}
         </div>
+      )}
+      {/* /model second-level model completion */}
+      {isModelArg && filteredModels.length > 0 && (
+        <div className="rounded-xl border border-border-subtle bg-surface shadow-lg p-1 mb-1 max-h-48 overflow-y-auto">
+          {filteredModels.map((m, i) => (
+            <button key={`${m.provider}/${m.id}`} type="button"
+              onClick={() => selectModel(m)}
+              className={`w-full flex items-center gap-2 px-3 py-1.5 rounded-lg text-left transition-colors ${i === activeIndex ? "bg-main" : "hover:bg-main"}`}>
+              <span className="text-xs font-mono font-bold text-brand">{m.provider}</span>
+              <span className="text-xs font-mono text-text">/</span>
+              <span className="text-xs font-mono text-text">{m.id}</span>
+              {m.display_name && <span className="text-[10px] text-text-dim ml-auto truncate max-w-[120px]">{m.display_name}</span>}
+            </button>
+          ))}
+        </div>
+      )}
+      {/* Thinking mode toggles — only shown when the model supports thinking */}
+      {supportsThinking && (
+      <div className="flex items-center gap-2 flex-wrap">
+        <button
+          type="button"
+          onClick={() => setDeepThinking(!deepThinking)}
+          title={t("chat.deep_thinking_hint")}
+          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[11px] font-medium transition-colors ${
+            deepThinking
+              ? "border-brand/40 bg-brand/10 text-brand"
+              : "border-border-subtle bg-surface text-text-dim hover:text-text hover:border-border"
+          }`}
+        >
+          <Brain className="h-3 w-3" />
+          <span>{t("chat.deep_thinking")}</span>
+        </button>
+        <button
+          type="button"
+          onClick={() => setShowThinkingProcess(!showThinkingProcess)}
+          title={t("chat.show_thinking_hint")}
+          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[11px] font-medium transition-colors ${
+            showThinkingProcess
+              ? "border-brand/40 bg-brand/10 text-brand"
+              : "border-border-subtle bg-surface text-text-dim hover:text-text hover:border-border"
+          }`}
+        >
+          {showThinkingProcess ? <Eye className="h-3 w-3" /> : <EyeOff className="h-3 w-3" />}
+          <span>{t("chat.show_thinking")}</span>
+        </button>
+      </div>
       )}
       <div className="flex gap-2 sm:gap-3 items-end">
         <div className="flex-1">
@@ -722,38 +1127,77 @@ function ChatInput({ onSend, disabled, placeholder, authMissing, providerName }:
             value={message}
             onChange={(e) => setMessage(e.target.value)}
             onKeyDown={(e) => {
+              // Dropdown navigation takes priority
+              if (hasDropdown) {
+                handleKeyDown(e);
+                if (e.defaultPrevented) return;
+              }
               if (e.key === "Enter" && !e.shiftKey && !e.metaKey) {
                 e.preventDefault();
                 handleSubmit(e);
               }
             }}
-            placeholder={placeholder}
-            disabled={effectiveDisabled}
+            placeholder={voiceInput.isRecording ? t("chat.voice_recording") : voiceInput.isTranscribing ? t("chat.voice_transcribing") : placeholder}
+            disabled={textareaDisabled}
             rows={1}
             className="w-full min-h-[44px] sm:min-h-[52px] max-h-[150px] rounded-2xl border border-border-subtle bg-surface px-3 sm:px-5 py-2.5 sm:py-3.5 text-sm focus:border-brand focus:ring-2 focus:ring-brand/10 outline-none resize-none placeholder:text-text-dim/40 shadow-sm"
           />
         </div>
-        <button
-          type="submit"
-          disabled={!message.trim() || effectiveDisabled}
-          className="group relative px-3.5 sm:px-5 py-2.5 sm:py-3.5 rounded-2xl bg-gradient-to-r from-brand to-brand/90 text-white font-bold text-sm shadow-lg shadow-brand/20 hover:shadow-brand/40 hover:-translate-y-0.5 transition-all duration-300 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:translate-y-0"
-        >
-          <Send className="h-4 w-4" />
-          <span className="absolute -top-8 right-0 bg-surface border border-border-subtle rounded-lg px-2 py-1 text-[10px] text-text-dim opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap hidden sm:block">
-            {t("chat.send_hint")}
-          </span>
-        </button>
+        {voiceInput.isSupported && (
+          <button
+            type="button"
+            onClick={sttAvailable ? voiceInput.toggleRecording : undefined}
+            disabled={!sttAvailable || textareaDisabled || voiceInput.isTranscribing}
+            title={!sttAvailable ? t("chat.voice_not_configured") : voiceInput.isRecording ? t("chat.voice_stop") : t("chat.voice_input")}
+            className={`group relative px-3 sm:px-3.5 py-2.5 sm:py-3.5 rounded-2xl font-bold text-sm transition-all duration-300 disabled:opacity-40 disabled:cursor-not-allowed ${
+              voiceInput.isRecording
+                ? "bg-error/10 text-error border border-error/30 animate-pulse"
+                : voiceInput.isTranscribing
+                  ? "bg-warning/10 text-warning border border-warning/30"
+                  : "bg-surface text-text-dim border border-border-subtle hover:text-text hover:border-border hover:-translate-y-0.5"
+            }`}
+          >
+            {voiceInput.isRecording ? <MicOff className="h-4 w-4" /> : voiceInput.isTranscribing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Mic className="h-4 w-4" />}
+          </button>
+        )}
+        {isStreaming && onStop ? (
+          <button
+            type="button"
+            onClick={onStop}
+            title={t("chat.stop_hint")}
+            className="group relative px-3.5 sm:px-5 py-2.5 sm:py-3.5 rounded-2xl bg-linear-to-r from-error to-error/90 text-white font-bold text-sm shadow-lg shadow-error/20 hover:shadow-error/40 hover:-translate-y-0.5 transition-all duration-300"
+          >
+            <Square className="h-4 w-4 fill-current" />
+            <span className="absolute -top-8 right-0 bg-surface border border-border-subtle rounded-lg px-2 py-1 text-[10px] text-text-dim opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap hidden sm:block">
+              {t("chat.stop_hint")}
+            </span>
+          </button>
+        ) : (
+          <button
+            type="submit"
+            disabled={!message.trim() || effectiveDisabled}
+            className="group relative px-3.5 sm:px-5 py-2.5 sm:py-3.5 rounded-2xl bg-linear-to-r from-brand to-brand/90 text-white font-bold text-sm shadow-lg shadow-brand/20 hover:shadow-brand/40 hover:-translate-y-0.5 transition-all duration-300 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:translate-y-0"
+          >
+            <Send className="h-4 w-4" />
+            <span className="absolute -top-8 right-0 bg-surface border border-border-subtle rounded-lg px-2 py-1 text-[10px] text-text-dim opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap hidden sm:block">
+              {t("chat.send_hint")}
+            </span>
+          </button>
+        )}
       </div>
     </form>
   );
 }
 
 // Connection status bar with session dropdown
-function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, wsConnected, modelName, sessions, activeSessionId, onSwitchSession, onNewSession, onDeleteSession, agentId, onModelChange }: {
-  agentName: string; isLoading: boolean; messageCount: number; onClear: () => void; onExport: () => void; wsConnected?: boolean; modelName?: string;
+function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, wsConnected, modelName, modelProvider, sessions, activeSessionId, onSwitchSession, onNewSession, onDeleteSession, agentId, onModelChange, webSearchAugmentation, onWebSearchChange, webSearchAvailable, onOpenConfig }: {
+  agentName: string; isLoading: boolean; messageCount: number; onClear: () => void; onExport: () => void; wsConnected?: boolean; modelName?: string; modelProvider?: string;
   sessions?: SessionListItem[]; activeSessionId?: string;
   onSwitchSession?: (sessionId: string) => void; onNewSession?: () => void; onDeleteSession?: (sessionId: string) => void;
   agentId: string; onModelChange: () => void;
+  webSearchAugmentation?: "off" | "auto" | "always"; onWebSearchChange?: (mode: "off" | "auto" | "always") => void;
+  webSearchAvailable?: boolean;
+  onOpenConfig: () => void;
 }) {
   const { t } = useTranslation();
   const [sessionOpen, setSessionOpen] = useState(false);
@@ -762,16 +1206,23 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, 
   // Model popover state
   const [modelOpen, setModelOpen] = useState(false);
   const modelRef = useRef<HTMLDivElement>(null);
-  const [models, setModels] = useState<ModelItem[]>([]);
   const [modelSearch, setModelSearch] = useState("");
-  const [modelLoading, setModelLoading] = useState(false);
-  const [modelFetchError, setModelFetchError] = useState<string | null>(null);
   const [patchError, setPatchError] = useState<string | null>(null);
   const [patchPending, setPatchPending] = useState(false);
   const [optimisticModel, setOptimisticModel] = useState<string | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<string>("");
 
   const hiddenModelKeys = useUIStore((s) => s.hiddenModelKeys);
   const hiddenSet = useMemo(() => new Set(hiddenModelKeys), [hiddenModelKeys]);
+  const patchAgentConfigMutation = usePatchAgentConfig();
+  const modelsQuery = useModels(
+    { available: true },
+    {
+      enabled: modelOpen,
+      // Model picker opens on demand. Keep query idle until popover visible.
+      staleTime: 0,
+    },
+  );
 
   // Clear optimistic model once the real modelName catches up
   useEffect(() => {
@@ -798,27 +1249,49 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, 
     const handler = (e: MouseEvent) => {
       if (modelRef.current && !modelRef.current.contains(e.target as Node)) {
         setModelOpen(false);
+        setSelectedProvider("");
+        setModelSearch("");
       }
     };
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
   }, [modelOpen]);
 
-  // Fetch available models lazily when popover first opens
-  useEffect(() => {
-    if (!modelOpen || models.length > 0 || modelLoading) return;
-    setModelLoading(true);
-    setModelFetchError(null);
-    listModels({ available: true })
-      .then(res => setModels(res.models))
-      .catch(() => setModelFetchError(t("chat.unable_to_load_models")))
-      .finally(() => setModelLoading(false));
-  }, [modelOpen, models.length, modelLoading]);
-
+  const models = modelsQuery.data?.models ?? [];
+  const modelLoading = modelsQuery.isLoading || modelsQuery.isFetching;
+  const modelFetchError = modelsQuery.error ? t("chat.unable_to_load_models") : null;
   const visibleModels = useMemo(() => filterVisible(models, hiddenSet), [models, hiddenSet]);
-  const filteredModels = visibleModels.filter(m =>
-    (m.provider + " " + (m.id || "")).toLowerCase().includes(modelSearch.toLowerCase())
-  );
+
+  // Unique providers derived from loaded models, sorted alphabetically
+  const providers = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const m of visibleModels) {
+      map.set(m.provider, (map.get(m.provider) ?? 0) + 1);
+    }
+    return Array.from(map.entries())
+      .map(([id, count]) => ({ id, count }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+  }, [visibleModels]);
+
+  // Models filtered by selected provider, then by search
+  const filteredModels = useMemo(() => {
+    let list = visibleModels;
+    if (selectedProvider) {
+      list = list.filter(m => m.provider === selectedProvider);
+    }
+    if (modelSearch) {
+      const q = modelSearch.toLowerCase();
+      list = list.filter(m => (m.id || "").toLowerCase().includes(q) || (m.display_name || "").toLowerCase().includes(q));
+    }
+    return list;
+  }, [visibleModels, selectedProvider, modelSearch]);
+
+  // Filter providers by search when in provider view
+  const filteredProviders = useMemo(() => {
+    if (!modelSearch) return providers;
+    const q = modelSearch.toLowerCase();
+    return providers.filter(p => p.id.toLowerCase().includes(q));
+  }, [providers, modelSearch]);
 
   async function handleSelectModel(model: ModelItem) {
     const prev = optimisticModel ?? modelName ?? null;
@@ -826,8 +1299,13 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, 
     setPatchPending(true);
     setPatchError(null);
     try {
-      await patchAgentConfig(agentId, { model: model.id, provider: model.provider });
+      await patchAgentConfigMutation.mutateAsync({
+        agentId,
+        config: { model: model.id, provider: model.provider },
+      });
       setModelOpen(false);
+      setSelectedProvider("");
+      setModelSearch("");
       onModelChange(); // invalidates queries; useEffect clears optimisticModel when modelName catches up
     } catch {
       setOptimisticModel(prev);
@@ -838,7 +1316,7 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, 
   }
 
   return (
-    <div className="px-2 sm:px-4 py-2 sm:py-2.5 border-b border-border-subtle/50 bg-gradient-to-r from-surface to-transparent flex items-center justify-between">
+    <div className="px-2 sm:px-4 py-2 sm:py-2.5 border-b border-border-subtle/50 bg-linear-to-r from-surface to-transparent flex items-center justify-between">
       <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
         <div className="relative">
           <Wifi className="h-3.5 w-3.5 text-success" />
@@ -863,25 +1341,37 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, 
         {/* Model switcher */}
         <div className="relative hidden sm:block" ref={modelRef}>
           <button
-            onClick={() => setModelOpen(v => !v)}
+            onClick={() => { setModelOpen(v => { if (v) { setSelectedProvider(""); setModelSearch(""); } return !v; }); }}
             className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-mono text-text-dim/50 hover:text-text hover:bg-surface-hover transition-colors truncate max-w-[200px]"
-            title="Switch model"
+            title={t("chat.switch_model")}
           >
             <span className="truncate">{optimisticModel ?? modelName ?? t("chat.no_model")}</span>
             <ChevronDown className={`h-2.5 w-2.5 shrink-0 transition-transform ${modelOpen ? "rotate-180" : ""}`} />
           </button>
           {modelOpen && (
             <div className="absolute right-0 top-full mt-1 w-80 bg-surface border border-border-subtle rounded-xl shadow-xl z-50 overflow-hidden">
-              <div className="p-2 border-b border-border-subtle/50">
-                <span className="text-[10px] font-semibold text-text-dim/50 uppercase tracking-wider px-2">{t("chat.switch_model")}</span>
+              {/* Header */}
+              <div className="p-2 border-b border-border-subtle/50 flex items-center gap-2">
+                {selectedProvider && (
+                  <button
+                    onClick={() => { setSelectedProvider(""); setModelSearch(""); }}
+                    className="p-0.5 rounded hover:bg-surface-hover transition-colors"
+                  >
+                    <ArrowLeft className="h-3.5 w-3.5 text-text-dim" />
+                  </button>
+                )}
+                <span className="text-[10px] font-semibold text-text-dim/50 uppercase tracking-wider px-1">
+                  {selectedProvider || t("chat.select_provider", { defaultValue: "Select Provider" })}
+                </span>
               </div>
+              {/* Search */}
               <div className="p-2 border-b border-border-subtle/50">
                 <input
                   autoFocus
                   type="text"
                   value={modelSearch}
                   onChange={e => setModelSearch(e.target.value)}
-                  placeholder={t("chat.search_models")}
+                  placeholder={selectedProvider ? t("chat.search_models") : t("chat.search_providers", { defaultValue: "Search providers..." })}
                   className="w-full px-2.5 py-1.5 text-xs rounded-lg bg-main border border-border-subtle focus:outline-none focus:border-brand"
                 />
                 {patchError && (
@@ -899,51 +1389,121 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, 
                   <div className="px-2.5 py-2 space-y-1.5">
                     <p className="text-xs text-error">{modelFetchError}</p>
                     <button
-                      onClick={() => { setModels([]); setModelFetchError(null); }}
+                      onClick={() => { void modelsQuery.refetch(); }}
                       className="text-[10px] text-brand hover:underline"
                     >
                       {t("chat.retry")}
                     </button>
                   </div>
                 )}
-                {!modelLoading && !modelFetchError && filteredModels.length === 0 && (
-                  <p className="px-2.5 py-2 text-xs text-text-dim">{t("chat.no_models_found")}</p>
-                )}
-                {!modelLoading && !modelFetchError && modelName && !filteredModels.some(m => m.id === modelName) && (
-                  <div
-                    key={`fallback/${modelName}`}
-                    onClick={() => {}}
-                    className="flex items-center gap-2 px-2.5 py-2 rounded-lg cursor-pointer transition-colors bg-brand/10 text-brand"
-                  >
-                    {patchPending
-                      ? <Loader2 className="h-3 w-3 animate-spin shrink-0" />
-                      : <span className="w-1.5 h-1.5 rounded-full bg-success shrink-0" />
-                    }
-                    <span className="text-xs font-medium truncate">{modelName}</span>
-                  </div>
-                )}
-                {!modelLoading && !modelFetchError && filteredModels.map(model => {
-                  const isActive = model.id === (optimisticModel ?? modelName);
+
+                {/* Provider list view */}
+                {!modelLoading && !modelFetchError && !selectedProvider && (() => {
+                  // Use the agent's known provider (from props) to highlight the current provider.
+                  // Falls back to scanning the model list only if the prop is unavailable.
+                  const agentProvider = modelProvider || models.find(m => m.id === (optimisticModel ?? modelName))?.provider;
                   return (
-                    <div
-                      key={`${model.provider}/${model.id}`}
-                      onClick={() => { if (!isActive) handleSelectModel(model); }}
-                      className={`flex items-center gap-2 px-2.5 py-2 rounded-lg cursor-pointer transition-colors ${isActive ? "bg-brand/10 text-brand" : "hover:bg-surface-hover text-text-dim"}`}
-                    >
-                      {isActive && patchPending
-                        ? <Loader2 className="h-3 w-3 animate-spin shrink-0" />
-                        : isActive && <span className="w-1.5 h-1.5 rounded-full bg-success shrink-0" />
-                      }
-                      <span className="text-[10px] text-text-dim/60 shrink-0">{model.provider}</span>
-                      <span className="text-[10px]">·</span>
-                      <span className="text-xs font-medium truncate">{model.id}</span>
-                    </div>
+                  <>
+                    {filteredProviders.length === 0 && (
+                      <p className="px-2.5 py-2 text-xs text-text-dim">{t("chat.no_models_found")}</p>
+                    )}
+                    {filteredProviders.map(p => {
+                      const isCurrent = p.id === agentProvider;
+                      return (
+                        <div
+                          key={p.id}
+                          onClick={() => { setSelectedProvider(p.id); setModelSearch(""); }}
+                          className={`flex items-center justify-between px-2.5 py-2 rounded-lg cursor-pointer transition-colors ${isCurrent ? "bg-brand/10 text-brand" : "hover:bg-surface-hover text-text-dim"}`}
+                        >
+                          <div className="flex items-center gap-2">
+                            {isCurrent && <span className="w-1.5 h-1.5 rounded-full bg-success shrink-0" />}
+                            <span className="text-xs font-medium">{p.id}</span>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] text-text-dim/40">{p.count} {p.count === 1 ? "model" : "models"}</span>
+                            <ArrowRight className="h-3 w-3 text-text-dim/30" />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </>
                   );
-                })}
+                })()}
+
+                {/* Model list view (filtered by selected provider) */}
+                {!modelLoading && !modelFetchError && selectedProvider && (
+                  <>
+                    {filteredModels.length === 0 && (
+                      <p className="px-2.5 py-2 text-xs text-text-dim">{t("chat.no_models_found")}</p>
+                    )}
+                    {filteredModels.map(model => {
+                      const isActive = model.id === (optimisticModel ?? modelName) && model.provider === selectedProvider;
+                      return (
+                        <div
+                          key={`${model.provider}/${model.id}`}
+                          onClick={() => { if (!isActive) handleSelectModel(model); }}
+                          className={`flex items-center gap-2 px-2.5 py-2 rounded-lg cursor-pointer transition-colors ${isActive ? "bg-brand/10 text-brand" : "hover:bg-surface-hover text-text-dim"}`}
+                        >
+                          {isActive && patchPending
+                            ? <Loader2 className="h-3 w-3 animate-spin shrink-0" />
+                            : isActive && <span className="w-1.5 h-1.5 rounded-full bg-success shrink-0" />
+                          }
+                          <span className="text-xs font-medium truncate">{model.display_name || model.id}</span>
+                        </div>
+                      );
+                    })}
+                  </>
+                )}
               </div>
             </div>
           )}
         </div>
+        {/* Web Search toggle (off → auto → always → off) with config check */}
+        {onWebSearchChange && (() => {
+          const mode = webSearchAugmentation || "auto";
+          const isActive = mode !== "off";
+          const noKey = !webSearchAvailable;
+          return (
+            <div className="hidden sm:flex items-center gap-1.5">
+              <button
+                onClick={() => {
+                    if (noKey && mode === "off") {
+                      // No search key configured — navigate to Config page Web section
+                      onOpenConfig();
+                      return;
+                    }
+                  const cycle: Record<string, "off" | "auto" | "always"> = { off: "auto", auto: "always", always: "off" };
+                  onWebSearchChange(cycle[mode] || "auto");
+                }}
+                title={noKey ? t("chat.web_search_no_key", { defaultValue: "No search API key configured. Click to open settings." }) : undefined}
+                className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-mono transition-colors ${
+                  noKey && !isActive
+                    ? "text-warning/50 hover:text-warning hover:bg-warning/10"
+                    : mode === "always"
+                      ? "text-brand bg-brand/10 hover:bg-brand/20"
+                      : mode === "auto"
+                        ? "text-text-dim/50 hover:text-text hover:bg-surface-hover"
+                        : "text-text-dim/30 hover:text-text-dim/60 hover:bg-surface-hover"
+                }`}
+              >
+                <Globe className="h-3 w-3" />
+                <span>{noKey && !isActive
+                  ? t("chat.web_search_setup", { defaultValue: "Search" })
+                  : mode === "always" ? t("common.always", { defaultValue: "Always" }) : mode === "auto" ? t("common.auto", { defaultValue: "Auto" }) : t("common.off", { defaultValue: "Off" })
+                }</span>
+                {noKey && !isActive && <AlertCircle className="h-2.5 w-2.5 text-warning" />}
+              </button>
+              {isActive && noKey && (
+                <button
+                  onClick={onOpenConfig}
+                  className="text-[9px] text-warning hover:text-warning/80 underline hidden xl:inline"
+                >
+                  {t("chat.web_search_configure", { defaultValue: "Configure API key" })}
+                </button>
+              )}
+            </div>
+          );
+        })()}
         {/* Session dropdown */}
         {sessions && sessions.length > 0 && (
           <div className="relative" ref={dropdownRef}>
@@ -1047,17 +1607,14 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, 
 // ---------------------------------------------------------------------------
 function useApprovalPoller(agentId: string | null) {
   const queryClient = useQueryClient();
-  const approvalsQuery = useQuery({
-    queryKey: ["approvals", "pending", agentId],
-    queryFn: () => listPendingApprovals(agentId!),
-    enabled: !!agentId,
-    refetchInterval: 5000,
+  const approvalsQuery = usePendingApprovals(agentId ?? undefined, {
+    enabled: Boolean(agentId), // Poll approvals only when chat has concrete agent selected.
   });
 
   const remove = useCallback((id: string) => {
     queryClient.setQueryData<ApprovalItem[]>(
-      ["approvals", "pending", agentId],
-      (prev) => prev?.filter((a) => a.id !== id) ?? [],
+      approvalKeys.pending(agentId),
+      (prev) => prev?.filter((a: ApprovalItem) => a.id !== id) ?? [],
     );
   }, [agentId, queryClient]);
 
@@ -1084,11 +1641,12 @@ function riskStyle(level?: string) {
 function ApprovalCard({ approval, onResolved }: { approval: ApprovalItem; onResolved: (id: string) => void }) {
   const { t } = useTranslation();
   const [resolving, setResolving] = useState<"approve" | "deny" | null>(null);
+  const resolveApprovalMutation = useResolveApproval();
 
   const handleResolve = async (approved: boolean) => {
     setResolving(approved ? "approve" : "deny");
     try {
-      await resolveApproval(approval.id, approved);
+      await resolveApprovalMutation.mutateAsync({ id: approval.id, approved });
       onResolved(approval.id);
     } catch {
       // Approval may have already been resolved or timed out
@@ -1100,6 +1658,10 @@ function ApprovalCard({ approval, onResolved }: { approval: ApprovalItem; onReso
 
   const rs = riskStyle(approval.risk_level);
 
+  const riskLabel = approval.risk_level
+    ? t(`chat.approval_risk_${approval.risk_level}`, { defaultValue: approval.risk_level })
+    : null;
+
   return (
     <div className={`mx-auto w-full max-w-lg rounded-2xl border ${rs.border} ${rs.bg} p-4 shadow-lg animate-fade-in-up`}>
       {/* Header */}
@@ -1108,21 +1670,21 @@ function ApprovalCard({ approval, onResolved }: { approval: ApprovalItem; onReso
         <span className={`text-xs font-black uppercase tracking-widest ${rs.text}`}>
           {t("chat.approval_required")}
         </span>
-        {approval.risk_level && (
+        {riskLabel && (
           <span className={`ml-auto text-[10px] font-bold uppercase px-2 py-0.5 rounded-full ${rs.bg} ${rs.text} border ${rs.border}`}>
-            {approval.risk_level}
+            {riskLabel}
           </span>
         )}
       </div>
 
       {/* Tool info */}
-      <div className="space-y-1 mb-4">
+      <div className="space-y-2 mb-4">
         <div className="flex items-center gap-2">
           <span className="text-[10px] font-bold uppercase text-text-dim tracking-wider">{t("chat.approval_tool")}</span>
           <code className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-main">{approval.tool_name || "unknown"}</code>
         </div>
         {(approval.description || approval.action_summary || approval.action) && (
-          <p className="text-sm text-text-dim leading-relaxed">
+          <p className="text-xs text-text-dim leading-relaxed bg-main/50 rounded-lg px-3 py-2 font-mono whitespace-pre-wrap break-all">
             {approval.description || approval.action_summary || approval.action}
           </p>
         )}
@@ -1161,13 +1723,17 @@ function ApprovalCard({ approval, onResolved }: { approval: ApprovalItem; onReso
 
 export function ChatPage() {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
   const navigate = useNavigate();
   const search = useSearch({ from: "/chat" });
   const initialAgentId = search?.agentId || "";
   const [selectedAgentId, setSelectedAgentId] = useState(initialAgentId);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const addToast = useUIStore((s) => s.addToast);
+  const createSessionMutation = useCreateAgentSession();
+  const switchSessionMutation = useSwitchAgentSession();
+  const deleteSessionMutation = useDeleteAgentSession();
+  const patchAgentConfigMutation = usePatchAgentConfig();
 
   // Sync agent selection to URL search params
   const selectAgent = useCallback((id: string) => {
@@ -1176,28 +1742,25 @@ export function ChatPage() {
   }, [navigate]);
 
   // Check TTS provider availability
-  const mediaProvidersQuery = useQuery({
-    queryKey: ["media-providers"],
-    queryFn: listMediaProviders,
-    staleTime: 60000,
-  });
+  const mediaProvidersQuery = useMediaProviders();
   const ttsAvailable = useMemo(
     () => (mediaProvidersQuery.data ?? []).some(p => p.configured && p.capabilities.includes("text_to_speech")),
     [mediaProvidersQuery.data],
   );
 
   const handleCopy = useCallback(async (messageId: string, content: string) => {
-    try {
-      await navigator.clipboard.writeText(content);
+    if (await copyToClipboard(content)) {
       setCopiedMessageId(messageId);
       setTimeout(() => setCopiedMessageId(null), 1500);
-    } catch {
-      // Clipboard API not available
+    } else {
+      addToast(t("common.copy_failed"), "error");
     }
-  }, []);
+  }, [addToast, t]);
 
-  const configQuery = useQuery({ queryKey: ["config"], queryFn: getFullConfig, staleTime: 60000 });
+  const configQuery = useFullConfig();
   const usageFooter = (configQuery.data as Record<string, unknown>)?.usage_footer as string | undefined ?? "full";
+  const mediaConfigRaw = (configQuery.data as Record<string, unknown>)?.media as Record<string, unknown> | undefined;
+  const sttAvailable = mediaConfigRaw?.stt_available === true;
   const ttsConfigRaw = (configQuery.data as Record<string, unknown>)?.tts as Record<string, unknown> | undefined;
   const ttsProvider = ttsConfigRaw?.provider as string | undefined;
   const ttsSpeechConfig = useMemo(() => {
@@ -1235,20 +1798,67 @@ export function ChatPage() {
     tts.stop();
   }, [selectedAgentId, tts.stop]);
 
-  const agentsQuery = useQuery({ queryKey: ["agents", "list", "chat"], queryFn: listAgents, staleTime: 30000 });
-  const agents = useMemo(() => [...(agentsQuery.data ?? [])].sort((a, b) => {
-    // Auth missing → sort to bottom
-    const aNoAuth = isAuthUnavailable(a.auth_status) ? 1 : 0;
-    const bNoAuth = isAuthUnavailable(b.auth_status) ? 1 : 0;
-    if (aNoAuth !== bNoAuth) return aNoAuth - bNoAuth;
-    const aSusp = (a.state || "").toLowerCase() === "suspended" ? 1 : 0;
-    const bSusp = (b.state || "").toLowerCase() === "suspended" ? 1 : 0;
-    if (aSusp !== bSusp) return aSusp - bSusp;
-    return a.name.localeCompare(b.name);
-  }), [agentsQuery.data]);
+  const [showHandAgents, setShowHandAgents] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return localStorage.getItem("librefang.chat.show_hand_agents") === "1";
+  });
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    localStorage.setItem(
+      "librefang.chat.show_hand_agents",
+      showHandAgents ? "1" : "0",
+    );
+  }, [showHandAgents]);
+
+  const agentsQuery = useAgents({ includeHands: showHandAgents });
+  // Check if web search is available (any search API key configured)
+  const webSearchAvailable = ((configQuery.data as Record<string, unknown>)?.web as Record<string, unknown> | undefined)?.search_available === true;
+  const handsQuery = useActiveHandsWhen(showHandAgents);
+
+  const sortedAgents = useMemo(
+    () =>
+      [...(agentsQuery.data ?? [])].sort((a, b) => {
+        // Auth missing → sort to bottom
+        const aNoAuth = isAuthUnavailable(a.auth_status) ? 1 : 0;
+        const bNoAuth = isAuthUnavailable(b.auth_status) ? 1 : 0;
+        if (aNoAuth !== bNoAuth) return aNoAuth - bNoAuth;
+        const aSusp = (a.state || "").toLowerCase() === "suspended" ? 1 : 0;
+        const bSusp = (b.state || "").toLowerCase() === "suspended" ? 1 : 0;
+        if (aSusp !== bSusp) return aSusp - bSusp;
+        return a.name.localeCompare(b.name);
+      }),
+    [agentsQuery.data],
+  );
+
+  const picker = useMemo(
+    () =>
+      groupedPicker(sortedAgents, handsQuery.data, showHandAgents),
+    [sortedAgents, handsQuery.data, showHandAgents],
+  );
+
+  // Flat view used by downstream consumers (default-selection logic,
+  // selectedAgent lookup, export). Standalone first, then groups in order.
+  const agents = useMemo(
+    () => [
+      ...picker.standalone,
+      ...picker.handGroups.flatMap((g) => g.agents),
+    ],
+    [picker],
+  );
   // Session state — bump version to force message reload after switch
   const [sessionVersion, setSessionVersion] = useState(0);
-  const { messages, isLoading, sendMessage, clearHistory, wsConnected } = useChatMessages(selectedAgentId || null, agents, sessionVersion);
+  const { messages, isLoading, sendMessage, stopMessage, clearHistory, wsConnected } = useChatMessages(
+    selectedAgentId || null,
+    agents,
+    sessionVersion,
+    () => void agentsQuery.refetch(),
+    (message) => addToast(message, "error"),
+  );
+  // Track LLM text streaming (cleared on `typing:stop`) independently of
+  // `isLoading`, which stays true through post-processing until the final
+  // `response` event. Textarea unblocks as soon as streaming ends so the user
+  // can compose the next message immediately.
+  const isStreaming = messages.some(m => m.role === "assistant" && m.isStreaming);
 
   // Export current conversation as a markdown file. Keeps the local
   // timestamp, role, content, and (when present) tool call summaries
@@ -1266,7 +1876,7 @@ export function ChatPage() {
       "",
     ];
     for (const m of messages) {
-      const ts = m.timestamp instanceof Date ? m.timestamp.toISOString() : new Date(m.timestamp as any).toISOString();
+      const ts = m.timestamp instanceof Date ? m.timestamp.toISOString() : new Date(m.timestamp as string).toISOString();
       const role = m.role === "assistant" ? agentName : m.role;
       lines.push(`### ${role} · ${ts}`);
       lines.push("");
@@ -1288,44 +1898,46 @@ export function ChatPage() {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }, [messages, agents, selectedAgentId]);
   const { pendingApprovals, removeApproval } = useApprovalPoller(selectedAgentId || null);
   const selectedAgent = agents.find(a => a.id === selectedAgentId);
 
   // Per-agent session list
-  const sessionsQuery = useQuery({
-    queryKey: ["agent-sessions", selectedAgentId],
-    queryFn: () => listAgentSessions(selectedAgentId!),
-    enabled: !!selectedAgentId,
-    staleTime: 10_000,
-  });
+  const sessionsQuery = useAgentSessions(selectedAgentId);
   const activeSessionId = useMemo(() => {
-    const active = sessionsQuery.data?.find((s: any) => s.active);
+    const active = sessionsQuery.data?.find((s: SessionListItem) => s.active);
     return active?.session_id;
   }, [sessionsQuery.data]);
 
   const handleSwitchSession = useCallback(async (sessionId: string) => {
     if (!selectedAgentId) return;
-    await switchAgentSession(selectedAgentId, sessionId);
-    queryClient.invalidateQueries({ queryKey: ["agents"] });
-    queryClient.invalidateQueries({ queryKey: ["agent-sessions", selectedAgentId] });
+    await switchSessionMutation.mutateAsync({ agentId: selectedAgentId, sessionId });
     setSessionVersion(v => v + 1);
-  }, [selectedAgentId, queryClient]);
+  }, [selectedAgentId, switchSessionMutation]);
 
   const handleNewSession = useCallback(async () => {
     if (!selectedAgentId) return;
-    const result = await createAgentSession(selectedAgentId);
-    await switchAgentSession(selectedAgentId, result.session_id);
-    queryClient.invalidateQueries({ queryKey: ["agents"] });
-    queryClient.invalidateQueries({ queryKey: ["agent-sessions", selectedAgentId] });
+    const result = await createSessionMutation.mutateAsync({ agentId: selectedAgentId });
+    await switchSessionMutation.mutateAsync({ agentId: selectedAgentId, sessionId: result.session_id });
     setSessionVersion(v => v + 1);
-  }, [selectedAgentId, queryClient]);
+  }, [selectedAgentId, createSessionMutation, switchSessionMutation]);
 
   const handleDeleteSession = useCallback(async (sessionId: string) => {
-    await deleteSession(sessionId);
-    queryClient.invalidateQueries({ queryKey: ["agent-sessions", selectedAgentId] });
-  }, [selectedAgentId, queryClient]);
+    await deleteSessionMutation.mutateAsync({ sessionId, agentId: selectedAgentId });
+  }, [deleteSessionMutation, selectedAgentId]);
+
+  // If the current selection is no longer visible (e.g. hand agents toggled
+  // off while a hand-spawned agent was selected), clear it so the auto-select
+  // effect below picks a new one instead of leaving the chat pane in a broken
+  // state with selectedAgent === undefined.
+  useEffect(() => {
+    if (!selectedAgentId) return;
+    if (agentsQuery.data === undefined) return;
+    if (!agents.some(a => a.id === selectedAgentId)) {
+      setSelectedAgentId("");
+    }
+  }, [agents, selectedAgentId, agentsQuery.data]);
 
   useEffect(() => {
     // Auto-select first running agent
@@ -1347,6 +1959,56 @@ export function ChatPage() {
     prevMsgCountRef.current = messages.length;
   }, [messages]);
 
+  const renderAgentButton = (
+    agent: AgentItem,
+    role?: string,
+    isCoordinator?: boolean,
+  ) => (
+    <button
+      key={agent.id}
+      onClick={() => selectAgent(agent.id)}
+      className={`w-full flex items-center gap-3 p-3 rounded-xl transition-colors text-left group ${
+        selectedAgentId === agent.id
+          ? "bg-brand text-white shadow-lg shadow-brand/20"
+          : "hover:bg-surface-hover"
+      }`}
+    >
+      <div className={`relative h-10 w-10 rounded-xl flex items-center justify-center font-black text-lg ${
+        selectedAgentId === agent.id ? "bg-white/20"
+        : (agent.state || "").toLowerCase() === "running" ? "bg-linear-to-br from-brand/20 to-accent/20 text-brand"
+        : "bg-main text-text-dim/40"
+      }`}>
+        {t(`agents.builtin.${agent.name}.name`, { defaultValue: agent.name }).charAt(0).toUpperCase()}
+        {(agent.state || "").toLowerCase() === "running" ? (
+          <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-success border-2 border-white dark:border-surface animate-pulse" />
+        ) : (
+          <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-text-dim/30 border-2 border-white dark:border-surface" />
+        )}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1.5">
+          <p className={`text-sm font-bold truncate ${(agent.state || "").toLowerCase() !== "running" ? "opacity-50" : ""}`}>
+            {role ?? t(`agents.builtin.${agent.name}.name`, { defaultValue: agent.name })}
+          </p>
+          {(agent.auth_status === "configured" || agent.auth_status === "validated_key") && <span className={`shrink-0 px-1 py-0.5 rounded text-[8px] font-bold uppercase leading-none ${selectedAgentId === agent.id ? "bg-white/20" : "bg-brand/10 text-brand"}`}>KEY</span>}
+          {agent.auth_status === "configured_cli" && <span className={`shrink-0 px-1 py-0.5 rounded text-[8px] font-bold uppercase leading-none ${selectedAgentId === agent.id ? "bg-white/20" : "bg-accent/10 text-accent"}`}>CLI</span>}
+          {agent.auth_status === "auto_detected" && <span className={`shrink-0 px-1 py-0.5 rounded text-[8px] font-bold uppercase leading-none ${selectedAgentId === agent.id ? "bg-white/20" : "bg-warning/10 text-warning"}`}>AUTO</span>}
+          {isAuthUnavailable(agent.auth_status) && <AlertCircle className="h-3 w-3 text-warning shrink-0" />}
+        </div>
+        {isCoordinator ? (
+          <p className={`text-[10px] truncate ${selectedAgentId === agent.id ? "text-white/70" : "text-text-dim"}`}>
+            {t("chat.hand_coordinator", { defaultValue: "coordinator" })}
+          </p>
+        ) : (
+          <p className={`text-[10px] truncate ${selectedAgentId === agent.id ? "text-white/70" : "text-text-dim"}`}>
+            {agent.model_provider || t("common.unknown")}
+          </p>
+        )}
+      </div>
+      <ArrowRight className={`h-4 w-4 shrink-0 transition-transform ${selectedAgentId === agent.id ? "rotate-90" : "opacity-0 group-hover:opacity-100"}`} />
+    </button>
+  );
+
   return (
     <div className="flex h-[calc(100vh-100px)] sm:h-[calc(100vh-140px)] flex-col">
       {/* Header */}
@@ -1361,7 +2023,7 @@ export function ChatPage() {
             <h1 className="text-xl sm:text-3xl font-extrabold tracking-tight">{t("chat.title")}</h1>
           </div>
           <button
-            onClick={() => queryClient.invalidateQueries({ queryKey: ["agents", "list"] })}
+            onClick={() => void agentsQuery.refetch()}
             className="p-2 sm:p-2.5 rounded-xl hover:bg-surface-hover text-text-dim hover:text-brand transition-colors"
           >
             <RefreshCw className={`h-4 w-4 ${agentsQuery.isFetching ? "animate-spin" : ""}`} />
@@ -1372,50 +2034,48 @@ export function ChatPage() {
       {/* Main content area */}
       <div className="flex flex-1 overflow-hidden rounded-2xl border border-border-subtle bg-surface shadow-xl ring-1 ring-black/5 dark:ring-white/5">
         {/* Left sidebar - Agent list */}
-        <aside className="hidden md:flex w-64 flex-shrink-0 border-r border-border-subtle bg-main flex-col">
-          <div className="p-4 border-b border-border-subtle">
+        <aside className="hidden md:flex w-64 shrink-0 border-r border-border-subtle bg-main flex-col">
+          <div className="p-4 border-b border-border-subtle space-y-2">
             <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-text-dim/60">{t("nav.agents")}</h3>
+            <button
+              onClick={() => setShowHandAgents((value) => !value)}
+              aria-pressed={showHandAgents}
+              className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-bold transition-colors ${
+                showHandAgents
+                  ? "border-brand/30 bg-brand/10 text-brand"
+                  : "border-border-subtle bg-surface text-text-dim hover:border-brand/20 hover:text-brand"
+              }`}
+            >
+              <span>{t("agents.show_hand_agents", { defaultValue: "Show hand agents" })}</span>
+            </button>
           </div>
           <div className="flex-1 overflow-y-auto p-3 space-y-2 scrollbar-thin">
-            {agents.length === 0 ? (
+            {picker.standalone.length === 0 && picker.handGroups.length === 0 ? (
               <div className="p-4 text-center text-text-dim text-sm">{t("common.no_data")}</div>
             ) : (
-              agents.map(agent => (
-                <button
-                  key={agent.id}
-                  onClick={() => selectAgent(agent.id)}
-                  className={`w-full flex items-center gap-3 p-3 rounded-xl transition-colors text-left group ${
-                    selectedAgentId === agent.id
-                      ? "bg-brand text-white shadow-lg shadow-brand/20"
-                      : "hover:bg-surface-hover"
-                  }`}
-                >
-                  <div className={`relative h-10 w-10 rounded-xl flex items-center justify-center font-black text-lg ${
-                    selectedAgentId === agent.id ? "bg-white/20"
-                    : (agent.state || "").toLowerCase() === "running" ? "bg-gradient-to-br from-brand/20 to-accent/20 text-brand"
-                    : "bg-main text-text-dim/40"
-                  }`}>
-                    {t(`agents.builtin.${agent.name}.name`, { defaultValue: agent.name }).charAt(0).toUpperCase()}
-                    {(agent.state || "").toLowerCase() === "running" ? (
-                      <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-success border-2 border-white dark:border-surface animate-pulse" />
-                    ) : (
-                      <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-text-dim/30 border-2 border-white dark:border-surface" />
+              <>
+                {picker.standalone.length > 0 && (
+                  <div className="space-y-2">
+                    {picker.handGroups.length > 0 && (
+                      <h4 className="px-1 pt-1 text-[10px] font-black uppercase tracking-[0.2em] text-text-dim/60">
+                        {t("chat.group_standalone", { defaultValue: "Standalone" })}
+                      </h4>
+                    )}
+                    {picker.standalone.map((agent) => renderAgentButton(agent))}
+                  </div>
+                )}
+                {picker.handGroups.map((group) => (
+                  <div key={group.hand_id} className="space-y-2 pt-3">
+                    <h4 className="px-1 text-[10px] font-black uppercase tracking-[0.2em] text-text-dim/60 flex items-center gap-1.5">
+                      {group.hand_icon && <span aria-hidden="true">{group.hand_icon}</span>}
+                      <span>{group.hand_name}</span>
+                    </h4>
+                    {group.agents.map((agent) =>
+                      renderAgentButton(agent, agent.role, agent.isCoordinator),
                     )}
                   </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-1.5">
-                      <p className={`text-sm font-bold truncate ${(agent.state || "").toLowerCase() !== "running" ? "opacity-50" : ""}`}>{t(`agents.builtin.${agent.name}.name`, { defaultValue: agent.name })}</p>
-                      {(agent.auth_status === "configured" || agent.auth_status === "validated_key") && <span className={`flex-shrink-0 px-1 py-0.5 rounded text-[8px] font-bold uppercase leading-none ${selectedAgentId === agent.id ? "bg-white/20" : "bg-brand/10 text-brand"}`}>KEY</span>}
-                      {agent.auth_status === "configured_cli" && <span className={`flex-shrink-0 px-1 py-0.5 rounded text-[8px] font-bold uppercase leading-none ${selectedAgentId === agent.id ? "bg-white/20" : "bg-accent/10 text-accent"}`}>CLI</span>}
-                      {isAuthUnavailable(agent.auth_status) && <AlertCircle className="h-3 w-3 text-warning flex-shrink-0" />}
-                    </div>
-                    <p className={`text-[10px] truncate ${selectedAgentId === agent.id ? "text-white/70" : "text-text-dim"}`}>
-                      {agent.model_provider || t("common.unknown")}
-                    </p>
-                  </div>
-                  <ArrowRight className={`h-4 w-4 flex-shrink-0 transition-transform ${selectedAgentId === agent.id ? "rotate-90" : "opacity-0 group-hover:opacity-100"}`} />
-                </button>
-              ))
+                ))}
+              </>
             )}
           </div>
         </aside>
@@ -1436,10 +2096,25 @@ export function ChatPage() {
               className="w-full rounded-lg border border-border-subtle bg-main px-3 py-2 text-sm font-bold outline-none focus:border-brand"
             >
               <option value="">{t("chat.select_agent")}</option>
-              {agents.map(agent => (
+              {picker.standalone.map((agent) => (
                 <option key={agent.id} value={agent.id}>
                   {t(`agents.builtin.${agent.name}.name`, { defaultValue: agent.name })} ({agent.state || "unknown"})
                 </option>
+              ))}
+              {picker.handGroups.map((group) => (
+                <optgroup
+                  key={group.hand_id}
+                  label={`${group.hand_icon ?? ""} ${group.hand_name}`.trim()}
+                >
+                  {group.agents.map((agent) => (
+                    <option key={agent.id} value={agent.id}>
+                      {agent.role}
+                      {agent.isCoordinator
+                        ? ` (${t("chat.hand_coordinator", { defaultValue: "coordinator" })})`
+                        : ""}
+                    </option>
+                  ))}
+                </optgroup>
               ))}
             </select>
           </div>
@@ -1449,27 +2124,41 @@ export function ChatPage() {
               agentName={selectedAgent?.name || ""}
               isLoading={isLoading}
               messageCount={messages.length}
-              onClear={clearHistory}
+              onClear={() => { void clearHistory(); }}
               onExport={handleExport}
               wsConnected={wsConnected}
               modelName={selectedAgent?.model_name}
+              modelProvider={selectedAgent?.model_provider}
               sessions={sessionsQuery.data}
               activeSessionId={activeSessionId}
               onSwitchSession={handleSwitchSession}
               onNewSession={handleNewSession}
               onDeleteSession={handleDeleteSession}
               agentId={selectedAgentId}
-              onModelChange={() => queryClient.invalidateQueries({ queryKey: ["agents", "list"] })}
+              onModelChange={() => void agentsQuery.refetch()}
+              onOpenConfig={() => navigate({ to: "/config" })}
+              webSearchAugmentation={selectedAgent?.web_search_augmentation}
+              webSearchAvailable={webSearchAvailable}
+              onWebSearchChange={async (mode) => {
+                try {
+                  await patchAgentConfigMutation.mutateAsync({
+                    agentId: selectedAgentId,
+                    config: { web_search_augmentation: mode },
+                  });
+                  await agentsQuery.refetch();
+                } catch { /* Config update failure — non-critical */ }
+              }}
             />
           )}
 
           {/* Message area */}
-          <div className="flex-1 overflow-y-auto p-3 sm:p-6 space-y-4 sm:space-y-6 scrollbar-thin">
+          <div className="flex-1 overflow-y-auto p-3 sm:p-6 scrollbar-thin">
+            <div className="w-full space-y-4 sm:space-y-6">
             {!selectedAgentId ? (
               <div className="h-full flex flex-col items-center justify-center text-center relative">
-                <div className="absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-main/50" />
+                <div className="absolute inset-0 bg-linear-to-b from-transparent via-transparent to-main/50" />
                 <div className="relative">
-                  <div className="w-24 h-24 rounded-3xl bg-gradient-to-br from-brand/20 to-accent/20 flex items-center justify-center mb-6 ring-4 ring-brand/10">
+                  <div className="w-24 h-24 rounded-3xl bg-linear-to-br from-brand/20 to-accent/20 flex items-center justify-center mb-6 ring-4 ring-brand/10">
                     <MessageCircle className="h-12 w-12 text-brand" />
                   </div>
                   <div className="absolute inset-0 rounded-3xl bg-brand/10 animate-pulse" />
@@ -1479,7 +2168,7 @@ export function ChatPage() {
               </div>
             ) : messages.length === 0 ? (
               <div className="h-full flex flex-col items-center justify-center text-center">
-                <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-brand/10 to-accent/10 flex items-center justify-center mb-4 ring-2 ring-brand/10">
+                <div className="w-20 h-20 rounded-2xl bg-linear-to-br from-brand/10 to-accent/10 flex items-center justify-center mb-4 ring-2 ring-brand/10">
                   <Bot className="h-10 w-10 text-brand" />
                 </div>
                 <h3 className="text-xl font-black">{selectedAgent?.name}</h3>
@@ -1507,16 +2196,23 @@ export function ChatPage() {
                 <div ref={messagesEndRef} />
               </div>
             )}
+            </div>
           </div>
 
           {/* Input area */}
           <div className={`p-2 sm:p-4 border-t border-border-subtle bg-surface transition-opacity ${!selectedAgentId ? "opacity-30 pointer-events-none" : ""}`}>
             <ChatInput
               onSend={sendMessage}
+              onStop={stopMessage}
+              isStreaming={isStreaming}
               disabled={isLoading}
-              placeholder={selectedAgentId ? t("chat.input_placeholder_with_agent", { name: selectedAgent?.name }) : t("chat.transmit_command")}
+              inputDisabled={isStreaming}
+              placeholder={isStreaming ? t("chat.generating") : selectedAgentId ? t("chat.input_placeholder_with_agent", { name: selectedAgent?.name }) : t("chat.transmit_command")}
               authMissing={isAuthUnavailable(selectedAgent?.auth_status)}
+              authStatus={selectedAgent?.auth_status}
               providerName={selectedAgent?.model_provider}
+              supportsThinking={selectedAgent?.supports_thinking}
+              sttAvailable={sttAvailable}
             />
           </div>
         </main>
@@ -1524,3 +2220,4 @@ export function ChatPage() {
     </div>
   );
 }
+

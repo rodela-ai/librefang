@@ -1,9 +1,7 @@
 import { useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
-import type { DashboardSnapshot, HealthCheck, VersionResponse } from "../api";
-import { loadDashboardSnapshot, getVersionInfo, postQuickInit } from "../api";
+import type { HealthCheck } from "../api";
 import { Card } from "../components/ui/Card";
 import { Badge } from "../components/ui/Badge";
 import { CardSkeleton } from "../components/ui/Skeleton";
@@ -12,37 +10,27 @@ import { truncateId } from "../lib/string";
 import { isProviderAvailable } from "../lib/status";
 import { getStatusVariant } from "../lib/status";
 import { formatRelativeTime } from "../lib/datetime";
-
-const REFRESH_MS = 5000;
+import { useDashboardSnapshot, useVersionInfo } from "../lib/queries/overview";
+import { useQuickInit } from "../lib/mutations/overview";
 
 export function OverviewPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const snapshotQuery = useQuery<DashboardSnapshot>({
-    queryKey: ["dashboard", "snapshot"],
-    queryFn: loadDashboardSnapshot,
-    refetchInterval: REFRESH_MS
-  });
-
-  const versionQuery = useQuery<VersionResponse>({
-    queryKey: ["version"],
-    queryFn: getVersionInfo,
-    staleTime: Infinity,
-  });
+  const snapshotQuery = useDashboardSnapshot();
+  const versionQuery = useVersionInfo();
+  const quickInitMutation = useQuickInit();
 
   const snapshot = snapshotQuery.data ?? null;
   const versionInfo = versionQuery.data;
   const isLoading = snapshotQuery.isLoading;
 
-  const queryClient = useQueryClient();
   const [initLoading, setInitLoading] = useState(false);
   const needsInit = snapshot?.status?.config_exists === false;
 
   const handleInit = async () => {
     setInitLoading(true);
     try {
-      await postQuickInit();
-      await queryClient.invalidateQueries({ queryKey: ["dashboard", "snapshot"] });
+      await quickInitMutation.mutateAsync();
     } catch {
       // ignore — banner will remain if init failed
     } finally {
@@ -164,7 +152,7 @@ export function OverviewPage() {
 
       {/* Setup Banner */}
       {needsInit && (
-        <Card padding="lg" className="border-brand/30 bg-gradient-to-r from-brand/5 via-brand/10 to-brand/5">
+        <Card padding="lg" className="border-brand/30 bg-linear-to-r from-brand/5 via-brand/10 to-brand/5">
           <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
             <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-brand/15">
               <Rocket className="h-6 w-6 text-brand" />
@@ -173,19 +161,27 @@ export function OverviewPage() {
               <h3 className="text-sm font-bold">{t("overview.setup_title")}</h3>
               <p className="mt-1 text-xs text-text-dim">{t("overview.setup_description")}</p>
             </div>
-            <button
-              onClick={handleInit}
-              disabled={initLoading}
-              className="shrink-0 rounded-xl bg-brand px-5 py-2.5 text-xs font-bold text-white shadow-lg shadow-brand/20 transition-all hover:shadow-xl hover:shadow-brand/30 hover:-translate-y-0.5 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {initLoading ? t("overview.setup_running") : t("overview.setup_button")}
-            </button>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                onClick={() => navigate({ to: "/wizard" })}
+                className="rounded-xl border border-border-subtle bg-surface px-4 py-2.5 text-xs font-bold text-text-main hover:border-brand/30 hover:text-brand transition-all"
+              >
+                {t("overview.setup_wizard", { defaultValue: "Use Wizard" })}
+              </button>
+              <button
+                onClick={handleInit}
+                disabled={initLoading}
+                className="rounded-xl bg-brand px-5 py-2.5 text-xs font-bold text-white shadow-lg shadow-brand/20 transition-all hover:shadow-xl hover:shadow-brand/30 hover:-translate-y-0.5 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {initLoading ? t("overview.setup_running") : t("overview.setup_button")}
+              </button>
+            </div>
           </div>
         </Card>
       )}
 
       {/* Stats Cards */}
-      <div className="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-4 stagger-children">
+      <div className="grid grid-cols-2 gap-3 sm:gap-4 md:grid-cols-4 stagger-children">
         {isLoading ? (
           // Loading skeletons
           <>
@@ -239,7 +235,7 @@ export function OverviewPage() {
                   onClick={() => navigate({ to: action.to as any })}
                   className={`group flex flex-col items-center gap-2 sm:gap-3 rounded-2xl border p-3 sm:p-5 transition-all duration-300 hover:-translate-y-1 hover:shadow-lg ${
                     action.primary
-                      ? "border-brand/20 bg-gradient-to-b from-brand/5 to-brand/10 text-brand hover:shadow-brand/15"
+                      ? "border-brand/20 bg-linear-to-b from-brand/5 to-brand/10 text-brand hover:shadow-brand/15"
                       : "border-border-subtle bg-surface text-text-dim hover:border-brand/30 hover:text-brand"
                   }`}
                 >
@@ -266,13 +262,13 @@ export function OverviewPage() {
               </button>
             </div>
             {isLoading ? (
-              <div className="grid gap-3 sm:grid-cols-2">
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                 {[1, 2].map(i => (
-                  <div key={i} className="h-16 rounded-xl bg-gradient-to-r from-main via-surface-hover to-main bg-[length:200%_100%]" style={{ animation: "shimmer 1.5s ease-in-out infinite" }} />
+                  <div key={i} className="h-16 rounded-xl bg-linear-to-r from-main via-surface-hover to-main bg-[length:200%_100%]" style={{ animation: "shimmer 1.5s ease-in-out infinite" }} />
                 ))}
               </div>
             ) : snapshot?.agents && snapshot.agents.length > 0 ? (
-              <div className="grid gap-3 sm:grid-cols-2">
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                 {snapshot.agents.filter(a => !a.is_hand && !a.name.includes(":")).slice(0, 4).map(agent => (
                   <div
                     key={agent.id}
@@ -353,7 +349,7 @@ export function OverviewPage() {
               <div className="flex items-center gap-3 p-2.5 rounded-lg bg-main/40">
                 <div className="w-8 h-8 rounded-lg bg-brand/10 flex items-center justify-center shrink-0"><HardDrive className="w-4 h-4 text-brand" /></div>
                 <span className="text-xs text-text-dim flex-1">{t("overview.memory_usage")}</span>
-                <span className="text-sm font-mono font-black">{snapshot?.status?.memory_used_mb ? `${snapshot.status.memory_used_mb} MB` : "-"}</span>
+                <span className="text-sm font-mono font-black">{snapshot?.status?.memory_used_mb != null ? `${snapshot.status.memory_used_mb} MB` : "-"}</span>
               </div>
               <div className="flex items-center gap-3 p-2.5 rounded-lg bg-main/40">
                 <div className="w-8 h-8 rounded-lg bg-warning/10 flex items-center justify-center shrink-0"><Activity className="w-4 h-4 text-warning" /></div>
@@ -363,7 +359,16 @@ export function OverviewPage() {
               <div className="flex items-center gap-3 p-2.5 rounded-lg bg-main/40">
                 <div className="w-8 h-8 rounded-lg bg-brand/10 flex items-center justify-center shrink-0"><Globe className="w-4 h-4 text-brand" /></div>
                 <span className="text-xs text-text-dim flex-1">Hostname</span>
-                <span className="text-sm font-mono font-black truncate max-w-[140px]" title={versionInfo?.hostname}>{versionInfo?.hostname || "-"}</span>
+                {/* `/api/version` is public and deliberately omits
+                    hostname (per-machine identifier). Read from the
+                    authenticated snapshot first; fall back to versionInfo
+                    for older daemons. */}
+                <span
+                  className="text-sm font-mono font-black truncate max-w-[140px]"
+                  title={snapshot?.status?.hostname || versionInfo?.hostname}
+                >
+                  {snapshot?.status?.hostname || versionInfo?.hostname || "-"}
+                </span>
               </div>
               <div className="flex items-center gap-3 p-2.5 rounded-lg bg-main/40">
                 <div className="w-8 h-8 rounded-lg bg-accent/10 flex items-center justify-center shrink-0"><User className="w-4 h-4 text-accent" /></div>
@@ -407,7 +412,7 @@ export function OverviewPage() {
       </div>
 
       {/* Pro Tip */}
-      <div className="hidden sm:flex items-center gap-3 rounded-xl border border-brand/10 bg-gradient-to-r from-brand/5 to-transparent px-4 py-3">
+      <div className="hidden sm:flex items-center gap-3 rounded-xl border border-brand/10 bg-linear-to-r from-brand/5 to-transparent px-4 py-3">
         <Sparkles className="h-4 w-4 text-brand shrink-0" />
         <span className="text-xs text-text-dim flex-1">
           <span className="font-bold text-brand">{t("overview.pro_tip")}</span> — {t("overview.pro_tip_shortcut")}

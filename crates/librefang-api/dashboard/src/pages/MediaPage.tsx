@@ -1,19 +1,19 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { FormEvent, useMemo, useRef, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
-  listMediaProviders,
-  generateImage,
-  synthesizeSpeech,
-  submitVideo,
-  pollVideo,
-  generateMusic,
   type MediaProvider,
   type MediaImageResult,
   type SpeechResult,
   type MediaMusicResult,
   type MediaVideoStatus,
-} from "../api";
+} from "../lib/http/client";
+import { useMediaProviders, useVideoTask } from "../lib/queries/media";
+import {
+  useGenerateImage,
+  useSynthesizeSpeech,
+  useSubmitVideo,
+  useGenerateMusic,
+} from "../lib/mutations/media";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { Input } from "../components/ui/Input";
@@ -50,11 +50,7 @@ export function MediaPage() {
   const addToast = useUIStore((s) => s.addToast);
   const [activeTab, setActiveTab] = useState<MediaTab>("image");
 
-  const providersQuery = useQuery({
-    queryKey: ["media-providers"],
-    queryFn: listMediaProviders,
-    refetchInterval: 60_000,
-  });
+  const providersQuery = useMediaProviders();
 
   const providers = providersQuery.data ?? [];
   const configuredProviders = useMemo(() => providers.filter((p) => p.configured), [providers]);
@@ -247,28 +243,29 @@ function ImagePanel({
   const [aspect, setAspect] = useState("");
   const [result, setResult] = useState<MediaImageResult | null>(null);
 
-  const mut = useMutation({
-    mutationFn: () =>
-      generateImage({
-        prompt,
-        provider: provider || undefined,
-        model: model || undefined,
-        count: count || undefined,
-        aspect_ratio: aspect || undefined,
-      }),
-    onSuccess: (data) => {
-      setResult(data);
-      onToast(t("media.image_done"), "success");
-    },
-    onError: (err: Error) => onToast(err.message || t("common.error"), "error"),
-  });
+  const mut = useGenerateImage();
 
   return (
     <form
       onSubmit={(e: FormEvent) => {
         e.preventDefault();
         if (!prompt.trim()) return;
-        mut.mutate();
+        mut.mutate(
+          {
+            prompt,
+            provider: provider || undefined,
+            model: model || undefined,
+            count: count || undefined,
+            aspect_ratio: aspect || undefined,
+          },
+          {
+            onSuccess: (data) => {
+              setResult(data);
+              onToast(t("media.image_done"), "success");
+            },
+            onError: (err: Error) => onToast(err.message || t("common.error"), "error"),
+          },
+        );
       }}
       className="flex flex-col gap-4"
     >
@@ -356,29 +353,30 @@ function SpeechPanel({
   const [speed, setSpeed] = useState(1);
   const [result, setResult] = useState<SpeechResult | null>(null);
 
-  const mut = useMutation({
-    mutationFn: () =>
-      synthesizeSpeech({
-        text,
-        provider: provider || undefined,
-        model: model || undefined,
-        voice: voice || undefined,
-        format: format || undefined,
-        speed: speed || undefined,
-      }),
-    onSuccess: (data) => {
-      setResult(data);
-      onToast(t("media.speech_done"), "success");
-    },
-    onError: (err: Error) => onToast(err.message || t("common.error"), "error"),
-  });
+  const mut = useSynthesizeSpeech();
 
   return (
     <form
       onSubmit={(e: FormEvent) => {
         e.preventDefault();
         if (!text.trim()) return;
-        mut.mutate();
+        mut.mutate(
+          {
+            text,
+            provider: provider || undefined,
+            model: model || undefined,
+            voice: voice || undefined,
+            format: format || undefined,
+            speed: speed || undefined,
+          },
+          {
+            onSuccess: (data) => {
+              setResult(data);
+              onToast(t("media.speech_done"), "success");
+            },
+            onError: (err: Error) => onToast(err.message || t("common.error"), "error"),
+          },
+        );
       }}
       className="flex flex-col gap-4"
     >
@@ -456,62 +454,79 @@ function VideoPanel({
   const [prompt, setPrompt] = useState("");
   const [provider, setProvider] = useState("");
   const [model, setModel] = useState("");
-  const [status, setStatus] = useState<MediaVideoStatus | null>(null);
+  // Local draft shown immediately after submission, before the first poll
+  // returns. Once the query has data we derive status from the query instead —
+  // keeping a mirrored copy of query data in state is a React anti-pattern
+  // and can race the first fetch for a new taskId.
+  const [submittedDraft, setSubmittedDraft] = useState<MediaVideoStatus | null>(null);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [taskProvider, setTaskProvider] = useState<string | null>(null);
-  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const completionToastShown = useRef<string | null>(null);
+  const errorToastShown = useRef<string | null>(null);
 
-  const stopPolling = () => {
-    if (pollTimer.current) {
-      clearTimeout(pollTimer.current);
-      pollTimer.current = null;
-    }
-  };
-
-  const poll = async (id: string, prov: string) => {
-    try {
-      const s = await pollVideo(id, prov);
-      setStatus(s);
-      if (s.status === "completed" || s.status === "failed" || s.error) {
-        stopPolling();
-        if (s.status === "completed") onToast(t("media.video_done"), "success");
-        else if (s.error) onToast(s.error, "error");
-        return;
-      }
-      pollTimer.current = setTimeout(() => poll(id, prov), 5000);
-    } catch (err) {
-      stopPolling();
-      onToast(err instanceof Error ? err.message : t("common.error"), "error");
-    }
-  };
-
-  const submit = useMutation({
-    mutationFn: () =>
-      submitVideo({
-        prompt,
-        provider: provider || undefined,
-        model: model || undefined,
-      }),
-    onSuccess: (data) => {
-      stopPolling();
-      setStatus({ status: "submitted", task_id: data.task_id });
-      setTaskId(data.task_id);
-      setTaskProvider(data.provider);
-      onToast(t("media.video_submitted"), "success");
-      // Start polling
-      pollTimer.current = setTimeout(() => poll(data.task_id, data.provider), 3000);
+  const submit = useSubmitVideo();
+  const videoTaskQuery = useVideoTask(
+    taskId && taskProvider ? { taskId, provider: taskProvider } : null,
+    {
+      enabled: Boolean(taskId && taskProvider), // Only poll after a submission creates a task.
+      refetchInterval: 5_000,
     },
-    onError: (err: Error) => onToast(err.message || t("common.error"), "error"),
-  });
+  );
 
-  const isPolling = !!pollTimer.current;
+  const status: MediaVideoStatus | null = videoTaskQuery.data ?? submittedDraft;
+
+  useEffect(() => {
+    if (!videoTaskQuery.isError) return;
+    const message = videoTaskQuery.error instanceof Error ? videoTaskQuery.error.message : t("common.error");
+    if (errorToastShown.current === message) return;
+    errorToastShown.current = message;
+    onToast(message, "error");
+  }, [videoTaskQuery.error, videoTaskQuery.isError, onToast, t]);
+
+  useEffect(() => {
+    if (!status) return;
+    if (status.status === "completed") {
+      if (completionToastShown.current === taskId) return;
+      completionToastShown.current = taskId;
+      onToast(t("media.video_done"), "success");
+      return;
+    }
+    if (status.error) {
+      if (errorToastShown.current === status.error) return;
+      errorToastShown.current = status.error;
+      onToast(status.error, "error");
+    }
+  }, [onToast, status, t, taskId]);
+
+  const isPolling = !!(taskId && taskProvider)
+    && !!status
+    && status.status !== "completed"
+    && status.status !== "failed"
+    && !status.error;
 
   return (
     <form
       onSubmit={(e: FormEvent) => {
         e.preventDefault();
         if (!prompt.trim()) return;
-        submit.mutate();
+        submit.mutate(
+          {
+            prompt,
+            provider: provider || undefined,
+            model: model || undefined,
+          },
+          {
+            onSuccess: (data) => {
+              setSubmittedDraft({ status: "submitted", task_id: data.task_id });
+              setTaskId(data.task_id);
+              setTaskProvider(data.provider);
+              completionToastShown.current = null;
+              errorToastShown.current = null;
+              onToast(t("media.video_submitted"), "success");
+            },
+            onError: (err: Error) => onToast(err.message || t("common.error"), "error"),
+          },
+        );
       }}
       className="flex flex-col gap-4"
     >
@@ -599,21 +614,7 @@ function MusicPanel({
   const [instrumental, setInstrumental] = useState(false);
   const [result, setResult] = useState<MediaMusicResult | null>(null);
 
-  const mut = useMutation({
-    mutationFn: () =>
-      generateMusic({
-        prompt: prompt || undefined,
-        lyrics: lyrics || undefined,
-        provider: provider || undefined,
-        model: model || undefined,
-        instrumental,
-      }),
-    onSuccess: (data) => {
-      setResult(data);
-      onToast(t("media.music_done"), "success");
-    },
-    onError: (err: Error) => onToast(err.message || t("common.error"), "error"),
-  });
+  const mut = useGenerateMusic();
 
   const canSubmit = !!prompt.trim() || !!lyrics.trim();
 
@@ -622,7 +623,22 @@ function MusicPanel({
       onSubmit={(e: FormEvent) => {
         e.preventDefault();
         if (!canSubmit) return;
-        mut.mutate();
+        mut.mutate(
+          {
+            prompt: prompt || undefined,
+            lyrics: lyrics || undefined,
+            provider: provider || undefined,
+            model: model || undefined,
+            instrumental,
+          },
+          {
+            onSuccess: (data) => {
+              setResult(data);
+              onToast(t("media.music_done"), "success");
+            },
+            onError: (err: Error) => onToast(err.message || t("common.error"), "error"),
+          },
+        );
       }}
       className="flex flex-col gap-4"
     >

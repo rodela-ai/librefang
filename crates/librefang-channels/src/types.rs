@@ -1,5 +1,17 @@
 //! Core channel bridge types.
 
+/// Truncate `s` to at most `max_bytes`, respecting UTF-8 char boundaries.
+pub(crate) fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 use chrono::{DateTime, Utc};
 use librefang_types::agent::AgentId;
 use librefang_types::config::AutoRouteStrategy;
@@ -96,6 +108,22 @@ pub struct InteractiveMessage {
     pub buttons: Vec<Vec<InteractiveButton>>,
 }
 
+/// A single media item in a `MediaGroup` album message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MediaGroupItem {
+    /// A photo with optional caption.
+    Photo {
+        url: String,
+        caption: Option<String>,
+    },
+    /// A video with optional caption and duration.
+    Video {
+        url: String,
+        caption: Option<String>,
+        duration_seconds: u32,
+    },
+}
+
 /// Content types that can be received from a channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ChannelContent {
@@ -159,6 +187,66 @@ pub enum ChannelContent {
         /// Original message text (if available).
         message_text: Option<String>,
     },
+    /// Delete a previously sent message (outbound only).
+    /// Sending this variant causes the adapter to call deleteMessage.
+    DeleteMessage {
+        message_id: String,
+    },
+    /// Edit an existing interactive message in place (outbound only).
+    /// Telegram maps this to editMessageText with a new reply_markup.
+    EditInteractive {
+        message_id: String,
+        text: String,
+        buttons: Vec<Vec<InteractiveButton>>,
+    },
+    /// Audio file (music/podcast — distinct from Voice messages).
+    /// Voice is for voice memos; Audio is for music files with metadata.
+    Audio {
+        url: String,
+        caption: Option<String>,
+        duration_seconds: u32,
+        /// Optional track title.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// Optional performer/artist.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        performer: Option<String>,
+    },
+    /// Animated GIF or H.264/MPEG-4 AVC video without sound.
+    Animation {
+        url: String,
+        caption: Option<String>,
+        duration_seconds: u32,
+    },
+    /// Sticker identified by a platform file_id (not a download URL).
+    Sticker {
+        file_id: String,
+    },
+    /// A group of media items sent as a single album.
+    MediaGroup {
+        items: Vec<MediaGroupItem>,
+    },
+    /// A poll or quiz sent to the user (outbound).
+    Poll {
+        question: String,
+        /// Answer option texts (2–10 options for Telegram).
+        options: Vec<String>,
+        /// When true, sent as a quiz (one correct answer).
+        #[serde(default)]
+        is_quiz: bool,
+        /// Index of the correct option (required when `is_quiz` is true).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correct_option_id: Option<u8>,
+        /// Explanation shown after user answers (quiz mode only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        explanation: Option<String>,
+    },
+    /// A user's answer to a poll (inbound only).
+    PollAnswer {
+        poll_id: String,
+        /// Indices of the selected options.
+        option_ids: Vec<u8>,
+    },
 }
 
 /// A unified message from any channel.
@@ -196,6 +284,13 @@ pub struct SenderContext {
     pub channel: String,
     /// Platform-specific user ID.
     pub user_id: String,
+    /// Platform-specific conversation ID (Telegram chat_id, Discord
+    /// channel_id, WhatsApp JID, etc.). Populated by `build_sender_context`
+    /// from `ChannelMessage.sender.platform_id` so kernel session scoping
+    /// can distinguish groups, DMs, and other conversations on the same
+    /// channel+agent pair. `None` for non-channel invocations (CLI, REST).
+    #[serde(default)]
+    pub chat_id: Option<String>,
     /// Human-readable display name.
     pub display_name: String,
     /// Whether the message came from a group chat (vs DM).
@@ -242,6 +337,50 @@ pub struct SenderContext {
     /// part of the key.
     #[serde(default)]
     pub chat_id: Option<String>,
+    /// Group participant roster (Phase 2 §C OB-04/OB-05/GS-01).
+    ///
+    /// Populated by the WhatsApp gateway via `sock.groupMetadata(groupJid)`
+    /// (5min TTL cache) for group messages. Empty for DMs and for non-WhatsApp
+    /// channels that don't yet expose roster info. Used by the addressee guard
+    /// in `should_process_group_message` to detect when a turn is addressed
+    /// to a named participant other than the agent.
+    ///
+    /// `#[serde(default)]` ensures BC-02: stored canonical blobs that predate
+    /// this field still deserialize cleanly.
+    #[serde(default)]
+    pub group_participants: Vec<ParticipantRef>,
+    /// When true, the kernel session resolver treats this invocation as
+    /// non-channel for *storage* purposes: messages persist to
+    /// `entry.session_id` instead of `SessionId::for_channel(agent, channel)`.
+    /// `channel` itself is still used for routing cache keys so the assistant
+    /// auto-router stays per-surface (`webui` vs `telegram` etc.).
+    ///
+    /// Set by the dashboard WebSocket handler so the webui chat view shares a
+    /// session with `agent_send` / triggers and so `list_agent_sessions` /
+    /// `switch_agent_session` actually affect what the user sees.
+    #[serde(default)]
+    pub use_canonical_session: bool,
+    /// Set by the kernel's internal cron runner only — never by external API
+    /// callers. Gates [SILENT] marker processing so a regular user who
+    /// happens to type "[SILENT]" in chat does not accidentally suppress
+    /// their session history.
+    ///
+    /// Intentionally excluded from serialization so external callers cannot
+    /// inject `"is_internal_cron": true` through a JSON payload.
+    #[serde(skip)]
+    pub is_internal_cron: bool,
+}
+
+/// Reference to a participant in a group chat.
+///
+/// Minimal shape required by the §C addressee guard. Full roster persistence
+/// (with phone-number resolution, role, etc.) is deferred to Phase 5.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParticipantRef {
+    /// Platform JID (e.g. `1234567890@s.whatsapp.net` or `lid@lid`).
+    pub jid: String,
+    /// Human-readable name (push-name, contact name, or first part of JID).
+    pub display_name: String,
 }
 
 /// Agent lifecycle phase for UX indicators.
@@ -564,11 +703,11 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<&str> {
 fn retreat_past_html_entity(text: &str, pos: usize) -> usize {
     // Maximum entity length we consider (e.g. `&#1114111;` = 10 chars).
     const MAX_ENTITY_LEN: usize = 12;
+    // `pos.saturating_sub(MAX_ENTITY_LEN)` is a raw byte offset that can
+    // land inside a multi-byte UTF-8 character (e.g. `ñ` is 2 bytes,
+    // `😀` is 4). Slicing at a non-char-boundary index panics, so walk
+    // forward to the next char boundary before slicing. See issue #2285.
     let raw_start = pos.saturating_sub(MAX_ENTITY_LEN);
-    // Snap to the nearest char boundary so we never slice inside a multi-byte
-    // UTF-8 sequence (e.g. `ñ` = 2 bytes, emoji = 4 bytes). Without this,
-    // text containing non-ASCII characters panics on the `text[start..pos]`
-    // slice below. See #2285.
     let search_start = (raw_start..=pos)
         .find(|&i| text.is_char_boundary(i))
         .unwrap_or(pos);
@@ -624,6 +763,58 @@ mod tests {
         let text = "line1\nline2\nline3";
         let chunks = split_message(text, 10);
         assert_eq!(chunks, vec!["line1", "line2", "line3"]);
+    }
+
+    /// Regression: #2285 — `retreat_past_html_entity` used to slice a raw
+    /// byte offset that could land inside a multi-byte UTF-8 char, causing
+    /// `byte index N is not a char boundary; it is inside 'ñ' ...`.
+    #[test]
+    fn test_split_message_multibyte_at_boundary() {
+        // Place a 2-byte char (`ñ`) right where the entity-retreat window
+        // would otherwise slice into it. With max_len = 10, the look-back
+        // window is the 12 bytes before pos. We craft a string so the
+        // window starts inside `ñ`.
+        let text = "abcdefghijñklmn";
+        // Should not panic; should split at a char boundary.
+        let chunks = split_message(text, 10);
+        // Verify all chunks are valid UTF-8 (implicit since `&str`) and
+        // their concatenation reconstructs the original text.
+        let rebuilt: String = chunks.concat();
+        assert_eq!(rebuilt, text);
+    }
+
+    #[test]
+    fn test_split_message_emoji_near_boundary() {
+        // 4-byte emoji at the boundary — same panic class.
+        let text = "0123456789😀abcdefghij";
+        let chunks = split_message(text, 12);
+        let rebuilt: String = chunks.concat();
+        assert_eq!(rebuilt, text);
+    }
+
+    #[test]
+    fn test_split_message_long_multibyte_does_not_panic() {
+        // Reproduce the production trace: a long string of 2-byte chars
+        // straddling the 4096 boundary used to panic on `byte index 4084`.
+        let text: String = "coño ".repeat(900);
+        let chunks = split_message(&text, 4096);
+        let rebuilt: String = chunks.concat();
+        assert_eq!(rebuilt, text);
+    }
+
+    #[test]
+    fn test_retreat_past_html_entity_multibyte_safe() {
+        // Direct unit test of the helper with a string where the retreat
+        // window would land inside a multi-byte char.
+        let text = "abñ";
+        // pos = 4 (= text.len(), past the end of `ñ`)
+        // raw_start = pos.saturating_sub(12) = 0, which is on a boundary,
+        // so this case is fine. Test the harder case where pos itself is
+        // small enough that the window is fully inside the multi-byte char.
+        let result = retreat_past_html_entity(text, 4);
+        // Should not panic; should return either 4 or an earlier valid boundary.
+        assert!(text.is_char_boundary(result));
+        assert!(result <= 4);
     }
 
     #[test]

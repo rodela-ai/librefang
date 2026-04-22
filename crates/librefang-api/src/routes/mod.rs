@@ -14,11 +14,13 @@
 #![allow(ambiguous_glob_reexports)]
 
 pub mod agents;
+pub mod auto_dream;
 pub mod budget;
 pub mod channels;
 pub mod config;
 pub mod goals;
 pub mod inbox;
+pub mod mcp_auth;
 pub mod media;
 pub mod memory;
 pub mod network;
@@ -41,11 +43,13 @@ pub mod workflows;
 // warning, but `router()` is only accessed via qualified paths (e.g.
 // `routes::agents::router()`), so there is no actual conflict.
 pub use agents::*;
+pub use auto_dream::*;
 pub use budget::*;
 pub use channels::*;
 pub use config::*;
 pub use goals::*;
 pub use inbox::*;
+pub use mcp_auth::*;
 pub use media::*;
 pub use memory::*;
 pub use network::*;
@@ -125,6 +129,9 @@ pub struct AppState {
     /// Dynamic webhook router for channel webhook endpoints.
     /// Mounted under `/channels` on the main server. Updated on hot-reload.
     pub webhook_router: Arc<tokio::sync::RwLock<Arc<axum::Router>>>,
+    /// Mutex for serializing config file writes — prevents concurrent config_set
+    /// calls from reading the same file and overwriting each other's changes.
+    pub config_write_lock: tokio::sync::Mutex<()>,
     /// Prometheus metrics handle (only set when `telemetry` feature + config enabled).
     #[cfg(feature = "telemetry")]
     pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,

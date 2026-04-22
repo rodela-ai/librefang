@@ -1,8 +1,10 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { listChannels, configureChannel, testChannel, reloadChannels, wechatQrStart, wechatQrStatus, whatsappQrStart, whatsappQrStatus, type ChannelItem } from "../api";
+import { wechatQrStart, wechatQrStatus, whatsappQrStart, whatsappQrStatus, type ChannelItem } from "../api";
+import { useChannels } from "../lib/queries/channels";
+import { useConfigureChannel, useTestChannel, useReloadChannels } from "../lib/mutations/channels";
 import { useUIStore } from "../lib/store";
+import { copyToClipboard } from "../lib/clipboard";
 import QRCode from "qrcode";
 import { PageHeader } from "../components/ui/PageHeader";
 import { CardSkeleton } from "../components/ui/Skeleton";
@@ -16,8 +18,6 @@ import {
   Settings, Key, Clock, AlertCircle, CheckSquare, Square,
   MessageCircle, Mail, Phone, Link2, Radio, Send, Bell, Wifi, Globe
 } from "lucide-react";
-
-const REFRESH_MS = 30000;
 
 const channelIcons: Record<string, React.ReactNode> = {
   slack: <MessageCircle className="w-5 h-5" />,
@@ -316,7 +316,6 @@ function DetailsModal({ channel, onClose, onConfigure, onTest, t }: {
 
 // Config Dialog — standard form with controlled inputs
 function ConfigDialog({ channel, onClose, t }: { channel: Channel; onClose: () => void; t: (key: string) => string }) {
-  const queryClient = useQueryClient();
   const addToast = useUIStore((s) => s.addToast);
   const fields = useMemo(() => (channel.fields ?? []).filter(f => !f.advanced), [channel.fields]);
 
@@ -349,6 +348,7 @@ function ConfigDialog({ channel, onClose, t }: { channel: Channel; onClose: () =
   );
 
   // Only submit non-readonly, non-empty values (skip untouched secrets)
+  const configMutation = useConfigureChannel();
   const handleSubmit = () => {
     const payload: Record<string, string> = {};
     for (const f of visibleFields) {
@@ -356,18 +356,17 @@ function ConfigDialog({ channel, onClose, t }: { channel: Channel; onClose: () =
       const v = values[f.key];
       if (v) payload[f.key] = v;
     }
-    configMutation.mutate(payload);
+    configMutation.mutate(
+      { channelName: channel.name, config: payload },
+      {
+        onSuccess: () => {
+          addToast(t("channels.config_success") || `${channel.display_name || channel.name} configured`, "success");
+          onClose();
+        },
+        onError: (err: any) => addToast(err.message || t("channels.config_failed") || "Failed to configure channel", "error"),
+      },
+    );
   };
-
-  const configMutation = useMutation({
-    mutationFn: (payload: Record<string, string>) => configureChannel(channel.name, payload),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["channels", "list"] });
-      addToast(t("channels.config_success") || `${channel.display_name || channel.name} configured`, "success");
-      onClose();
-    },
-    onError: (err: any) => addToast(err.message || t("channels.config_failed") || "Failed to configure channel", "error"),
-  });
 
   return (
     <div className="fixed inset-0 bg-black/40 flex items-end sm:items-center justify-center z-50 backdrop-blur-sm" onClick={onClose}>
@@ -406,11 +405,14 @@ function ConfigDialog({ channel, onClose, t }: { channel: Channel; onClose: () =
                       className="flex-1 rounded-lg border border-border-subtle bg-main/50 px-3 py-2 text-xs text-text-dim font-mono"
                     />
                     <button
-                      onClick={() => navigator.clipboard.writeText(field.value || field.placeholder || "")}
+                      onClick={async () => {
+                        const ok = await copyToClipboard(field.value || field.placeholder || "");
+                        addToast(ok ? t("common.copied") : t("common.copy_failed"), ok ? "success" : "error");
+                      }}
                       className="px-3 py-2 rounded-lg bg-brand/10 text-brand text-xs hover:bg-brand/20 transition-colors shrink-0"
-                      title="Copy"
+                      title={t("common.copy")}
                     >
-                      Copy
+                      {t("common.copy")}
                     </button>
                   </div>
                 ) : field.type === "select" && field.options ? (
@@ -456,24 +458,22 @@ function ConfigDialog({ channel, onClose, t }: { channel: Channel; onClose: () =
 
 // QR Login Dialog for channels with setup_type === "qr" (e.g. WeChat, WhatsApp)
 function QrLoginDialog({ channel, onClose, t }: { channel: Channel; onClose: () => void; t: (key: string) => string }) {
-  const queryClient = useQueryClient();
+  const configureChannelMutation = useConfigureChannel();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cancelledRef = useRef(false);
+  const pollIdRef = useRef(0);
   const [phase, setPhase] = useState<"idle" | "loading" | "scanning" | "success" | "error">("idle");
   const [message, setMessage] = useState("");
 
-  const cleanup = useCallback(() => {
-    cancelledRef.current = true;
-  }, []);
-
-  useEffect(() => () => { cancelledRef.current = true; }, []);
+  useEffect(() => () => { cancelledRef.current = true; pollIdRef.current += 1; }, []);
 
   const startQr = useCallback(async () => {
+    const pollId = ++pollIdRef.current;
     cancelledRef.current = false;
     setPhase("loading");
     setMessage("");
     try {
-      // Pick the correct QR API based on channel name
+      // QR start/status are imperative long-poll probes, so they stay raw instead of going through cached query hooks.
       const qrStart = channel.name === "whatsapp" ? whatsappQrStart : wechatQrStart;
       const qrStatus = channel.name === "whatsapp" ? whatsappQrStatus : wechatQrStatus;
       const displayName = channel.name === "whatsapp" ? "WhatsApp" : "WeChat";
@@ -481,7 +481,7 @@ function QrLoginDialog({ channel, onClose, t }: { channel: Channel; onClose: () 
       const res = await qrStart();
       if (!res.available || !res.qr_code) {
         setPhase("error");
-        setMessage(res.message || "Failed to get QR code");
+        setMessage(res.message || t("channels.qr_failed"));
         return;
       }
       setPhase("scanning");
@@ -497,16 +497,24 @@ function QrLoginDialog({ channel, onClose, t }: { channel: Channel; onClose: () 
       // The backend holds each request ~30s (long-poll), so setInterval would
       // stack up parallel requests that all resolve at once on scan → flashing UI.
       const pollLoop = async () => {
-        while (!cancelledRef.current) {
+        while (!cancelledRef.current && pollIdRef.current === pollId) {
           try {
             const status = await qrStatus(res.qr_code!);
-            if (cancelledRef.current) break;
+            if (cancelledRef.current || pollIdRef.current !== pollId) break;
             if (status.connected && status.bot_token) {
               cancelledRef.current = true;
+              try {
+                await configureChannelMutation.mutateAsync({
+                  channelName: channel.name,
+                  config: { bot_token_env: status.bot_token },
+                });
+              } catch (error) {
+                setPhase("error");
+                setMessage(error instanceof Error ? error.message : t("channels.qr_failed"));
+                return;
+              }
               setPhase("success");
-              setMessage("Login successful! Saving configuration...");
-              await configureChannel(channel.name, { bot_token_env: status.bot_token });
-              queryClient.invalidateQueries({ queryKey: ["channels", "list"] });
+              setMessage(t("channels.login_success"));
               setTimeout(onClose, 1500);
               return;
             } else if (status.expired) {
@@ -517,7 +525,7 @@ function QrLoginDialog({ channel, onClose, t }: { channel: Channel; onClose: () 
             }
           } catch {
             // Transient error — wait briefly then retry
-            if (cancelledRef.current) break;
+            if (cancelledRef.current || pollIdRef.current !== pollId) break;
             await new Promise(r => setTimeout(r, 3000));
           }
         }
@@ -527,7 +535,7 @@ function QrLoginDialog({ channel, onClose, t }: { channel: Channel; onClose: () 
       setPhase("error");
       setMessage(e instanceof Error ? e.message : "Failed to start QR login");
     }
-  }, [channel.name, cleanup, onClose, queryClient]);
+  }, [channel.name, configureChannelMutation, onClose, t]);
 
   // Auto-start on mount
   useEffect(() => { startQr(); }, [startQr]);
@@ -601,26 +609,24 @@ export function ChannelsPage() {
   const [configuringChannel, setConfiguringChannel] = useState<Channel | null>(null);
   const [qrLoginChannel, setQrLoginChannel] = useState<Channel | null>(null);
 
-  const queryClient = useQueryClient();
   const addToast = useUIStore((s) => s.addToast);
 
-  const channelsQuery = useQuery({ queryKey: ["channels", "list"], queryFn: listChannels, refetchInterval: REFRESH_MS });
-  const testMut = useMutation({
-    mutationFn: (name: string) => testChannel(name),
-    onSuccess: (_data, name) => {
-      addToast(t("channels.test_success", { defaultValue: `Channel "${name}" test passed` }), "success");
-      queryClient.invalidateQueries({ queryKey: ["channels"] });
-    },
-    onError: (err: any, name) => addToast(err.message || t("channels.test_failed", { defaultValue: `Channel "${name}" test failed` }), "error"),
-  });
-  const reloadMut = useMutation({
-    mutationFn: reloadChannels,
-    onSuccess: () => {
-      addToast(t("channels.reload_success", { defaultValue: "Channels reloaded" }), "success");
-      queryClient.invalidateQueries({ queryKey: ["channels"] });
-    },
-    onError: (err: any) => addToast(err.message || t("common.error"), "error"),
-  });
+  const channelsQuery = useChannels();
+  const testMut = useTestChannel();
+  const reloadMut = useReloadChannels();
+
+  const handleTest = (name: string) => {
+    testMut.mutate(name, {
+      onSuccess: () => addToast(t("channels.test_success", { defaultValue: `Channel "${name}" test passed` }), "success"),
+      onError: (err: any) => addToast(err.message || t("channels.test_failed", { defaultValue: `Channel "${name}" test failed` }), "error"),
+    });
+  };
+  const handleReload = () => {
+    reloadMut.mutate(undefined, {
+      onSuccess: () => addToast(t("channels.reload_success", { defaultValue: "Channels reloaded" }), "success"),
+      onError: (err: any) => addToast(err.message || t("common.error"), "error"),
+    });
+  };
 
   const channels = channelsQuery.data ?? [];
   const configuredCount = useMemo(() => channels.filter(c => c.configured).length, [channels]);
@@ -700,7 +706,7 @@ export function ChannelsPage() {
         helpText={t("channels.help")}
         actions={
           <div className="flex items-center gap-2">
-            <Button variant="secondary" size="sm" onClick={() => reloadMut.mutate()} disabled={reloadMut.isPending}>
+            <Button variant="secondary" size="sm" onClick={handleReload} disabled={reloadMut.isPending}>
               {t("channels.reload", { defaultValue: "Reload" })}
             </Button>
             <div className="hidden rounded-full border border-border-subtle bg-surface px-3 py-1.5 text-[10px] font-bold uppercase text-text-dim sm:block">
@@ -792,7 +798,7 @@ export function ChannelsPage() {
       </div>
 
       {channelsQuery.isLoading ? (
-        <div className={viewMode === "grid" ? "grid gap-4 md:grid-cols-2 xl:grid-cols-3" : "flex flex-col gap-2"}>
+        <div className={viewMode === "grid" ? "grid gap-4 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 3xl:grid-cols-5 4xl:grid-cols-6" : "flex flex-col gap-2"}>
           {[1, 2, 3].map((i) => <CardSkeleton key={i} />)}
         </div>
       ) : channels.length === 0 ? (
@@ -815,7 +821,7 @@ export function ChannelsPage() {
             )}
           </div>
 
-          <div className={viewMode === "grid" ? "grid gap-4 md:grid-cols-2 xl:grid-cols-3" : "flex flex-col gap-2"}>
+          <div className={viewMode === "grid" ? "grid gap-4 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 3xl:grid-cols-5 4xl:grid-cols-6" : "flex flex-col gap-2"}>
             {paginatedChannels.map((c) => (
               <ChannelCard
                 key={c.name}
@@ -846,7 +852,7 @@ export function ChannelsPage() {
               setConfiguringChannel(ch);
             }
           }}
-          onTest={() => testMut.mutate(detailsChannel.name)}
+          onTest={() => handleTest(detailsChannel.name)}
           t={t}
         />
       )}

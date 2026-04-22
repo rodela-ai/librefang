@@ -75,6 +75,8 @@ pub struct MediaConfig {
     pub image_provider: Option<String>,
     /// Preferred audio transcription provider (auto-detect if None).
     pub audio_provider: Option<String>,
+    /// Preferred audio transcription model (provider default if None).
+    pub audio_model: Option<String>,
 }
 
 impl Default for MediaConfig {
@@ -86,6 +88,7 @@ impl Default for MediaConfig {
             max_concurrency: 2,
             image_provider: None,
             audio_provider: None,
+            audio_model: None,
         }
     }
 }
@@ -145,14 +148,26 @@ pub const ALLOWED_AUDIO_TYPES: &[&str] = &[
 /// Allowed video MIME types.
 pub const ALLOWED_VIDEO_TYPES: &[&str] = &["video/mp4", "video/quicktime", "video/webm"];
 
+/// Extract the bare `type/subtype` from a MIME string, discarding parameters
+/// and whitespace (RFC 2045). E.g. `"audio/ogg; codecs=opus"` → `"audio/ogg"`.
+pub fn mime_base(mime: &str) -> String {
+    mime.split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase()
+}
+
 impl MediaAttachment {
     /// Validate the attachment against security constraints.
     pub fn validate(&self) -> Result<(), String> {
-        // Check MIME type allowlist
+        // Check MIME type allowlist — normalize to bare type/subtype so that
+        // values like `audio/ogg; codecs=opus` (from WhatsApp) match the allowlist.
+        let base = mime_base(&self.mime_type);
         let allowed = match self.media_type {
-            MediaType::Image => ALLOWED_IMAGE_TYPES.contains(&self.mime_type.as_str()),
-            MediaType::Audio => ALLOWED_AUDIO_TYPES.contains(&self.mime_type.as_str()),
-            MediaType::Video => ALLOWED_VIDEO_TYPES.contains(&self.mime_type.as_str()),
+            MediaType::Image => ALLOWED_IMAGE_TYPES.contains(&base.as_str()),
+            MediaType::Audio => ALLOWED_AUDIO_TYPES.contains(&base.as_str()),
+            MediaType::Video => ALLOWED_VIDEO_TYPES.contains(&base.as_str()),
         };
         if !allowed {
             return Err(format!(
@@ -728,6 +743,33 @@ mod tests {
             mime_type: "image/png".to_string(),
             source: MediaSource::FilePath {
                 path: "test.png".to_string(),
+            },
+            size_bytes: 1024,
+        };
+        assert!(a.validate().is_ok());
+    }
+
+    #[test]
+    fn test_attachment_validate_mime_with_parameters() {
+        // WhatsApp voice notes arrive as `audio/ogg; codecs=opus`.
+        // The allowlist stores the bare `audio/ogg`, so validation must
+        // normalize parameters away before comparing.
+        let a = MediaAttachment {
+            media_type: MediaType::Audio,
+            mime_type: "audio/ogg; codecs=opus".to_string(),
+            source: MediaSource::FilePath {
+                path: "voice.ogg".to_string(),
+            },
+            size_bytes: 1024,
+        };
+        assert!(a.validate().is_ok());
+
+        // Uppercase type/subtype and spacing must also work.
+        let a = MediaAttachment {
+            media_type: MediaType::Audio,
+            mime_type: "Audio/OGG ;codecs=opus".to_string(),
+            source: MediaSource::FilePath {
+                path: "voice.ogg".to_string(),
             },
             size_bytes: 1024,
         };

@@ -1,10 +1,19 @@
 # LibreFang — Agent Instructions
 
 ## Project Overview
-LibreFang is an open-source Agent Operating System written in Rust (14 crates).
+LibreFang is an open-source Agent Operating System written in Rust (24 crates in `crates/`, plus `xtask/`).
 - Config: `~/.librefang/config.toml`
 - Default API: `http://127.0.0.1:4545`
 - CLI binary: `target/release/librefang.exe` (or `target/debug/librefang.exe`)
+
+### Crate map
+- **Core types & utilities**: `librefang-types`, `librefang-http`, `librefang-wire`, `librefang-telemetry`, `librefang-testing`, `librefang-migrate`
+- **Kernel**: `librefang-kernel` (orchestration), `librefang-kernel-handle` (trait used by runtime to call kernel without circular dep), `librefang-kernel-router`, `librefang-kernel-metering`
+- **Runtime**: `librefang-runtime` (agent loop, tools, plugins), `librefang-runtime-mcp`, `librefang-runtime-oauth`, `librefang-runtime-wasm`
+- **LLM drivers**: `librefang-llm-driver` (trait + error types — interface only) and `librefang-llm-drivers` (concrete provider impls: anthropic, openai, gemini, …)
+- **Memory**: `librefang-memory` (SQLite substrate)
+- **Surface**: `librefang-api` (HTTP server + dashboard SPA bundled at `crates/librefang-api/dashboard/`), `librefang-cli`, `librefang-desktop`
+- **Extensibility**: `librefang-skills`, `librefang-hands`, `librefang-extensions`, `librefang-channels`
 
 ## Build & Verify Workflow
 After every feature implementation, run ALL THREE checks:
@@ -101,6 +110,7 @@ taskkill //PID <pid> //F
 | `/api/budget/agents/{id}` | GET | Single agent budget detail |
 | `/api/network/status` | GET | OFP network status |
 | `/api/peers` | GET | Connected OFP peers |
+| `/api/skills/{name}` | GET | Skill detail with evolution history |
 | `/api/a2a/agents` | GET | External A2A agents |
 | `/api/a2a/discover` | POST | Discover A2A agent at URL |
 | `/api/a2a/send` | POST | Send task to external A2A agent |
@@ -112,17 +122,27 @@ taskkill //PID <pid> //F
 | `/api/approvals/totp` | DELETE | Revoke TOTP enrollment |
 
 ## Architecture Notes
-- **Don't touch `librefang-cli`** — user is actively building the interactive CLI
 - `KernelHandle` trait avoids circular deps between runtime and kernel
 - `AppState` in `server.rs` bridges kernel to API routes
 - New routes must be registered in `server.rs` router AND implemented in `routes.rs`
-- Dashboard is Alpine.js SPA in `static/index_body.html` — new tabs need both HTML and JS data/methods
+- Dashboard is React+TanStack Query SPA (not Alpine.js) in `crates/librefang-api/dashboard/`
+- **Dashboard data layer rule**: all API access in pages/components MUST go through hooks in `src/lib/queries/` and `src/lib/mutations/`. No `fetch()` or `api.*` calls inline in pages/components. Adding a new endpoint = add a query/mutation hook in the matching domain file, then import it. See `crates/librefang-api/dashboard/AGENTS.md` for details
+- **Dashboard query keys**: always use the factories in `src/lib/queries/keys.ts`. Never inline `["foo","bar"]` arrays. Every factory must be hierarchical (`all` / `lists()` / `list(filters)` / `details()` / `detail(id)`) so `invalidateQueries({ queryKey: xxxKeys.all })` invalidates the whole domain
+- **Dashboard mutations**: each mutation with side-effects must call `invalidateQueries` with factory keys in `onSuccess` (or `onSettled`). Colocate invalidation with the mutation hook, not at call sites
 - Config fields need: struct field + `#[serde(default)]` + Default impl entry + Serialize/Deserialize derives
+- **Trait injection pattern**: When runtime needs functionality from extensions/kernel, define a trait in runtime and implement it in kernel (e.g., `McpOAuthProvider`). Never make runtime depend on extensions (circular dep).
+- **Auth middleware allowlist**: Unauthenticated endpoints must be added to the `is_public` allowlist in `middleware.rs` — NOT by reordering routes in `server.rs`. The auth layer applies to all routes.
+- **Docker callback URLs**: Never bind ephemeral localhost ports for OAuth callbacks in daemon code — the port is unreachable from outside Docker. Route callbacks through the API server's existing port instead.
+- **MCP OAuth flow**: Entirely UI-driven — daemon only detects 401 and sets `NeedsAuth` state. PKCE + callback handled by API layer (`routes/mcp_auth.rs`). Dynamic Client Registration (RFC 7591) used when server has `registration_endpoint` but no `client_id`.
+- `session_mode` in `AgentManifest` (agent.toml, **not** config.toml) controls whether automated invocations reuse the persistent session (`"persistent"`, default) or create a fresh one (`"new"`). Per-trigger override via `Trigger.session_mode: Option<SessionMode>`. Resolution order: per-trigger override > agent manifest default. Session resolution in `execute_llm_agent` (`kernel/mod.rs` ~5346).
+  - **Honors `session_mode`**: event triggers, `agent_send`.
+  - **Ignores `session_mode`**: channel messages (always `SessionId::for_channel(agent,"<channel>:<chat>")`), **cron jobs** (synthesize `SenderContext{channel:"cron"}` at `kernel/mod.rs` ~8867, which takes the channel branch before `session_mode` is consulted — all cron fires for an agent share one `(agent,"cron")` session), forks (forced `Persistent` at ~4111 to preserve prompt cache).
+  - When creating a trigger or cron, consciously pick: persistent (continuity, cache reuse) vs new (isolation). Don't rely on `session_mode` for per-fire fresh cron sessions — it won't work without dispatcher changes.
 
 ## Git Conventions
 **Never include "generated by Claude Code" in commit messages** — omit the Co-Authored-By footer entirely
 - **Format**: Use conventional commits (`feat:`, `fix:`, `docs:`, `refactor:`, `chore:`, `ci:`, `perf:`, `test:`)
-- **Worktree**: Use `git worktree add` under `/tmp/` for new features (e.g. `/tmp/librefang-<feature>`), never develop on the main worktree
+- **Worktree**: Use `git worktree add` on an external disk for new features; fall back to `/tmp/librefang-<feature>` only if no external disk is available. Never develop on the main worktree
 
 ## Common Gotchas
 - `librefang.exe` may be locked if daemon is running — use `--lib` flag or kill daemon first
@@ -130,4 +150,8 @@ taskkill //PID <pid> //F
 - Config fields added to `KernelConfig` struct MUST also be added to the `Default` impl or build fails
 - `AgentLoopResult` field is `.response` not `.response_text`
 - CLI command to start daemon is `start` not `daemon`
+- When adding `Option<Arc<dyn Trait>>` fields to structs that derive `Serialize`/`Deserialize`/`Clone`/`Debug`, mark them `#[serde(skip)]` and implement the affected traits manually
+- `ErrorTranslator` (from `RequestLanguage`) is `!Send` — any `.await` must happen AFTER `drop(t)`, or the axum handler will fail with a cryptic `Handler<_, _>` trait bound error
+- `LIBREFANG_VAULT_KEY` env var must base64-decode to exactly 32 bytes (use `openssl rand -base64 32` which gives 44 chars). 32 ASCII chars ≠ 32 bytes.
+- When parallel agents modify the same crate, `Option::None` defaults for new fields will silently compile but disable features. Always write integration tests at the injection site, not just the implementation site.
 - On Windows: use `taskkill //PID <pid> //F` (double slashes in MSYS2/Git Bash)

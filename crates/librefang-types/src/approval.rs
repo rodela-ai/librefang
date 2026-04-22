@@ -47,18 +47,36 @@ const MAX_CHANNEL_RULE_TOOLS: usize = 50;
 // SecondFactor
 // ---------------------------------------------------------------------------
 
-/// Second-factor verification method for critical tool approvals.
+/// Second-factor verification scope.
 ///
-/// When set to `Totp`, approvals require a valid TOTP code from an
-/// authenticator app in addition to the normal approve action.
+/// Controls where TOTP verification is enforced:
+/// - `Totp` = approvals only (backward-compatible default when TOTP is enabled)
+/// - `Login` = dashboard login only
+/// - `Both` = approvals + dashboard login
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SecondFactor {
     /// No second factor required (default).
     #[default]
     None,
-    /// TOTP (RFC 6238) verification via authenticator app.
+    /// TOTP required for tool approvals only.
     Totp,
+    /// TOTP required for dashboard login only.
+    Login,
+    /// TOTP required for both approvals and dashboard login.
+    Both,
+}
+
+impl SecondFactor {
+    /// Whether TOTP is required for dashboard login.
+    pub fn requires_login_totp(self) -> bool {
+        matches!(self, SecondFactor::Login | SecondFactor::Both)
+    }
+
+    /// Whether TOTP is required for tool approvals.
+    pub fn requires_approval_totp(self) -> bool {
+        matches!(self, SecondFactor::Totp | SecondFactor::Both)
+    }
 }
 
 /// Maximum TOTP grace period in seconds (1 hour).
@@ -273,6 +291,13 @@ pub struct ApprovalRequest {
     /// Number of times this request has been escalated (max 3).
     #[serde(default)]
     pub escalation_count: u8,
+    /// Session ID that submitted this request (for per-session queue operations).
+    ///
+    /// When set, `resolve_all_for_session` can resolve all pending requests
+    /// belonging to this session atomically (mirrors Hermes-Agent's
+    /// `resolve_gateway_approval(session_key, choice, resolve_all=True)`).
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl ApprovalRequest {
@@ -596,6 +621,16 @@ impl Default for ApprovalPolicy {
                 "file_write".to_string(),
                 "file_delete".to_string(),
                 "apply_patch".to_string(),
+                // Skill evolution tools write to `~/.librefang/skills/`
+                // (create/update/patch/delete) and to supporting files
+                // inside each skill (write_file/remove_file). Every
+                // call is a persistent filesystem mutation equivalent
+                // in blast radius to `file_write`/`file_delete`, so
+                // the default policy MUST gate them the same way.
+                // Without the glob, agents could mutate skills without
+                // hitting the human approval / TOTP flow that the
+                // equivalent low-level tools require.
+                "skill_evolve_*".to_string(),
             ],
             timeout_secs: 60,
             auto_approve_autonomous: false,
@@ -622,7 +657,7 @@ fn default_totp_grace_period() -> u64 {
 
 /// Custom deserializer that accepts:
 /// - A list of strings: `["shell_exec", "file_write"]`
-/// - A boolean: `false` → `[]`, `true` → `["shell_exec", "file_write", "file_delete", "apply_patch"]`
+/// - A boolean: `false` → `[]`, `true` → the default mutation set
 fn deserialize_require_approval<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -640,11 +675,15 @@ where
 
         fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
             Ok(if v {
+                // Must stay in lockstep with `ApprovalPolicy::default`
+                // above — the boolean `true` shorthand should expand to
+                // the same set a freshly-defaulted policy ships with.
                 vec![
                     "shell_exec".to_string(),
                     "file_write".to_string(),
                     "file_delete".to_string(),
                     "apply_patch".to_string(),
+                    "skill_evolve_*".to_string(),
                 ]
             } else {
                 vec![]
@@ -676,7 +715,7 @@ impl ApprovalPolicy {
     /// Returns `true` if `second_factor` is `Totp` AND (totp_tools is empty
     /// OR the tool matches a pattern in totp_tools).
     pub fn tool_requires_totp(&self, tool_name: &str) -> bool {
-        if self.second_factor != SecondFactor::Totp {
+        if !self.second_factor.requires_approval_totp() {
             return false;
         }
         if self.totp_tools.is_empty() {
@@ -768,8 +807,8 @@ impl ApprovalPolicy {
         }
 
         // -- totp_issuer --
-        if self.second_factor == SecondFactor::Totp && self.totp_issuer.is_empty() {
-            return Err("totp_issuer must not be empty when second_factor is totp".into());
+        if self.second_factor != SecondFactor::None && self.totp_issuer.is_empty() {
+            return Err("totp_issuer must not be empty when second_factor is enabled".into());
         }
 
         Ok(())
@@ -800,6 +839,7 @@ mod tests {
             channel: None,
             route_to: Vec::new(),
             escalation_count: 0,
+            session_id: None,
         }
     }
 
@@ -1081,7 +1121,13 @@ mod tests {
         assert!(policy.validate().is_ok());
         assert_eq!(
             policy.require_approval,
-            vec!["shell_exec", "file_write", "file_delete", "apply_patch"]
+            vec![
+                "shell_exec",
+                "file_write",
+                "file_delete",
+                "apply_patch",
+                "skill_evolve_*",
+            ]
         );
         assert_eq!(policy.timeout_secs, 60);
         assert!(!policy.auto_approve_autonomous);
@@ -1096,7 +1142,13 @@ mod tests {
         assert_eq!(policy.timeout_secs, 60);
         assert_eq!(
             policy.require_approval,
-            vec!["shell_exec", "file_write", "file_delete", "apply_patch"]
+            vec![
+                "shell_exec",
+                "file_write",
+                "file_delete",
+                "apply_patch",
+                "skill_evolve_*",
+            ]
         );
         assert!(!policy.auto_approve_autonomous);
     }
@@ -1115,7 +1167,13 @@ mod tests {
         let policy: ApprovalPolicy = serde_json::from_str(r#"{"require_approval": true}"#).unwrap();
         assert_eq!(
             policy.require_approval,
-            vec!["shell_exec", "file_write", "file_delete", "apply_patch"]
+            vec![
+                "shell_exec",
+                "file_write",
+                "file_delete",
+                "apply_patch",
+                "skill_evolve_*",
+            ]
         );
     }
 

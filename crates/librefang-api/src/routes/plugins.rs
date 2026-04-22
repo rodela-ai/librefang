@@ -654,6 +654,10 @@ pub async fn list_plugin_registries(State(state): State<Arc<AppState>>) -> impl 
                     serde_json::json!({
                         "name": e.name,
                         "installed": installed_names.contains(&e.name),
+                        "version": e.version,
+                        "description": e.description,
+                        "author": e.author,
+                        "hooks": e.hooks,
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -1271,8 +1275,7 @@ pub async fn context_engine_metrics_prometheus(
             "librefang_hook_latency_ms_total{{plugin=\"{}\",hook=\"{}\"}} {}\n",
             plugin_label, hook, stats.total_ms
         ));
-        if stats.calls > 0 {
-            let avg = stats.total_ms / stats.calls;
+        if let Some(avg) = stats.total_ms.checked_div(stats.calls) {
             output.push_str(&format!(
                 "librefang_hook_latency_ms_avg{{plugin=\"{}\",hook=\"{}\"}} {}\n",
                 plugin_label, hook, avg
@@ -1970,8 +1973,8 @@ pub async fn context_engine_metrics_summary(
                 "successes": successes,
                 "failures": failures,
                 "total_ms": ms,
-                "avg_ms": if calls > 0 { ms / calls } else { 0 },
-                "error_rate_pct": if calls > 0 { (failures * 100) / calls } else { 0 },
+                "avg_ms": ms.checked_div(calls).unwrap_or(0),
+                "error_rate_pct": (failures * 100).checked_div(calls).unwrap_or(0),
             });
             (name.to_string(), v)
         })
@@ -1983,12 +1986,10 @@ pub async fn context_engine_metrics_summary(
             "calls": total_calls,
             "failures": total_failures,
             "total_ms": total_ms,
-            "avg_ms": if total_calls > 0 { total_ms / total_calls } else { 0 },
-            "error_rate_pct": if total_calls > 0 {
-                (total_failures * 100) / total_calls
-            } else {
-                0
-            },
+            "avg_ms": total_ms.checked_div(total_calls).unwrap_or(0),
+            "error_rate_pct": (total_failures * 100)
+                .checked_div(total_calls)
+                .unwrap_or(0),
         },
     }))
     .into_response()
@@ -2451,7 +2452,7 @@ pub async fn plugin_health(
                     } else {
                         0.0
                     };
-                    let avg_elapsed_ms = if calls > 0 { total_ms / calls } else { 0 };
+                    let avg_elapsed_ms = total_ms.checked_div(calls).unwrap_or(0);
                     serde_json::json!({
                         "calls": calls,
                         "errors": failures,

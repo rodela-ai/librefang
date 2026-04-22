@@ -95,6 +95,190 @@ fn check_taint_net_fetch(url: &str) -> Option<String> {
     None
 }
 
+/// Check if a free-form string carries an obvious secret shape. Used by
+/// exfiltration sinks that don't have a URL query-string structure to
+/// parse — `web_fetch` request bodies, `agent_send` message payloads,
+/// and (via shared helper) outbound channel / webhook bodies.
+///
+/// The check is a best-effort denylist: it trips when the text contains
+/// an `<assignment-style-key>=<value>` fragment using one of the common
+/// secret parameter names (`api_key`, `token`, `secret`, `password`,
+/// …), or when it carries an `Authorization:` header prefix, or when it
+/// looks like a long contiguous token (e.g. a raw bearer token dropped
+/// in as the whole body). Hits are wrapped in a `TaintedValue` and run
+/// through the given sink so the rejection message stays consistent
+/// with the URL-side checks.
+///
+/// This is the same "two-sink pattern match" shape described in the
+/// SECURITY.md taint section — it is **not** a full information-flow
+/// tracker, and copy-pasted obfuscation will still bypass it. The goal
+/// is to catch the obvious "the LLM is stuffing OPENAI_API_KEY into an
+/// agent_send" shape on the way out, not to prove a data-flow theorem.
+const SECRET_KEYS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "api-key",
+    "authorization",
+    "proxy-authorization",
+    "access_token",
+    "refresh_token",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "bearer",
+    "x-api-key",
+];
+
+/// Header names whose mere presence implies the value is a credential,
+/// regardless of what the value looks like. `Authorization: Bearer sk-…`
+/// has a space between the scheme and the token, which would otherwise
+/// defeat the contiguous-token heuristic in `check_taint_outbound_text`.
+const SECRET_HEADER_NAMES: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "apikey",
+    "x-auth-token",
+    "cookie",
+    "set-cookie",
+];
+
+/// Check if an HTTP header (name + value) should be blocked. Headers
+/// whose name identifies them as credential carriers are rejected
+/// unconditionally; everything else falls through to the text-level
+/// scanner used for bodies.
+fn check_taint_outbound_header(name: &str, value: &str, sink: &TaintSink) -> Option<String> {
+    let name_lower = name.to_ascii_lowercase();
+    if SECRET_HEADER_NAMES.iter().any(|h| *h == name_lower)
+        || SECRET_KEYS.iter().any(|k| *k == name_lower)
+    {
+        let mut labels = HashSet::new();
+        labels.insert(TaintLabel::Secret);
+        let tainted = TaintedValue::new(value, labels, "llm_tool_call");
+        if let Err(violation) = tainted.check_sink(sink) {
+            warn!(
+                sink = %sink.name,
+                header = %name_lower,
+                value_len = value.len(),
+                %violation,
+                "Outbound taint check failed (credential header)"
+            );
+            return Some(violation.to_string());
+        }
+    }
+    // Fall through to the regular body-level scan so e.g. a custom
+    // `X-Forwarded-Debug: api_key=sk-…` still gets caught.
+    check_taint_outbound_text(value, sink)
+}
+
+/// Decide whether a contiguous string "smells like" a raw secret token.
+/// Returns false for pure-hex / pure-decimal / single-case alnum blobs
+/// so that git commit SHAs, UUIDs-without-dashes, and sha256 digests —
+/// which agents legitimately exchange — don't trip the filter. Genuine
+/// API tokens tend to include mixed case and/or punctuation
+/// (`sk-…`, `ghp_…`, base64 with `+/=`).
+fn looks_like_opaque_token(trimmed: &str) -> bool {
+    if trimmed.len() < 32 || trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let charset_ok = trimmed.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || c == '-'
+            || c == '_'
+            || c == '.'
+            || c == '/'
+            || c == '+'
+            || c == '='
+    });
+    if !charset_ok {
+        return false;
+    }
+    // Require mixed character classes: either (a) at least one
+    // uppercase AND one lowercase letter, or (b) at least one of the
+    // token-ish punctuation characters. Pure hex (git SHAs, sha256),
+    // pure decimal, and pure single-case alphanumeric all fail this.
+    let has_upper = trimmed.chars().any(|c| c.is_ascii_uppercase());
+    let has_lower = trimmed.chars().any(|c| c.is_ascii_lowercase());
+    let has_punct = trimmed
+        .chars()
+        .any(|c| matches!(c, '-' | '_' | '.' | '/' | '+' | '='));
+    (has_upper && has_lower) || has_punct
+}
+
+fn check_taint_outbound_text(payload: &str, sink: &TaintSink) -> Option<String> {
+    let lower = payload.to_lowercase();
+
+    // Fast path 1: `Authorization:` header literal — unambiguous
+    // signal that the LLM is trying to ship credentials in-band.
+    let mut hit = lower.contains("authorization:");
+
+    // Fast path 2: `key=value` / `key: value` / `key":` / `'key':`
+    // shapes. We match on the key name plus one of a handful of
+    // assignment separators so plain prose ("a token of appreciation")
+    // doesn't trip the filter.
+    if !hit {
+        let normalized = lower
+            .replace(" = ", "=")
+            .replace(" =", "=")
+            .replace("= ", "=")
+            .replace(" : ", ":")
+            .replace(" :", ":")
+            .replace(": ", ":");
+        for k in SECRET_KEYS {
+            for sep in ["=", ":", "\":", "':"] {
+                if normalized.contains(&format!("{k}{sep}")) {
+                    hit = true;
+                    break;
+                }
+            }
+            if hit {
+                break;
+            }
+        }
+    }
+
+    // Fast path 3: the payload *is* a long opaque token. Covers the
+    // case where the LLM shoves a raw credential into the message
+    // without any key/value framing. Matches conservatively — long
+    // strings with only base64/hex characters and no whitespace, so
+    // natural-language messages don't false-positive. Well-known
+    // prefixes (`sk-`, `ghp_`, `xoxp-`) are also flagged regardless
+    // of length.
+    if !hit {
+        let trimmed = payload.trim();
+        let well_known_prefix = trimmed.starts_with("sk-")
+            || trimmed.starts_with("ghp_")
+            || trimmed.starts_with("github_pat_")
+            || trimmed.starts_with("xoxp-")
+            || trimmed.starts_with("xoxb-")
+            || trimmed.starts_with("AKIA")
+            || trimmed.starts_with("AIza");
+        if looks_like_opaque_token(trimmed) || well_known_prefix {
+            hit = true;
+        }
+    }
+
+    if hit {
+        let mut labels = HashSet::new();
+        labels.insert(TaintLabel::Secret);
+        let tainted = TaintedValue::new(payload, labels, "llm_tool_call");
+        if let Err(violation) = tainted.check_sink(sink) {
+            // Never log the payload itself: if the heuristic fired, the
+            // payload IS the secret we are trying to contain.
+            warn!(
+                sink = %sink.name,
+                payload_len = payload.len(),
+                %violation,
+                "Outbound taint check failed"
+            );
+            return Some(violation.to_string());
+        }
+    }
+    None
+}
+
 tokio::task_local! {
     /// Tracks the current inter-agent call depth within a task.
     static AGENT_CALL_DEPTH: std::cell::Cell<u32>;
@@ -120,6 +304,8 @@ pub struct ToolExecContext<'a> {
     pub allowed_tools: Option<&'a [String]>,
     pub caller_agent_id: Option<&'a str>,
     pub skill_registry: Option<&'a SkillRegistry>,
+    /// Skill allowlist for the calling agent. Empty slice = all skills allowed.
+    pub allowed_skills: Option<&'a [String]>,
     pub mcp_connections: Option<&'a tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
     pub web_ctx: Option<&'a WebToolsContext>,
     pub browser_ctx: Option<&'a crate::browser::BrowserManager>,
@@ -131,9 +317,25 @@ pub struct ToolExecContext<'a> {
     pub tts_engine: Option<&'a crate::tts::TtsEngine>,
     pub docker_config: Option<&'a librefang_types::config::DockerSandboxConfig>,
     pub process_manager: Option<&'a crate::process_manager::ProcessManager>,
+    /// Background process registry — tracks fire-and-forget processes spawned by
+    /// `shell_exec` with a rolling 200 KB output buffer.
+    pub process_registry: Option<&'a crate::process_registry::ProcessRegistry>,
     pub sender_id: Option<&'a str>,
     pub channel: Option<&'a str>,
     pub chat_id: Option<&'a str>,
+    /// Optional checkpoint manager.  When `Some`, a snapshot is taken
+    /// automatically before every `file_write` and `apply_patch` call.
+    /// Snapshot failures are non-fatal (logged as warnings only).
+    pub checkpoint_manager: Option<&'a Arc<crate::checkpoint_manager::CheckpointManager>>,
+    /// Per-session interrupt handle.  Tools MAY poll `interrupt.is_cancelled()`
+    /// at natural checkpoints to exit early when the user stops the session.
+    /// `None` means no interrupt support was wired up for this call site (legacy
+    /// paths) — tools must treat `None` the same as "not cancelled".
+    pub interrupt: Option<crate::interrupt::SessionInterrupt>,
+    /// Session-scoped dangerous command checker. When `Some`, the session allowlist
+    /// is preserved across tool calls so previously-approved patterns are not re-blocked.
+    pub dangerous_command_checker:
+        Option<&'a Arc<tokio::sync::RwLock<crate::dangerous_command::DangerousCommandChecker>>>,
 }
 
 /// Execute a tool without running the approval / capability / taint gate.
@@ -154,6 +356,7 @@ pub async fn execute_tool_raw(
         allowed_tools,
         caller_agent_id,
         skill_registry,
+        allowed_skills,
         mcp_connections,
         web_ctx,
         browser_ctx,
@@ -165,17 +368,27 @@ pub async fn execute_tool_raw(
         tts_engine,
         docker_config,
         process_manager,
+        process_registry: _,
         sender_id,
         channel,
         chat_id,
+        checkpoint_manager,
+        interrupt,
+        dangerous_command_checker,
     } = ctx;
 
     let result = match tool_name {
         // Filesystem tools
         "file_read" => tool_file_read(input, *workspace_root).await,
-        "file_write" => tool_file_write(input, *workspace_root).await,
+        "file_write" => {
+            maybe_snapshot(checkpoint_manager, *workspace_root, "pre file_write").await;
+            tool_file_write(input, *workspace_root).await
+        }
         "file_list" => tool_file_list(input, *workspace_root).await,
-        "apply_patch" => tool_apply_patch(input, *workspace_root).await,
+        "apply_patch" => {
+            maybe_snapshot(checkpoint_manager, *workspace_root, "pre apply_patch").await;
+            tool_apply_patch(input, *workspace_root).await
+        }
 
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
         "web_fetch" => match input["url"].as_str() {
@@ -193,6 +406,40 @@ pub async fn execute_tool_raw(
                 let method = input["method"].as_str().unwrap_or("GET");
                 let headers = input.get("headers").and_then(|v| v.as_object());
                 let body = input["body"].as_str();
+                // Body-side taint check: the URL scan handles query
+                // strings, but POST/PUT callers can stuff credentials
+                // into the request body instead.
+                if let Some(body_text) = body {
+                    if let Some(violation) =
+                        check_taint_outbound_text(body_text, &TaintSink::net_fetch())
+                    {
+                        return ToolResult {
+                            tool_use_id: tool_use_id.to_string(),
+                            content: format!("Taint violation: {violation}"),
+                            is_error: true,
+                            ..Default::default()
+                        };
+                    }
+                }
+                // Header values, too — an LLM that knows the filter
+                // blocks `body` might fall back to stuffing the token
+                // into `Authorization:` via `headers`.
+                if let Some(headers_map) = headers {
+                    for (name, value) in headers_map {
+                        if let Some(vs) = value.as_str() {
+                            if let Some(violation) =
+                                check_taint_outbound_header(name, vs, &TaintSink::net_fetch())
+                            {
+                                return ToolResult {
+                                    tool_use_id: tool_use_id.to_string(),
+                                    content: format!("Taint violation: {violation}"),
+                                    is_error: true,
+                                    ..Default::default()
+                                };
+                            }
+                        }
+                    }
+                }
                 if let Some(ctx) = web_ctx {
                     ctx.fetch
                         .fetch_with_options(url, method, headers, body)
@@ -275,6 +522,45 @@ pub async fn execute_tool_raw(
                     };
                 }
             }
+
+            // Dangerous command detection gate.
+            //
+            // Runs in Manual mode for all exec policies (including Full) because
+            // even explicitly-trusted agents should not silently execute commands
+            // like `rm -rf /` or fork bombs.
+            //
+            // In Manual mode a Dangerous result causes an immediate block with a
+            // descriptive error. The agent can route approval via the existing
+            // `submit_tool_approval` path by catching the error message and
+            // re-submitting after the user has explicitly allowed the pattern.
+            {
+                use crate::dangerous_command::{
+                    ApprovalMode, CheckResult, DangerousCommandChecker,
+                };
+                let check_result = if let Some(checker_arc) = dangerous_command_checker {
+                    checker_arc.read().await.check(command)
+                } else {
+                    DangerousCommandChecker::new(ApprovalMode::Manual).check(command)
+                };
+                if let CheckResult::Dangerous { description } = check_result {
+                    warn!(
+                        command = crate::str_utils::safe_truncate_str(command, 120),
+                        description, "Dangerous command detected — blocking execution"
+                    );
+                    return ToolResult {
+                        tool_use_id: tool_use_id.to_string(),
+                        content: format!(
+                            "shell_exec blocked: dangerous command detected ({description}). \
+                             The command matches a known-dangerous pattern and has been blocked \
+                             for safety. If you need to run this command, request explicit user \
+                             approval first."
+                        ),
+                        is_error: true,
+                        ..Default::default()
+                    };
+                }
+            }
+
             let effective_allowed_env_vars = allowed_env_vars.or_else(|| {
                 exec_policy.and_then(|policy| {
                     if policy.allowed_env_vars.is_empty() {
@@ -289,6 +575,7 @@ pub async fn execute_tool_raw(
                 effective_allowed_env_vars.unwrap_or(&[]),
                 *workspace_root,
                 *exec_policy,
+                interrupt.clone(),
             )
             .await
         }
@@ -311,7 +598,7 @@ pub async fn execute_tool_raw(
         "agent_find" => tool_agent_find(input, *kernel),
         "task_post" => tool_task_post(input, *kernel, *caller_agent_id).await,
         "task_claim" => tool_task_claim(*kernel, *caller_agent_id).await,
-        "task_complete" => tool_task_complete(input, *kernel).await,
+        "task_complete" => tool_task_complete(input, *kernel, *caller_agent_id).await,
         "task_list" => tool_task_list(input, *kernel).await,
         "event_publish" => tool_event_publish(input, *kernel).await,
 
@@ -356,6 +643,26 @@ pub async fn execute_tool_raw(
 
         // System time tool
         "system_time" => Ok(tool_system_time()),
+
+        // Skill file read tool
+        "skill_read_file" => tool_skill_read_file(input, *skill_registry, *allowed_skills).await,
+
+        // Skill evolution tools
+        "skill_evolve_create" => {
+            tool_skill_evolve_create(input, *skill_registry, *caller_agent_id).await
+        }
+        "skill_evolve_update" => {
+            tool_skill_evolve_update(input, *skill_registry, *caller_agent_id).await
+        }
+        "skill_evolve_patch" => {
+            tool_skill_evolve_patch(input, *skill_registry, *caller_agent_id).await
+        }
+        "skill_evolve_delete" => tool_skill_evolve_delete(input, *skill_registry).await,
+        "skill_evolve_rollback" => {
+            tool_skill_evolve_rollback(input, *skill_registry, *caller_agent_id).await
+        }
+        "skill_evolve_write_file" => tool_skill_evolve_write_file(input, *skill_registry).await,
+        "skill_evolve_remove_file" => tool_skill_evolve_remove_file(input, *skill_registry).await,
 
         // Cron scheduling tools
         "cron_create" => {
@@ -555,6 +862,7 @@ pub async fn execute_tool_raw(
             else if let Some(registry) = skill_registry {
                 if let Some(skill) = registry.find_tool_provider(other) {
                     debug!(tool = other, skill = %skill.manifest.skill.name, "Dispatching to skill");
+                    let skill_dir = skill.path.clone();
                     match librefang_skills::loader::execute_skill_tool(
                         &skill.manifest,
                         &skill.path,
@@ -569,6 +877,14 @@ pub async fn execute_tool_raw(
                             if skill_result.is_error {
                                 Err(content)
                             } else {
+                                // Fire-and-forget usage increment on success.
+                                tokio::task::spawn_blocking(move || {
+                                    if let Err(e) =
+                                        librefang_skills::evolution::record_skill_usage(&skill_dir)
+                                    {
+                                        tracing::debug!(error = %e, dir = %skill_dir.display(), "record_skill_usage failed");
+                                    }
+                                });
                                 Ok(content)
                             }
                         }
@@ -616,6 +932,7 @@ pub async fn execute_tool(
     allowed_tools: Option<&[String]>,
     caller_agent_id: Option<&str>,
     skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
     mcp_connections: Option<&tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
     web_ctx: Option<&WebToolsContext>,
     browser_ctx: Option<&crate::browser::BrowserManager>,
@@ -627,9 +944,16 @@ pub async fn execute_tool(
     tts_engine: Option<&crate::tts::TtsEngine>,
     docker_config: Option<&librefang_types::config::DockerSandboxConfig>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    process_registry: Option<&crate::process_registry::ProcessRegistry>,
     sender_id: Option<&str>,
     channel: Option<&str>,
     chat_id: Option<&str>,
+    checkpoint_manager: Option<&Arc<crate::checkpoint_manager::CheckpointManager>>,
+    interrupt: Option<crate::interrupt::SessionInterrupt>,
+    session_id: Option<&str>,
+    dangerous_command_checker: Option<
+        &Arc<tokio::sync::RwLock<crate::dangerous_command::DangerousCommandChecker>>,
+    >,
 ) -> ToolResult {
     // Normalize the tool name through compat mappings so LLM-hallucinated aliases
     // (e.g. "fs-write" → "file_write") resolve to the canonical LibreFang name.
@@ -705,7 +1029,7 @@ pub async fn execute_tool(
                 workspace_root: workspace_root.map(|p| p.to_path_buf()),
             };
             match kh
-                .submit_tool_approval(agent_id_str, tool_name, &summary, deferred)
+                .submit_tool_approval(agent_id_str, tool_name, &summary, deferred, session_id)
                 .await
             {
                 Ok(librefang_types::tool::ToolApprovalSubmission::Pending { request_id }) => {
@@ -759,6 +1083,7 @@ pub async fn execute_tool(
         allowed_tools,
         caller_agent_id,
         skill_registry,
+        allowed_skills,
         mcp_connections,
         web_ctx,
         browser_ctx,
@@ -770,9 +1095,13 @@ pub async fn execute_tool(
         tts_engine,
         docker_config,
         process_manager,
+        process_registry,
         sender_id,
         channel,
         chat_id,
+        checkpoint_manager,
+        interrupt,
+        dangerous_command_checker,
     };
     execute_tool_raw(tool_use_id, tool_name, input, &ctx).await
 }
@@ -1051,6 +1380,19 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["event_type"]
             }),
         },
+        // --- Skill file read tool ---
+        ToolDefinition {
+            name: "skill_read_file".to_string(),
+            description: "Read a companion file from an installed skill. Use when a skill's prompt context references additional files by relative path (e.g. 'see references/syntax.md').".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "skill": { "type": "string", "description": "The skill name as listed in Available Skills" },
+                    "path": { "type": "string", "description": "Path relative to the skill directory, e.g. 'references/query-syntax.md'" }
+                },
+                "required": ["skill", "path"]
+            }),
+        },
         // --- Scheduling tools ---
         ToolDefinition {
             name: "schedule_create".to_string(),
@@ -1060,6 +1402,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "description": { "type": "string", "description": "What this schedule does (e.g., 'Check for new emails')" },
                     "schedule": { "type": "string", "description": "Natural language or cron expression (e.g., 'every 5 minutes', 'daily at 9am', '0 */5 * * *')" },
+                    "tz": { "type": "string", "description": "IANA timezone for time-of-day schedules (e.g., 'Asia/Shanghai', 'US/Eastern'). Omit for UTC. Always set this for schedules like 'daily at 9am' so they run in the user's local time." },
                     "agent": { "type": "string", "description": "Agent name or ID to run this task (optional, defaults to self)" }
                 },
                 "required": ["description", "schedule"]
@@ -1356,7 +1699,8 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "object",
                         "description": "Delivery target: {\"kind\":\"none\"} or {\"kind\":\"channel\",\"channel\":\"telegram\"} or {\"kind\":\"last_channel\"}"
                     },
-                    "one_shot": { "type": "boolean", "description": "If true, auto-delete after execution. Default: false" }
+                    "one_shot": { "type": "boolean", "description": "If true, auto-delete after execution. Default: false" },
+                    "session_mode": { "type": "string", "enum": ["persistent", "new"], "description": "Session behaviour for AgentTurn actions. 'persistent' (default): all fires share one dedicated cron session, preserving history across runs. 'new': each fire gets a fresh isolated session with no memory of previous runs." }
                 },
                 "required": ["name", "schedule", "action"]
             }),
@@ -1395,7 +1739,13 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "file_url": { "type": "string", "description": "URL of a file to send as attachment" },
                     "file_path": { "type": "string", "description": "Local file path to send as attachment (reads from disk; use instead of file_url for local files)" },
                     "filename": { "type": "string", "description": "Filename for file attachments (defaults to the basename of file_path, or 'file')" },
-                    "thread_id": { "type": "string", "description": "Thread/topic ID to reply in (e.g., Telegram message_thread_id, Slack thread_ts)" }
+                    "thread_id": { "type": "string", "description": "Thread/topic ID to reply in (e.g., Telegram message_thread_id, Slack thread_ts)" },
+                    "account_id": { "type": "string", "description": "Optional account_id of the specific configured bot to send through (e.g., 'admin-bot'). When omitted, uses the first configured adapter for this channel." },
+                    "poll_question": { "type": "string", "description": "Question for a poll (starts a poll, mutually exclusive with image_url/file_url/file_path)" },
+                    "poll_options": { "type": "array", "items": { "type": "string" }, "description": "Answer options for the poll (2-10 items, required with poll_question)" },
+                    "poll_is_quiz": { "type": "boolean", "description": "Set to true for a quiz mode (one correct answer)" },
+                    "poll_correct_option": { "type": "integer", "description": "Index of the correct answer (0-based, for quiz mode)" },
+                    "poll_explanation": { "type": "string", "description": "Explanation shown after answering (quiz mode)" }
                 },
                 "required": ["channel", "recipient"]
             }),
@@ -1620,6 +1970,96 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["html"]
             }),
         },
+        // --- Skill evolution tools ---
+        ToolDefinition {
+            name: "skill_evolve_create".to_string(),
+            description: "Create a new prompt-only skill from a successful task approach. Use after completing a complex task (5+ tool calls) that involved trial-and-error or a non-trivial workflow worth reusing. The skill becomes available to all agents.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Skill name: lowercase alphanumeric with hyphens (e.g., 'csv-analysis', 'api-debugging')" },
+                    "description": { "type": "string", "description": "One-line description of what this skill teaches (max 1024 chars)" },
+                    "prompt_context": { "type": "string", "description": "Markdown instructions that will be injected into the system prompt when this skill is active. Should capture the methodology, pitfalls, and best practices discovered." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags for discovery (e.g., ['data', 'csv', 'analysis'])" }
+                },
+                "required": ["name", "description", "prompt_context"]
+            }),
+        },
+        ToolDefinition {
+            name: "skill_evolve_update".to_string(),
+            description: "Rewrite a skill's prompt_context entirely. Use when the skill needs a major overhaul based on new learnings. Creates a rollback snapshot automatically.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Name of the existing skill to update" },
+                    "prompt_context": { "type": "string", "description": "New Markdown instructions (full replacement)" },
+                    "changelog": { "type": "string", "description": "Brief description of what changed and why" }
+                },
+                "required": ["name", "prompt_context", "changelog"]
+            }),
+        },
+        ToolDefinition {
+            name: "skill_evolve_patch".to_string(),
+            description: "Make a targeted find-and-replace edit to a skill's prompt_context. Use when only a section needs fixing. Supports fuzzy matching (tolerates whitespace/indent differences).".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Name of the existing skill to patch" },
+                    "old_string": { "type": "string", "description": "Text to find in the current prompt_context (fuzzy-matched)" },
+                    "new_string": { "type": "string", "description": "Replacement text" },
+                    "changelog": { "type": "string", "description": "Brief description of what changed and why" },
+                    "replace_all": { "type": "boolean", "description": "Replace all occurrences (default: false)" }
+                },
+                "required": ["name", "old_string", "new_string", "changelog"]
+            }),
+        },
+        ToolDefinition {
+            name: "skill_evolve_delete".to_string(),
+            description: "Delete an agent-evolved skill. Only works on locally-created skills (not marketplace installs).".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Name of the skill to delete" }
+                },
+                "required": ["name"]
+            }),
+        },
+        ToolDefinition {
+            name: "skill_evolve_rollback".to_string(),
+            description: "Roll back a skill to its previous version. Use when a recent update degraded the skill's effectiveness.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Name of the skill to roll back" }
+                },
+                "required": ["name"]
+            }),
+        },
+        ToolDefinition {
+            name: "skill_evolve_write_file".to_string(),
+            description: "Add a supporting file to a skill (references, templates, scripts, or assets). Use to enrich a skill with additional context like API docs, code templates, or example configurations.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Name of the skill to add the file to" },
+                    "path": { "type": "string", "description": "Relative path under the skill directory (e.g., 'references/api.md', 'templates/config.yaml'). Must be under references/, templates/, scripts/, or assets/" },
+                    "content": { "type": "string", "description": "File content to write" }
+                },
+                "required": ["name", "path", "content"]
+            }),
+        },
+        ToolDefinition {
+            name: "skill_evolve_remove_file".to_string(),
+            description: "Remove a supporting file from a skill.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Name of the skill" },
+                    "path": { "type": "string", "description": "Relative path of file to remove (e.g., 'references/old-api.md')" }
+                },
+                "required": ["name", "path"]
+            }),
+        },
     ]
 }
 
@@ -1639,6 +2079,62 @@ fn resolve_file_path(raw_path: &str, workspace_root: Option<&Path>) -> Result<Pa
     )?;
     crate::workspace_sandbox::resolve_sandbox_path(raw_path, root)
 }
+
+// ---------------------------------------------------------------------------
+// Checkpoint helper
+// ---------------------------------------------------------------------------
+
+/// Take a snapshot of `workspace_root` before a file-mutating operation.
+///
+/// If an explicit `CheckpointManager` is provided (injected from the kernel),
+/// it is used.  When `mgr` is `None` no snapshot is taken — callers that
+/// pass `None` are test or ephemeral contexts that do not need filesystem
+/// rollback coverage.
+///
+/// Failures are **non-fatal**: they are logged as warnings and the calling
+/// tool proceeds normally.
+///
+/// ## Async safety
+///
+/// `CheckpointManager::snapshot` spawns `git` subprocesses and calls
+/// blocking I/O.  This wrapper offloads the work to a dedicated thread pool
+/// via `tokio::task::spawn_blocking` so that tokio worker threads are never
+/// blocked by slow git operations.
+async fn maybe_snapshot(
+    mgr: &Option<&Arc<crate::checkpoint_manager::CheckpointManager>>,
+    workspace_root: Option<&Path>,
+    reason: &str,
+) {
+    let Some(root) = workspace_root else {
+        return;
+    };
+    let Some(m) = mgr else {
+        // No manager injected — skip snapshot entirely.
+        // (Test call sites pass None deliberately; production code always
+        // passes Some via the kernel.)
+        return;
+    };
+
+    let mgr_arc = Arc::clone(m);
+    let root_owned = root.to_path_buf();
+    let reason_owned = reason.to_string();
+
+    // Offload blocking git I/O to the blocking thread pool.
+    let result =
+        tokio::task::spawn_blocking(move || mgr_arc.snapshot(&root_owned, &reason_owned)).await;
+
+    match result {
+        Ok(Err(e)) => {
+            warn!(reason, root = %root.display(), "checkpoint snapshot failed (non-fatal): {e}")
+        }
+        Err(e) => warn!(reason, root = %root.display(), "checkpoint spawn_blocking panicked: {e}"),
+        Ok(Ok(_)) => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Filesystem tools
+// ---------------------------------------------------------------------------
 
 async fn tool_file_read(
     input: &serde_json::Value,
@@ -1822,6 +2318,7 @@ async fn tool_shell_exec(
     allowed_env: &[String],
     workspace_root: Option<&Path>,
     exec_policy: Option<&librefang_types::config::ExecPolicy>,
+    interrupt: Option<crate::interrupt::SessionInterrupt>,
 ) -> Result<String, String> {
     let command = input["command"]
         .as_str()
@@ -1907,11 +2404,62 @@ async fn tool_shell_exec(
     // Prevent child from inheriting stdin (avoids blocking on Windows)
     cmd.stdin(std::process::Stdio::null());
 
-    let result =
-        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
+    // Check for interrupt before we even launch the subprocess — the user may
+    // have hit /stop while approval was pending or while a prior tool was running.
+    if interrupt.as_ref().is_some_and(|i| i.is_cancelled()) {
+        return Err("[interrupted before execution]".to_string());
+    }
 
-    match result {
-        Ok(Ok(output)) => {
+    // Capture piped output so we can collect it after the process exits.
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    // Spawn the child process so we hold a handle that can be killed if the
+    // session interrupt fires while the command is running.  Using `output()`
+    // instead would block until the process *completes*, meaning cancel() would
+    // never be observed mid-execution — the whole point of this feature.
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Err(format!("Failed to execute command: {e}")),
+    };
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+    // Poll for completion, interrupt, or timeout.  We use a short sleep so we
+    // don't burn CPU in a tight loop; 50 ms is imperceptible to users but still
+    // gives responsive cancellation.
+    let output = loop {
+        // Has the process already finished?
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                // Process exited; collect its output.
+                match child.wait_with_output().await {
+                    Ok(o) => break Ok(o),
+                    Err(e) => break Err(format!("Failed to collect output: {e}")),
+                }
+            }
+            Ok(None) => {} // still running
+            Err(e) => break Err(format!("Failed to wait on child: {e}")),
+        }
+
+        // Did the session get cancelled while the command was running?
+        if interrupt.as_ref().is_some_and(|i| i.is_cancelled()) {
+            // Best-effort kill; ignore errors (process may have already exited).
+            let _ = child.kill().await;
+            return Err("[interrupted]".to_string());
+        }
+
+        // Timed out?
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.kill().await;
+            return Err(format!("Command timed out after {timeout_secs}s"));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
+    match output {
+        Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let exit_code = output.status.code().unwrap_or(-1);
@@ -1941,8 +2489,7 @@ async fn tool_shell_exec(
                 "Exit code: {exit_code}\n\nSTDOUT:\n{stdout_str}\nSTDERR:\n{stderr_str}"
             ))
         }
-        Ok(Err(e)) => Err(format!("Failed to execute command: {e}")),
-        Err(_) => Err(format!("Command timed out after {timeout_secs}s")),
+        Err(e) => Err(e),
     }
 }
 
@@ -1969,6 +2516,18 @@ async fn tool_agent_send(
     let message = input["message"]
         .as_str()
         .ok_or("Missing 'message' parameter")?;
+
+    // Taint check: refuse to pass obvious credential payloads across
+    // the agent boundary. `tool_agent_send` is the entry point for
+    // both in-process delegation *and* external A2A peers, so an LLM
+    // that stuffs `OPENAI_API_KEY=sk-…` into its own tool-call
+    // arguments would otherwise exfiltrate the secret to whoever is
+    // on the receiving side. Uses `TaintSink::agent_message` so the
+    // rejection message matches the shape documented in the taint
+    // module.
+    if let Some(violation) = check_taint_outbound_text(message, &TaintSink::agent_message()) {
+        return Err(format!("Taint violation: {violation}"));
+    }
 
     // Check + increment inter-agent call depth
     let max_depth = kh.max_agent_call_depth();
@@ -2284,15 +2843,17 @@ async fn tool_task_claim(
 async fn tool_task_complete(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
+    let agent_id = caller_agent_id.ok_or("task_complete requires a calling agent context")?;
     let task_id = input["task_id"]
         .as_str()
         .ok_or("Missing 'task_id' parameter")?;
     let result = input["result"]
         .as_str()
         .ok_or("Missing 'result' parameter")?;
-    kh.task_complete(task_id, result).await?;
+    kh.task_complete(agent_id, task_id, result).await?;
     Ok(format!("Task {task_id} marked as completed."))
 }
 
@@ -2700,9 +3261,15 @@ async fn tool_schedule_create(
     } else {
         serde_json::json!({ "kind": "last_channel" })
     };
+    let tz = input["tz"].as_str();
+    let schedule = if let Some(tz_str) = tz {
+        serde_json::json!({ "kind": "cron", "expr": cron_expr, "tz": tz_str })
+    } else {
+        serde_json::json!({ "kind": "cron", "expr": cron_expr })
+    };
     let job_json = serde_json::json!({
         "name": name,
-        "schedule": { "kind": "cron", "expr": cron_expr },
+        "schedule": schedule,
         "action": { "kind": "agent_turn", "message": message },
         "delivery": delivery,
     });
@@ -2878,6 +3445,46 @@ async fn tool_cron_cancel(
 // Channel send tool (proactive outbound messaging via configured adapters)
 // ---------------------------------------------------------------------------
 
+/// Parse and validate `poll_options` for the `channel_send` tool.
+///
+/// Telegram requires 2–10 string options per poll. A previous version used
+/// `filter_map(as_str)` which silently dropped non-string entries — e.g.
+/// `["a", 42, "c"]` became `["a", "c"]`, slipped past the min-2 check, and
+/// sent a poll missing the user's third option. This helper fails fast
+/// when any entry is the wrong type so the agent can surface the mistake
+/// instead of producing a malformed poll.
+fn parse_poll_options(raw: Option<&serde_json::Value>) -> Result<Vec<String>, String> {
+    let arr = raw
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "poll_options must be an array of strings".to_string())?;
+    let mut out: Vec<String> = Vec::with_capacity(arr.len());
+    for (idx, v) in arr.iter().enumerate() {
+        match v.as_str() {
+            Some(s) => out.push(s.to_string()),
+            None => {
+                return Err(format!(
+                    "poll_options[{idx}] must be a string, got {}",
+                    match v {
+                        serde_json::Value::Null => "null",
+                        serde_json::Value::Bool(_) => "boolean",
+                        serde_json::Value::Number(_) => "number",
+                        serde_json::Value::Array(_) => "array",
+                        serde_json::Value::Object(_) => "object",
+                        serde_json::Value::String(_) => unreachable!(),
+                    }
+                ));
+            }
+        }
+    }
+    if !(2..=10).contains(&out.len()) {
+        return Err(format!(
+            "poll_options must have between 2 and 10 options, got {}",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
 async fn tool_channel_send(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
@@ -2900,6 +3507,7 @@ async fn tool_channel_send(
     }
 
     let thread_id = input["thread_id"].as_str().filter(|s| !s.is_empty());
+    let account_id = input["account_id"].as_str().filter(|s| !s.is_empty());
 
     // Check for media content (image_url, file_url, or file_path)
     let image_url = input["image_url"].as_str().filter(|s| !s.is_empty());
@@ -2908,17 +3516,29 @@ async fn tool_channel_send(
 
     if let Some(url) = image_url {
         let caption = input["message"].as_str().filter(|s| !s.is_empty());
+        if let Some(c) = caption {
+            if let Some(violation) = check_taint_outbound_text(c, &TaintSink::agent_message()) {
+                return Err(violation);
+            }
+        }
         return kh
-            .send_channel_media(&channel, recipient, "image", url, caption, None, thread_id)
+            .send_channel_media(
+                &channel, recipient, "image", url, caption, None, thread_id, account_id,
+            )
             .await;
     }
 
     if let Some(url) = file_url {
         let caption = input["message"].as_str().filter(|s| !s.is_empty());
         let filename = input["filename"].as_str();
+        if let Some(c) = caption {
+            if let Some(violation) = check_taint_outbound_text(c, &TaintSink::agent_message()) {
+                return Err(violation);
+            }
+        }
         return kh
             .send_channel_media(
-                &channel, recipient, "file", url, caption, filename, thread_id,
+                &channel, recipient, "file", url, caption, filename, thread_id, account_id,
             )
             .await;
     }
@@ -2974,8 +3594,85 @@ async fn tool_channel_send(
         };
 
         return kh
-            .send_channel_file_data(&channel, recipient, data, &filename, mime_type, thread_id)
+            .send_channel_file_data(
+                &channel, recipient, data, &filename, mime_type, thread_id, account_id,
+            )
             .await;
+    }
+
+    if let Some(poll_question) = input.get("poll_question").and_then(|v| v.as_str()) {
+        for key in ["image_url", "image_path", "file_url", "file_path"] {
+            if input
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+            {
+                return Err(format!(
+                    "poll_question cannot be combined with media/file attachments (got {key})"
+                ));
+            }
+        }
+
+        let poll_options = parse_poll_options(input.get("poll_options"))?;
+
+        if let Some(violation) =
+            check_taint_outbound_text(poll_question, &TaintSink::agent_message())
+        {
+            return Err(violation);
+        }
+        for opt in &poll_options {
+            if let Some(violation) = check_taint_outbound_text(opt, &TaintSink::agent_message()) {
+                return Err(violation);
+            }
+        }
+
+        let is_quiz = input
+            .get("poll_is_quiz")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let correct_option_id = input
+            .get("poll_correct_option")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u8);
+        let explanation = input.get("poll_explanation").and_then(|v| v.as_str());
+        if let Some(exp) = explanation {
+            if let Some(violation) = check_taint_outbound_text(exp, &TaintSink::agent_message()) {
+                return Err(violation);
+            }
+        }
+
+        // Validate quiz mode requirements
+        if is_quiz {
+            let id = correct_option_id.ok_or_else(|| {
+                "poll_correct_option is required when poll_is_quiz is true".to_string()
+            })?;
+            if id as usize >= poll_options.len() {
+                return Err(format!(
+                    "poll_correct_option {} is out of bounds (must be between 0 and {})",
+                    id,
+                    poll_options.len() - 1
+                ));
+            }
+        }
+
+        kh.send_channel_poll(
+            &channel,
+            recipient,
+            poll_question,
+            &poll_options,
+            is_quiz,
+            correct_option_id,
+            explanation,
+            account_id,
+        )
+        .await?;
+
+        let mut result = format!("Poll sent to {recipient} on {channel}: {poll_question}");
+        if is_quiz {
+            result.push_str(" (quiz mode)");
+        }
+        return Ok(result);
     }
 
     // Text-only message
@@ -3005,7 +3702,12 @@ async fn tool_channel_send(
         message.to_string()
     };
 
-    kh.send_channel_message(&channel, recipient, &final_message, thread_id)
+    if let Some(violation) = check_taint_outbound_text(&final_message, &TaintSink::agent_message())
+    {
+        return Err(violation);
+    }
+
+    kh.send_channel_message(&channel, recipient, &final_message, thread_id, account_id)
         .await
 }
 
@@ -3155,6 +3857,15 @@ async fn tool_a2a_send(
     } else {
         return Err("Missing 'agent_url' or 'agent_name' parameter".to_string());
     };
+
+    // Taint sink: block secrets from being exfiltrated to an external A2A peer.
+    if let Some(violation) = check_taint_outbound_text(message, &TaintSink::agent_message()) {
+        return Err(violation);
+    }
+    // Also gate the URL itself against query-string credential leaks.
+    if let Some(violation) = check_taint_net_fetch(&url) {
+        return Err(violation);
+    }
 
     let session_id = input["session_id"].as_str();
     let client = crate::a2a::A2aClient::new();
@@ -4426,6 +5137,373 @@ pub fn sanitize_canvas_html(html: &str, max_bytes: usize) -> Result<String, Stri
     Ok(html.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Skill evolution tools
+// ---------------------------------------------------------------------------
+
+/// Build the author tag for an agent-triggered evolution. Use the
+/// agent's id so the dashboard history can attribute the change.
+fn agent_author_tag(caller: Option<&str>) -> String {
+    caller
+        .map(|id| format!("agent:{id}"))
+        .unwrap_or_else(|| "agent".to_string())
+}
+
+/// Reject evolution ops when the registry is frozen (Stable mode).
+///
+/// The registry's frozen flag is meant to express "no skill changes in
+/// this kernel", but the evolution module writes to disk directly and
+/// then triggers `reload_skills`, which no-ops under freeze. Without
+/// this gate, an agent running under Stable mode would silently
+/// persist skill mutations that'd be picked up at the next unfreeze
+/// or restart — defeating the whole point of the mode.
+fn ensure_not_frozen(registry: &SkillRegistry) -> Result<(), String> {
+    if registry.is_frozen() {
+        Err("Skill registry is frozen (Stable mode) — skill evolution is disabled".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+async fn tool_skill_evolve_create(
+    input: &serde_json::Value,
+    skill_registry: Option<&SkillRegistry>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let registry = skill_registry.ok_or("Skill registry not available")?;
+    ensure_not_frozen(registry)?;
+    let name = input["name"].as_str().ok_or("Missing 'name' parameter")?;
+    let description = input["description"]
+        .as_str()
+        .ok_or("Missing 'description' parameter")?;
+    let prompt_context = input["prompt_context"]
+        .as_str()
+        .ok_or("Missing 'prompt_context' parameter")?;
+    let tags: Vec<String> = input["tags"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let author = agent_author_tag(caller_agent_id);
+    let skills_dir = registry.skills_dir();
+    match librefang_skills::evolution::create_skill(
+        skills_dir,
+        name,
+        description,
+        prompt_context,
+        tags,
+        Some(&author),
+    ) {
+        Ok(result) => serde_json::to_string(&result).map_err(|e| e.to_string()),
+        Err(e) => Err(format!("Failed to create skill: {e}")),
+    }
+}
+
+async fn tool_skill_evolve_update(
+    input: &serde_json::Value,
+    skill_registry: Option<&SkillRegistry>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let registry = skill_registry.ok_or("Skill registry not available")?;
+    ensure_not_frozen(registry)?;
+    let name = input["name"].as_str().ok_or("Missing 'name' parameter")?;
+    let prompt_context = input["prompt_context"]
+        .as_str()
+        .ok_or("Missing 'prompt_context' parameter")?;
+    let changelog = input["changelog"]
+        .as_str()
+        .ok_or("Missing 'changelog' parameter")?;
+
+    // Registry hot-reload happens AFTER the turn finishes, so within
+    // the same turn `create` followed by `update` would find the
+    // registry cache still stale. Fall back to loading straight from
+    // disk when the cache misses — if the skill truly doesn't exist
+    // the helper returns NotFound too.
+    let skill_owned;
+    let skill = match registry.get(name) {
+        Some(s) => s,
+        None => {
+            skill_owned = librefang_skills::evolution::load_installed_skill_from_disk(
+                registry.skills_dir(),
+                name,
+            )
+            .map_err(|e| format!("Skill '{name}' not found: {e}"))?;
+            &skill_owned
+        }
+    };
+
+    let author = agent_author_tag(caller_agent_id);
+    match librefang_skills::evolution::update_skill(skill, prompt_context, changelog, Some(&author))
+    {
+        Ok(result) => serde_json::to_string(&result).map_err(|e| e.to_string()),
+        Err(e) => Err(format!("Failed to update skill: {e}")),
+    }
+}
+
+async fn tool_skill_evolve_patch(
+    input: &serde_json::Value,
+    skill_registry: Option<&SkillRegistry>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let registry = skill_registry.ok_or("Skill registry not available")?;
+    ensure_not_frozen(registry)?;
+    let name = input["name"].as_str().ok_or("Missing 'name' parameter")?;
+    let old_string = input["old_string"]
+        .as_str()
+        .ok_or("Missing 'old_string' parameter")?;
+    let new_string = input["new_string"]
+        .as_str()
+        .ok_or("Missing 'new_string' parameter")?;
+    let changelog = input["changelog"]
+        .as_str()
+        .ok_or("Missing 'changelog' parameter")?;
+    let replace_all = input["replace_all"].as_bool().unwrap_or(false);
+
+    // Same-turn create→patch fallback (see tool_skill_evolve_update).
+    let skill_owned;
+    let skill = match registry.get(name) {
+        Some(s) => s,
+        None => {
+            skill_owned = librefang_skills::evolution::load_installed_skill_from_disk(
+                registry.skills_dir(),
+                name,
+            )
+            .map_err(|e| format!("Skill '{name}' not found: {e}"))?;
+            &skill_owned
+        }
+    };
+
+    let author = agent_author_tag(caller_agent_id);
+    match librefang_skills::evolution::patch_skill(
+        skill,
+        old_string,
+        new_string,
+        changelog,
+        replace_all,
+        Some(&author),
+    ) {
+        Ok(result) => serde_json::to_string(&result).map_err(|e| e.to_string()),
+        Err(e) => Err(format!("Failed to patch skill: {e}")),
+    }
+}
+
+async fn tool_skill_evolve_delete(
+    input: &serde_json::Value,
+    skill_registry: Option<&SkillRegistry>,
+) -> Result<String, String> {
+    let registry = skill_registry.ok_or("Skill registry not available")?;
+    ensure_not_frozen(registry)?;
+    let name = input["name"].as_str().ok_or("Missing 'name' parameter")?;
+
+    // Resolve the actual installed skill's parent directory instead of
+    // blindly targeting `registry.skills_dir() + name`. Workspace skills
+    // shadow global skills with the same name in an agent run; without
+    // this, `skill_evolve_delete` removed the global skill (or reported
+    // NotFound) while leaving the workspace copy the agent was actually
+    // using in place — destructive against the wrong resource.
+    let parent = match registry.get(name) {
+        Some(s) => s
+            .path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| registry.skills_dir().to_path_buf()),
+        // Fall back to the global dir when the registry hasn't caught up
+        // yet (e.g. a skill created in this same turn hasn't been
+        // hot-reloaded into the live view) — delete_skill will return
+        // NotFound if nothing exists there either.
+        None => registry.skills_dir().to_path_buf(),
+    };
+    match librefang_skills::evolution::delete_skill(&parent, name) {
+        Ok(result) => serde_json::to_string(&result).map_err(|e| e.to_string()),
+        Err(e) => Err(format!("Failed to delete skill: {e}")),
+    }
+}
+
+async fn tool_skill_evolve_rollback(
+    input: &serde_json::Value,
+    skill_registry: Option<&SkillRegistry>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let registry = skill_registry.ok_or("Skill registry not available")?;
+    ensure_not_frozen(registry)?;
+    let name = input["name"].as_str().ok_or("Missing 'name' parameter")?;
+
+    // Same-turn create→rollback fallback (see tool_skill_evolve_update).
+    let skill_owned;
+    let skill = match registry.get(name) {
+        Some(s) => s,
+        None => {
+            skill_owned = librefang_skills::evolution::load_installed_skill_from_disk(
+                registry.skills_dir(),
+                name,
+            )
+            .map_err(|e| format!("Skill '{name}' not found: {e}"))?;
+            &skill_owned
+        }
+    };
+
+    let author = agent_author_tag(caller_agent_id);
+    match librefang_skills::evolution::rollback_skill(skill, Some(&author)) {
+        Ok(result) => serde_json::to_string(&result).map_err(|e| e.to_string()),
+        Err(e) => Err(format!("Failed to rollback skill: {e}")),
+    }
+}
+
+async fn tool_skill_evolve_write_file(
+    input: &serde_json::Value,
+    skill_registry: Option<&SkillRegistry>,
+) -> Result<String, String> {
+    let registry = skill_registry.ok_or("Skill registry not available")?;
+    ensure_not_frozen(registry)?;
+    let name = input["name"].as_str().ok_or("Missing 'name' parameter")?;
+    let path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+    let content = input["content"]
+        .as_str()
+        .ok_or("Missing 'content' parameter")?;
+
+    // Same-turn create→write_file fallback.
+    let skill_owned;
+    let skill = match registry.get(name) {
+        Some(s) => s,
+        None => {
+            skill_owned = librefang_skills::evolution::load_installed_skill_from_disk(
+                registry.skills_dir(),
+                name,
+            )
+            .map_err(|e| format!("Skill '{name}' not found: {e}"))?;
+            &skill_owned
+        }
+    };
+
+    match librefang_skills::evolution::write_supporting_file(skill, path, content) {
+        Ok(result) => serde_json::to_string(&result).map_err(|e| e.to_string()),
+        Err(e) => Err(format!("Failed to write file: {e}")),
+    }
+}
+
+async fn tool_skill_evolve_remove_file(
+    input: &serde_json::Value,
+    skill_registry: Option<&SkillRegistry>,
+) -> Result<String, String> {
+    let registry = skill_registry.ok_or("Skill registry not available")?;
+    ensure_not_frozen(registry)?;
+    let name = input["name"].as_str().ok_or("Missing 'name' parameter")?;
+    let path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+
+    // Same-turn fallback (see tool_skill_evolve_update).
+    let skill_owned;
+    let skill = match registry.get(name) {
+        Some(s) => s,
+        None => {
+            skill_owned = librefang_skills::evolution::load_installed_skill_from_disk(
+                registry.skills_dir(),
+                name,
+            )
+            .map_err(|e| format!("Skill '{name}' not found: {e}"))?;
+            &skill_owned
+        }
+    };
+
+    match librefang_skills::evolution::remove_supporting_file(skill, path) {
+        Ok(result) => serde_json::to_string(&result).map_err(|e| e.to_string()),
+        Err(e) => Err(format!("Failed to remove file: {e}")),
+    }
+}
+
+/// Read a companion file from an installed skill directory.
+///
+/// Security: resolves the path relative to the skill's installed directory and
+/// rejects any path that escapes via `..` or absolute components. Symlinks are
+/// resolved by `canonicalize()` before the containment check, so a symlink
+/// pointing outside the skill directory is correctly rejected.
+async fn tool_skill_read_file(
+    input: &serde_json::Value,
+    skill_registry: Option<&SkillRegistry>,
+    allowed_skills: Option<&[String]>,
+) -> Result<String, String> {
+    let registry = skill_registry.ok_or("Skill registry not available")?;
+    let skill_name = input["skill"].as_str().ok_or("Missing 'skill' parameter")?;
+    let rel_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+
+    // Enforce agent skill allowlist: if the agent specifies allowed skills
+    // (non-empty list), only those skills can be read. Empty = all allowed.
+    if let Some(allowed) = allowed_skills {
+        if !allowed.is_empty() && !allowed.iter().any(|s| s == skill_name) {
+            return Err(format!(
+                "Access denied: agent is not allowed to access skill '{skill_name}'"
+            ));
+        }
+    }
+
+    // Reject absolute paths early — Path::join replaces the base when given
+    // an absolute path, which would bypass the skill directory containment.
+    if std::path::Path::new(rel_path).is_absolute() {
+        return Err("Access denied: absolute paths are not allowed".to_string());
+    }
+
+    // Look up the skill
+    let skill = registry
+        .get(skill_name)
+        .ok_or_else(|| format!("Skill '{}' not found", skill_name))?;
+
+    // Resolve the path relative to the skill directory
+    let requested = skill.path.join(rel_path);
+    let canonical = requested
+        .canonicalize()
+        .map_err(|e| format!("File not found: {}", e))?;
+    let skill_root = skill
+        .path
+        .canonicalize()
+        .map_err(|e| format!("Skill directory error: {}", e))?;
+
+    // Security: ensure the resolved path is within the skill directory
+    if !canonical.starts_with(&skill_root) {
+        return Err(format!(
+            "Access denied: '{}' is outside the skill directory",
+            rel_path
+        ));
+    }
+
+    // Read the file
+    let content = tokio::fs::read_to_string(&canonical)
+        .await
+        .map_err(|e| format!("Failed to read '{}': {}", rel_path, e))?;
+
+    // Fire-and-forget usage tracking — only count when the agent actually
+    // loads the skill's core prompt content, not every supporting file
+    // read. Reading references/templates/scripts/assets shouldn't inflate
+    // the usage metric. Failures (lock contention, disk error) must not
+    // affect tool execution, so we swallow them.
+    let is_core_prompt = matches!(rel_path, "prompt_context.md" | "SKILL.md" | "skill.md");
+    if is_core_prompt {
+        let skill_dir = skill.path.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = librefang_skills::evolution::record_skill_usage(&skill_dir) {
+                tracing::debug!(error = %e, dir = %skill_dir.display(), "record_skill_usage failed");
+            }
+        });
+    }
+
+    // Cap output to avoid flooding the context.
+    // Use floor_char_boundary to avoid panicking on multi-byte UTF-8.
+    const MAX_BYTES: usize = 32_000;
+    if content.len() > MAX_BYTES {
+        let truncate_at = content.floor_char_boundary(MAX_BYTES);
+        Ok(format!(
+            "{}\n\n... (truncated at {} bytes, file is {} bytes total)",
+            &content[..truncate_at],
+            truncate_at,
+            content.len()
+        ))
+    } else {
+        Ok(content)
+    }
+}
+
 /// Canvas presentation tool handler.
 async fn tool_canvas_present(
     input: &serde_json::Value,
@@ -4481,6 +5559,246 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    // ── check_taint_outbound_text ────────────────────────────────────────
+
+    #[test]
+    fn test_taint_outbound_text_blocks_key_value_pairs() {
+        let sink = TaintSink::agent_message();
+        for body in [
+            "here is my api_key=sk-123",
+            "x-api-key: abcdef",
+            "{\"token\":\"mytoken\"}",
+            "{\"authorization\": \"Bearer sk-live-secret\"}",
+            "{\"proxy-authorization\": \"Basic Zm9vOmJhcg==\"}",
+            "api_key = sk-123",
+            "'password': 'hunter2'",
+            "Authorization: Bearer abc",
+            "some text bearer=abc",
+        ] {
+            assert!(
+                check_taint_outbound_text(body, &sink).is_some(),
+                "outbound taint check must reject {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_taint_outbound_text_blocks_well_known_prefixes() {
+        let sink = TaintSink::agent_message();
+        for tok in [
+            "sk-12345678901234567890123456789012",
+            "ghp_1234567890123456789012345678901234567890",
+            "xoxb-0000-0000-xxxxxxxxxxxx",
+            "AKIAIOSFODNN7EXAMPLE",
+            "AIzaSyDummyGoogleKeyLooksLikeThis00",
+        ] {
+            assert!(
+                check_taint_outbound_text(tok, &sink).is_some(),
+                "outbound taint check must reject well-known prefix {tok:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_taint_outbound_text_blocks_long_opaque_tokens() {
+        let sink = TaintSink::agent_message();
+        // 40-char mixed-case base64-ish payload with no whitespace or
+        // prose: smells like a raw bearer token.
+        let payload = "AbCdEf0123456789AbCdEf0123456789AbCdEf01";
+        assert!(
+            check_taint_outbound_text(payload, &sink).is_some(),
+            "outbound taint check must reject long opaque token"
+        );
+        // Same length but with punctuation — also looks tokenish.
+        let payload_punct = "abcdef0123456789-abcdef0123456789-abcdef";
+        assert!(
+            check_taint_outbound_text(payload_punct, &sink).is_some(),
+            "outbound taint check must reject punctuated token"
+        );
+    }
+
+    #[test]
+    fn test_taint_outbound_text_allows_git_sha() {
+        // 40-char lowercase hex commit SHA — legitimate inter-agent
+        // payload, must not be blocked.
+        let sink = TaintSink::agent_message();
+        let sha = "18060f6401234567890abcdef0123456789abcde";
+        assert!(
+            check_taint_outbound_text(sha, &sink).is_none(),
+            "git commit SHA must not be treated as a secret"
+        );
+    }
+
+    #[test]
+    fn test_taint_outbound_text_allows_sha256_hex() {
+        // 64-char lowercase hex sha256 digest — also legitimate.
+        let sink = TaintSink::agent_message();
+        let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert!(
+            check_taint_outbound_text(digest, &sink).is_none(),
+            "sha256 hex digest must not be treated as a secret"
+        );
+    }
+
+    #[test]
+    fn test_taint_outbound_text_allows_uuid_hex() {
+        // 32-char UUID-without-dashes (hex) — allowed.
+        let sink = TaintSink::agent_message();
+        let uuid = "550e8400e29b41d4a716446655440000";
+        assert!(
+            check_taint_outbound_text(uuid, &sink).is_none(),
+            "undashed UUID must not be treated as a secret"
+        );
+    }
+
+    #[test]
+    fn test_taint_outbound_header_blocks_authorization_bearer() {
+        // Regression for the header-name-bypass bug: a Bearer token
+        // with a space between scheme and value defeats every
+        // content-based heuristic, so we must trip on the header name.
+        let sink = TaintSink::net_fetch();
+        assert!(
+            check_taint_outbound_header("Authorization", "Bearer sk-x", &sink).is_some(),
+            "Authorization: Bearer <anything> must be blocked"
+        );
+        assert!(
+            check_taint_outbound_header("authorization", "Token abc", &sink).is_some(),
+            "lowercased authorization header must also be blocked"
+        );
+        assert!(
+            check_taint_outbound_header("Proxy-Authorization", "Basic Zm9vOmJhcg==", &sink)
+                .is_some(),
+            "Proxy-Authorization header must be blocked"
+        );
+        assert!(
+            check_taint_outbound_header("X-Api-Key", "hunter2", &sink).is_some(),
+            "X-Api-Key header must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_taint_outbound_header_allows_benign_headers() {
+        let sink = TaintSink::net_fetch();
+        assert!(
+            check_taint_outbound_header("Accept", "application/json", &sink).is_none(),
+            "benign Accept header must pass"
+        );
+        assert!(
+            check_taint_outbound_header("User-Agent", "librefang/1.0", &sink).is_none(),
+            "benign User-Agent header must pass"
+        );
+    }
+
+    #[test]
+    fn test_taint_outbound_text_allows_prose() {
+        let sink = TaintSink::agent_message();
+        for benign in [
+            "Please summarise this article about encryption.",
+            "Could you check whether our token economy works?",
+            "The passwd file lives at /etc/passwd on Linux — explain it.",
+            "Write a haiku about secret gardens.",
+            "",
+        ] {
+            assert!(
+                check_taint_outbound_text(benign, &sink).is_none(),
+                "outbound taint check must allow prose: {benign:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_taint_outbound_text_allows_short_identifiers() {
+        // A 16-char id is below the 32-char opaque-token threshold and
+        // doesn't match any key=value shape, so it should pass even
+        // though it looks alphanumeric.
+        let sink = TaintSink::agent_message();
+        let id = "req_0123456789ab";
+        assert!(check_taint_outbound_text(id, &sink).is_none());
+    }
+
+    // ── tool_a2a_send / tool_channel_send taint integration ─────────────
+    //
+    // Regression: prior to this patch the taint sink was only enforced
+    // on agent_send and web_fetch. tool_a2a_send and tool_channel_send
+    // were exfiltration sinks with NO check at all.
+
+    #[tokio::test]
+    async fn test_tool_a2a_send_blocks_secret_in_message() {
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::new(AtomicUsize::new(0)),
+        });
+        let input = serde_json::json!({
+            "agent_url": "https://example.com/a2a",
+            "message": "leaking api_key=sk-abcdefghijklmnop now",
+        });
+        let err = tool_a2a_send(&input, Some(&kernel))
+            .await
+            .expect_err("a2a_send must reject tainted message");
+        assert!(
+            err.contains("taint") || err.contains("violation"),
+            "expected taint violation, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_channel_send_blocks_secret_in_text_message() {
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::new(AtomicUsize::new(0)),
+        });
+        let input = serde_json::json!({
+            "channel": "telegram",
+            "recipient": "@user",
+            "message": "here is the api_key=sk-abcdefghijklmnop",
+        });
+        let err = tool_channel_send(&input, Some(&kernel), None)
+            .await
+            .expect_err("channel_send must reject tainted message");
+        assert!(
+            err.contains("taint") || err.contains("violation"),
+            "expected taint violation, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_channel_send_blocks_secret_in_image_caption() {
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::new(AtomicUsize::new(0)),
+        });
+        let input = serde_json::json!({
+            "channel": "telegram",
+            "recipient": "@user",
+            "image_url": "https://example.com/cat.png",
+            "message": "see attached. token=sk-abcdefghijklmnop",
+        });
+        let err = tool_channel_send(&input, Some(&kernel), None)
+            .await
+            .expect_err("image caption must be sink-checked");
+        assert!(
+            err.contains("taint") || err.contains("violation"),
+            "expected taint violation, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_channel_send_blocks_secret_in_poll_question() {
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::new(AtomicUsize::new(0)),
+        });
+        let input = serde_json::json!({
+            "channel": "telegram",
+            "recipient": "@user",
+            "poll_question": "guess my api_key=sk-abcdefghijklmnop",
+            "poll_options": ["yes", "no"],
+        });
+        let err = tool_channel_send(&input, Some(&kernel), None)
+            .await
+            .expect_err("poll question must be sink-checked");
+        assert!(
+            err.contains("taint") || err.contains("violation"),
+            "expected taint violation, got: {err}"
+        );
+    }
 
     struct ApprovalKernel {
         approval_requests: Arc<AtomicUsize>,
@@ -4547,7 +5865,12 @@ mod tests {
             Err("not used".to_string())
         }
 
-        async fn task_complete(&self, _task_id: &str, _result: &str) -> Result<(), String> {
+        async fn task_complete(
+            &self,
+            _agent_id: &str,
+            _task_id: &str,
+            _result: &str,
+        ) -> Result<(), String> {
             Err("not used".to_string())
         }
 
@@ -4601,6 +5924,7 @@ mod tests {
             _agent_id: &str,
             _tool_name: &str,
             _action_summary: &str,
+            _session_id: Option<&str>,
         ) -> Result<librefang_types::approval::ApprovalDecision, String> {
             self.approval_requests.fetch_add(1, Ordering::SeqCst);
             Ok(librefang_types::approval::ApprovalDecision::Denied)
@@ -4612,6 +5936,7 @@ mod tests {
             _tool_name: &str,
             _action_summary: &str,
             _deferred: librefang_types::tool::DeferredToolExecution,
+            _session_id: Option<&str>,
         ) -> Result<librefang_types::tool::ToolApprovalSubmission, String> {
             self.approval_requests.fetch_add(1, Ordering::SeqCst);
             Ok(librefang_types::tool::ToolApprovalSubmission::Pending {
@@ -4736,6 +6061,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -4747,9 +6073,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(
@@ -4770,6 +6101,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -4781,9 +6113,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(result.is_error);
@@ -4801,6 +6138,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -4812,9 +6150,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(result.is_error);
@@ -4832,6 +6175,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -4843,9 +6187,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(result.is_error);
@@ -4862,6 +6211,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -4873,9 +6223,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         // web_search now attempts a real fetch; may succeed or fail depending on network
@@ -4892,6 +6247,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -4903,9 +6259,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(result.is_error);
@@ -4922,6 +6283,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -4933,9 +6295,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(result.is_error);
@@ -4954,6 +6321,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -4964,9 +6332,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(result.is_error);
@@ -4986,6 +6359,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -4996,9 +6370,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         // Should fail for path resolution, NOT for permission denied
@@ -5044,6 +6423,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -5054,9 +6434,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(
@@ -5080,6 +6465,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -5090,9 +6476,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(result.is_error);
@@ -5124,6 +6515,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             Some(workspace.path()),
@@ -5133,9 +6525,14 @@ mod tests {
             None,
             None,
             None,
+            None,
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
 
@@ -5168,6 +6565,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -5177,9 +6575,14 @@ mod tests {
             None,
             None,
             None,
+            None,
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
 
@@ -5222,6 +6625,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -5232,9 +6636,14 @@ mod tests {
             None,
             None,
             None,
+            None,
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
 
@@ -5412,6 +6821,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -5423,9 +6833,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(result.is_error);
@@ -5465,6 +6880,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -5476,9 +6892,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(result.is_error);
@@ -5677,6 +7098,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -5688,9 +7110,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(
@@ -5715,6 +7142,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -5726,9 +7154,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(
@@ -5753,6 +7186,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -5764,9 +7198,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(
@@ -5803,6 +7242,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None, // media_engine
@@ -5811,9 +7251,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(
@@ -5854,6 +7299,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None, // media_engine
@@ -5862,9 +7308,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(
@@ -5946,6 +7397,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -5956,9 +7408,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(result.is_error);
@@ -5983,6 +7440,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -5993,9 +7451,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         // Should fail for "MCP not available", not "Permission denied"
@@ -6029,6 +7492,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -6039,9 +7503,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         // Should NOT be a permission-denied error
@@ -6065,6 +7534,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -6075,9 +7545,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(result.is_error);
@@ -6101,6 +7576,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -6111,9 +7587,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(
@@ -6136,6 +7617,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -6146,9 +7628,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         assert!(
@@ -6171,6 +7658,7 @@ mod tests {
             None,
             None,
             None,
+            None, // allowed_skills
             None,
             None,
             None,
@@ -6181,9 +7669,14 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // process_registry
             None, // sender_id
             None, // channel
             None, // chat_id
+            None, // checkpoint_manager
+            None, // interrupt
+            None, // session_id
+            None, // dangerous_command_checker
         )
         .await;
         // Should fail for "MCP not available", not "Permission denied"
@@ -6346,7 +7839,12 @@ mod tests {
             Err("not used".to_string())
         }
 
-        async fn task_complete(&self, _task_id: &str, _result: &str) -> Result<(), String> {
+        async fn task_complete(
+            &self,
+            _agent_id: &str,
+            _task_id: &str,
+            _result: &str,
+        ) -> Result<(), String> {
             Err("not used".to_string())
         }
 
@@ -6519,4 +8017,231 @@ mod tests {
             "schedule description must mention the tz field: {schedule_desc}"
         );
     }
+
+    #[test]
+    fn parse_poll_options_accepts_2_to_10_strings() {
+        let raw = serde_json::json!(["red", "green", "blue"]);
+        let opts = parse_poll_options(Some(&raw)).expect("valid options");
+        assert_eq!(opts, vec!["red", "green", "blue"]);
+    }
+
+    #[test]
+    fn parse_poll_options_rejects_non_string_entry() {
+        // Regression: a previous version used filter_map(as_str) which
+        // silently dropped non-string entries, letting a malformed poll
+        // slip past the min-2 validation.
+        let raw = serde_json::json!(["a", 42, "c"]);
+        let err = parse_poll_options(Some(&raw)).expect_err("should reject number");
+        assert!(
+            err.contains("poll_options[1]"),
+            "error mentions index: {err}"
+        );
+        assert!(err.contains("number"), "error mentions type: {err}");
+    }
+
+    #[test]
+    fn parse_poll_options_rejects_bool_entry() {
+        let raw = serde_json::json!(["a", true]);
+        let err = parse_poll_options(Some(&raw)).expect_err("should reject bool");
+        assert!(err.contains("poll_options[1]"));
+        assert!(err.contains("boolean"));
+    }
+
+    #[test]
+    fn parse_poll_options_rejects_null_entry() {
+        let raw = serde_json::json!(["a", null, "c"]);
+        let err = parse_poll_options(Some(&raw)).expect_err("should reject null");
+        assert!(err.contains("poll_options[1]"));
+        assert!(err.contains("null"));
+    }
+
+    #[test]
+    fn parse_poll_options_rejects_too_few() {
+        let raw = serde_json::json!(["only one"]);
+        let err = parse_poll_options(Some(&raw)).expect_err("should reject single option");
+        assert!(err.contains("between 2 and 10"));
+    }
+
+    #[test]
+    fn parse_poll_options_rejects_too_many() {
+        let raw = serde_json::json!(["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"]);
+        let err = parse_poll_options(Some(&raw)).expect_err("should reject 11 options");
+        assert!(err.contains("between 2 and 10"));
+    }
+
+    #[test]
+    fn parse_poll_options_rejects_missing() {
+        let err = parse_poll_options(None).expect_err("None should fail");
+        assert!(err.contains("must be an array"));
+    }
+
+    #[test]
+    fn parse_poll_options_rejects_non_array() {
+        let raw = serde_json::json!("not an array");
+        let err = parse_poll_options(Some(&raw)).expect_err("string should fail");
+        assert!(err.contains("must be an array"));
+    }
+
+    // ── skill_read_file ────────────────────────────────────────────────
+
+    fn create_skill_registry_with_file(
+        dir: &std::path::Path,
+        skill_name: &str,
+        file_rel: &str,
+        content: &str,
+    ) -> SkillRegistry {
+        let skill_dir = dir.join(skill_name);
+        std::fs::create_dir_all(
+            skill_dir.join(
+                std::path::Path::new(file_rel)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("")),
+            ),
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join(file_rel), content).unwrap();
+        std::fs::write(
+            skill_dir.join("skill.toml"),
+            format!(
+                r#"[skill]
+name = "{skill_name}"
+version = "0.1.0"
+description = "test"
+"#
+            ),
+        )
+        .unwrap();
+
+        let mut registry = SkillRegistry::new(dir.to_path_buf());
+        registry.load_all().unwrap();
+        registry
+    }
+
+    #[tokio::test]
+    async fn skill_read_file_reads_companion() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry =
+            create_skill_registry_with_file(dir.path(), "my-skill", "refs/guide.md", "hello world");
+
+        let input = serde_json::json!({ "skill": "my-skill", "path": "refs/guide.md" });
+        let result = tool_skill_read_file(&input, Some(&registry), None).await;
+        assert_eq!(result.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn skill_read_file_rejects_traversal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = create_skill_registry_with_file(dir.path(), "evil", "dummy.txt", "ok");
+
+        let input = serde_json::json!({ "skill": "evil", "path": "../../etc/passwd" });
+        let result = tool_skill_read_file(&input, Some(&registry), None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn skill_read_file_rejects_unknown_skill() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = create_skill_registry_with_file(dir.path(), "exists", "f.txt", "ok");
+
+        let input = serde_json::json!({ "skill": "nope", "path": "f.txt" });
+        let result = tool_skill_read_file(&input, Some(&registry), None).await;
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn skill_read_file_rejects_absolute_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = create_skill_registry_with_file(dir.path(), "abs", "dummy.txt", "ok");
+
+        // Use a platform-appropriate absolute path so the test passes on Windows too.
+        let abs_path = std::env::temp_dir()
+            .join("passwd")
+            .to_string_lossy()
+            .into_owned();
+        let input = serde_json::json!({ "skill": "abs", "path": abs_path });
+        let result = tool_skill_read_file(&input, Some(&registry), None).await;
+        assert!(result.unwrap_err().contains("absolute paths"));
+    }
+
+    #[tokio::test]
+    async fn skill_read_file_enforces_allowlist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry =
+            create_skill_registry_with_file(dir.path(), "secret", "data.txt", "classified");
+
+        // Agent only allowed "other-skill", not "secret"
+        let allowed = vec!["other-skill".to_string()];
+        let input = serde_json::json!({ "skill": "secret", "path": "data.txt" });
+        let result = tool_skill_read_file(&input, Some(&registry), Some(&allowed)).await;
+        assert!(result.unwrap_err().contains("not allowed"));
+
+        // Empty allowlist means all skills are accessible
+        let empty: Vec<String> = vec![];
+        let result = tool_skill_read_file(&input, Some(&registry), Some(&empty)).await;
+        assert!(result.is_ok());
+
+        // None allowlist (deferred context) also allows access
+        let result = tool_skill_read_file(&input, Some(&registry), None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn skill_read_file_truncates_without_panic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Create content with multi-byte chars that exceeds 32K bytes
+        let content = "é".repeat(20_000); // 2 bytes each = 40K bytes
+        let registry = create_skill_registry_with_file(dir.path(), "big", "large.txt", &content);
+
+        let input = serde_json::json!({ "skill": "big", "path": "large.txt" });
+        let result = tool_skill_read_file(&input, Some(&registry), None)
+            .await
+            .unwrap();
+        assert!(result.contains("truncated"));
+        // Must not panic — the point of this test
+    }
+}
+
+// ── skill evolve frozen-registry gating ───────────────────────────
+
+#[tokio::test]
+async fn test_evolve_tools_rejected_when_registry_frozen() {
+    // In Stable mode (registry frozen) every evolution tool must
+    // refuse at the handler boundary, BEFORE touching disk. The
+    // `evolution` module underneath would happily write files that
+    // the frozen registry never loads — burning reviewer tokens
+    // and leaving disk state the operator explicitly didn't want.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut registry = SkillRegistry::new(tmp.path().to_path_buf());
+    registry.freeze();
+
+    let input = serde_json::json!({
+        "name": "gated",
+        "description": "x",
+        "prompt_context": "# x",
+        "tags": [],
+    });
+    let err = tool_skill_evolve_create(&input, Some(&registry), None)
+        .await
+        .expect_err("must reject under freeze");
+    assert!(
+        err.contains("frozen") || err.contains("Stable"),
+        "error must mention Stable/frozen, got: {err}"
+    );
+
+    let err = tool_skill_evolve_delete(&serde_json::json!({ "name": "gated" }), Some(&registry))
+        .await
+        .expect_err("delete must reject under freeze");
+    assert!(err.contains("frozen") || err.contains("Stable"));
+
+    let err = tool_skill_evolve_write_file(
+        &serde_json::json!({
+            "name": "gated",
+            "path": "references/x.md",
+            "content": "hi",
+        }),
+        Some(&registry),
+    )
+    .await
+    .expect_err("write_file must reject under freeze");
+    assert!(err.contains("frozen") || err.contains("Stable"));
 }

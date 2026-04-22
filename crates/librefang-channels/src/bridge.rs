@@ -9,8 +9,8 @@ use crate::roster::GroupRosterStore;
 use crate::router::AgentRouter;
 use crate::sanitizer::{InputSanitizer, SanitizeResult};
 use crate::types::{
-    default_phase_emoji, AgentPhase, ChannelAdapter, ChannelContent, ChannelMessage, ChannelUser,
-    GroupMember, LifecycleReaction, SenderContext,
+    default_phase_emoji, truncate_utf8, AgentPhase, ChannelAdapter, ChannelContent, ChannelMessage,
+    ChannelUser, GroupMember, InteractiveButton, LifecycleReaction, ParticipantRef, SenderContext,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -19,7 +19,7 @@ use librefang_types::config::{
     AutoRouteStrategy, ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat,
 };
 use librefang_types::message::ContentBlock;
-use regex::RegexSet;
+use regex::{Regex, RegexSet};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -116,6 +116,16 @@ pub trait ChannelBridgeHandle: Send + Sync {
         None
     }
 
+    /// Return (provider_id, display_name, auth_ok) for each provider.
+    async fn list_providers_interactive(&self) -> Vec<(String, String, bool)> {
+        Vec::new()
+    }
+
+    /// Return (model_id, display_name) for models belonging to the given provider.
+    async fn list_models_by_provider(&self, _provider_id: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
     /// Send an ephemeral "side question" (`/btw`) — answered with the agent's system
     /// prompt but without loading or saving session history.
     async fn send_message_ephemeral(
@@ -193,6 +203,19 @@ pub trait ChannelBridgeHandle: Send + Sync {
         _account_id: Option<&str>,
     ) -> Option<ChannelOverrides> {
         None
+    }
+
+    /// Lightweight LLM classification: should the bot reply to this group message?
+    ///
+    /// Returns `true` if the bot should reply, `false` to stay silent.
+    /// Default implementation always returns `true` (fail-open).
+    async fn classify_reply_intent(
+        &self,
+        _message_text: &str,
+        _sender_name: &str,
+        _model: Option<&str>,
+    ) -> bool {
+        true
     }
 
     /// Record a delivery result for tracking (optional — default no-op).
@@ -338,6 +361,42 @@ pub trait ChannelBridgeHandle: Send + Sync {
     ) -> Result<mpsc::Receiver<String>, String> {
         let _ = sender;
         self.send_message_streaming(agent_id, message).await
+    }
+
+    /// Streaming send that *also* reports the kernel's terminal success/error
+    /// once the stream completes. Callers that need accurate delivery metrics,
+    /// lifecycle reactions, and error suppression should use this variant —
+    /// the plain `send_message_streaming_with_sender` collapses everything
+    /// into the text channel, which makes it impossible to distinguish a
+    /// successful reply from a sanitized error message after the fact.
+    ///
+    /// The oneshot resolves to `Ok(())` on success and `Err(error_string)` on
+    /// failure (panic, kernel error, or LLM error). It is sent only once the
+    /// kernel join handle has resolved, so awaiting it after draining the
+    /// text receiver is safe.
+    ///
+    /// Default implementation preserves existing behavior by reporting
+    /// fake-success — implementers that can detect kernel failure (e.g. the
+    /// real `LibreFangKernel` impl) should override this to surface real
+    /// status.
+    async fn send_message_streaming_with_sender_status(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        sender: &SenderContext,
+    ) -> Result<
+        (
+            mpsc::Receiver<String>,
+            tokio::sync::oneshot::Receiver<Result<(), String>>,
+        ),
+        String,
+    > {
+        let rx = self
+            .send_message_streaming_with_sender(agent_id, message, sender)
+            .await?;
+        let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+        let _ = status_tx.send(Ok(()));
+        Ok((rx, status_rx))
     }
 
     /// Push a proactive outbound message to a channel recipient.
@@ -667,6 +726,36 @@ fn content_to_text(content: &ChannelContent) -> String {
         ChannelContent::FileData { filename, .. } => format!("[File: {filename}]"),
         ChannelContent::Interactive { text, .. } => text.clone(),
         ChannelContent::ButtonCallback { action, .. } => format!("[Button: {action}]"),
+        ChannelContent::DeleteMessage { message_id } => {
+            format!("[Delete message: {message_id}]")
+        }
+        ChannelContent::EditInteractive { text, .. } => text.clone(),
+        ChannelContent::Audio {
+            url,
+            caption,
+            duration_seconds,
+            ..
+        } => match caption {
+            Some(c) => format!("[Audio ({duration_seconds}s): {url}]\n{c}"),
+            None => format!("[Audio ({duration_seconds}s): {url}]"),
+        },
+        ChannelContent::Animation {
+            url,
+            caption,
+            duration_seconds,
+        } => match caption {
+            Some(c) => format!("[Animation ({duration_seconds}s): {url}]\n{c}"),
+            None => format!("[Animation ({duration_seconds}s): {url}]"),
+        },
+        ChannelContent::Sticker { file_id } => format!("[Sticker: {file_id}]"),
+        ChannelContent::MediaGroup { items } => format!("[Media group: {} items]", items.len()),
+        ChannelContent::Poll { question, .. } => format!("[Poll: {question}]"),
+        ChannelContent::PollAnswer {
+            poll_id,
+            option_ids,
+        } => {
+            format!("[Poll answer: poll={poll_id}, options={option_ids:?}]")
+        }
     }
 }
 
@@ -1389,6 +1478,120 @@ fn matches_group_trigger_pattern(
     matched
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2 §C — Positional vocative trigger + addressee guard (OB-04, OB-05)
+// ---------------------------------------------------------------------------
+
+/// Truncate `text` to `max` chars (UTF-8 safe) for log excerpts.
+fn truncate_excerpt(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    for (i, ch) in text.chars().enumerate() {
+        if i >= max {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Returns true when `LIBREFANG_GROUP_ADDRESSEE_GUARD=on`.
+///
+/// Per D-§C-6 the guard is shipped default-off for a 1-week observation
+/// window. While off, the legacy substring matcher remains authoritative
+/// and the new positional/addressee functions are bypassed in
+/// `should_process_group_message`.
+fn addressee_guard_enabled() -> bool {
+    std::env::var("LIBREFANG_GROUP_ADDRESSEE_GUARD")
+        .ok()
+        .as_deref()
+        == Some("on")
+}
+
+/// Detect a leading-vocative `<Capitalized>[,!]` token in `text`.
+///
+/// Returns the captured name (without the punctuation) when the turn opens
+/// with a vocative form like "Caterina,". The match is anchored at the start
+/// of the string after optional whitespace; only ASCII-style capitalized
+/// names are recognized (Italian/English vocatives — sufficient for §C).
+fn leading_vocative_name(text: &str) -> Option<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // ^\s* <Capitalized name (1+ letters)> followed by , or !
+        Regex::new(r"^\s*([A-ZÀ-Ý][A-Za-zÀ-ÿ]+)[,!]").expect("leading_vocative regex compiles")
+    });
+    re.captures(text)
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+}
+
+/// Strict positional vocative-trigger match for `pattern` in `text`.
+///
+/// True iff the (whole-word, case-sensitive — pattern is expected to be a
+/// proper name like "Signore") `pattern` appears either:
+///  * at the start of the turn after optional whitespace, or
+///  * immediately after a `[.!?]` punctuation boundary followed by whitespace.
+///
+/// Additionally REJECTED when another capitalized vocative appears BEFORE
+/// the matched pattern — this captures the Beeper-screenshot case
+/// `"Caterina, chiedi al Signore..."` where "Signore" is mentioned but the
+/// turn is addressed to Caterina.
+pub fn is_vocative_trigger(text: &str, pattern: &str) -> bool {
+    if text.is_empty() || pattern.is_empty() {
+        return false;
+    }
+    // Build a per-call regex (patterns vary per-agent and tests cover several).
+    // Pattern is a literal proper name; escape to avoid regex-meta surprises.
+    let escaped = regex::escape(pattern);
+    let combined = format!(r"(?:^|[.!?])\s*({escaped})\b", escaped = escaped);
+    let re = match Regex::new(&combined) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let Some(m) = re.find(text) else { return false };
+
+    // Heuristic: reject if any *other* capitalized vocative (`<Name>,`) appears
+    // BEFORE the pattern position. We scan only the prefix [0..match_start].
+    let prefix = &text[..m.start()];
+    static OTHER_VOCATIVE: OnceLock<Regex> = OnceLock::new();
+    let other = OTHER_VOCATIVE.get_or_init(|| {
+        Regex::new(r"\b([A-ZÀ-Ý][A-Za-zÀ-ÿ]+),\s").expect("other_vocative regex compiles")
+    });
+    for cap in other.captures_iter(prefix) {
+        if let Some(name) = cap.get(1) {
+            // If the prefix vocative IS the pattern itself we'd have matched at
+            // start; getting here means it's a *different* name → reject.
+            if !name.as_str().eq_ignore_ascii_case(pattern) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// True when the turn opens with a vocative addressed to a participant other
+/// than the agent (e.g. `"Caterina, chiedi..."` in a group containing
+/// Caterina + the Bot).
+///
+/// Heuristic: extract a leading `<Capitalized>[,!]` token and look it up
+/// (case-insensitively) in the participant roster. If found and not equal
+/// to `agent_name`, the turn is addressed to someone else.
+pub fn is_addressed_to_other_participant(
+    text: &str,
+    participants: &[ParticipantRef],
+    agent_name: &str,
+) -> bool {
+    let Some(name) = leading_vocative_name(text) else {
+        return false;
+    };
+    if name.eq_ignore_ascii_case(agent_name) {
+        return false;
+    }
+    participants.iter().any(|p| {
+        p.display_name.eq_ignore_ascii_case(&name)
+            && !p.display_name.eq_ignore_ascii_case(agent_name)
+    })
+}
+
 fn is_group_command(message: &ChannelMessage) -> bool {
     matches!(&message.content, ChannelContent::Command { .. })
         || matches!(&message.content, ChannelContent::Text(text) if text.starts_with('/'))
@@ -1458,13 +1661,64 @@ fn should_process_group_message(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let is_command = is_group_command(message);
-            let regex_triggered = !was_mentioned
-                && !is_command
-                && matches_group_trigger_pattern(
+            let text = text_content(message).unwrap_or("");
+            let sender_excerpt: &str = &message.sender.display_name;
+            let guard_on = addressee_guard_enabled();
+
+            // OB-04/OB-05 — addressee guard. When the turn opens with a vocative
+            // matching another participant in the group roster, abstain even if
+            // a substring of `group_trigger_patterns` matches mid-turn.
+            // (No owner short-circuit here: per OB-06 audit no `is_owner` branch
+            // exists in librefang-channels — owner is treated as any participant.)
+            if guard_on {
+                let participants = extract_group_participants(message);
+                let agent_name = extract_agent_name(message);
+                if is_addressed_to_other_participant(text, &participants, &agent_name) {
+                    info!(
+                        event = "group_gating_skip",
+                        reason = "addressed_to_other_participant",
+                        channel = ct_str,
+                        sender = %sender_excerpt,
+                        text_excerpt = %truncate_excerpt(text, 80),
+                        "OB-04: vocative addressed to other participant"
+                    );
+                    return false;
+                }
+            }
+
+            // Trigger-pattern check. Under guard-on we additionally require
+            // `is_vocative_trigger` (positional) on top of the substring match,
+            // so "Caterina, chiedi al Signore..." with pattern "Signore" no
+            // longer triggers (the substring matches but the position is wrong
+            // AND another vocative precedes it).
+            let regex_triggered = if !was_mentioned && !is_command {
+                let mut hit = matches_group_trigger_pattern(
                     ct_str,
                     message,
                     &overrides.group_trigger_patterns,
                 );
+                if hit && guard_on {
+                    let positional_ok = overrides
+                        .group_trigger_patterns
+                        .iter()
+                        .any(|p| is_vocative_trigger(text, p));
+                    if !positional_ok {
+                        info!(
+                            event = "group_gating_skip",
+                            reason = "vocative_position_mismatch",
+                            channel = ct_str,
+                            sender = %sender_excerpt,
+                            text_excerpt = %truncate_excerpt(text, 80),
+                            "OB-05: substring matched but not at vocative position"
+                        );
+                        hit = false;
+                    }
+                }
+                hit
+            } else {
+                false
+            };
+
             let alias_triggered = !was_mentioned
                 && !is_command
                 && !regex_triggered
@@ -1481,16 +1735,57 @@ fn should_process_group_message(
                     "Group message matched agent alias trigger"
                 );
             }
+
             if !was_mentioned && !is_command && !regex_triggered && !alias_triggered {
-                debug!(
-                    "Ignoring group message on {ct_str} (group_policy=mention_only, not mentioned)"
+                info!(
+                    event = "group_gating_skip",
+                    reason = "mention_only_no_mention",
+                    channel = ct_str,
+                    sender = %sender_excerpt,
+                    text_excerpt = %truncate_excerpt(text, 80),
+                    "OB-06: mention_only and bot was not mentioned"
                 );
                 return false;
             }
+            info!(
+                event = "group_gating_pass",
+                channel = ct_str,
+                sender = %sender_excerpt,
+                was_mentioned,
+                is_command,
+                regex_triggered,
+                "Group message accepted for processing"
+            );
             true
         }
         GroupPolicy::All => true,
     }
+}
+
+/// Read `group_participants` from the inbound message metadata payload
+/// (populated gateway-side by `sock.groupMetadata`). Returns empty when the
+/// channel doesn't supply a roster — the addressee guard then becomes a no-op
+/// (cannot fire false positives).
+fn extract_group_participants(message: &ChannelMessage) -> Vec<ParticipantRef> {
+    message
+        .metadata
+        .get("group_participants")
+        .and_then(|v| serde_json::from_value::<Vec<ParticipantRef>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Read the canonical agent display name from message metadata when the
+/// caller provides it (gateway/runtime injects so the addressee guard knows
+/// "this name == us"). Empty string when absent — `eq_ignore_ascii_case("")`
+/// then never matches a real participant name, so the guard simply checks
+/// whether the leading vocative belongs to another roster member.
+fn extract_agent_name(message: &ChannelMessage) -> String {
+    message
+        .metadata
+        .get("agent_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Build a `SenderContext` from an incoming `ChannelMessage`.
@@ -1535,7 +1830,14 @@ fn build_sender_context(
         .metadata
         .get("chat_id")
         .and_then(|v| v.as_str())
-        .map(String::from);
+        .map(String::from)
+        .or_else(|| {
+            if message.sender.platform_id.is_empty() {
+                None
+            } else {
+                Some(message.sender.platform_id.clone())
+            }
+        });
     let bot_username = message
         .metadata
         .get("bot_username")
@@ -1571,6 +1873,7 @@ fn build_sender_context(
     SenderContext {
         channel,
         user_id: sender_user_id(message).to_string(),
+        chat_id,
         display_name: message.sender.display_name.clone(),
         is_group: message.is_group,
         was_mentioned: message
@@ -1593,6 +1896,16 @@ fn build_sender_context(
         sender_username,
         group_members,
         chat_id,
+        // §C: forward roster from inbound payload (gateway populates via
+        // sock.groupMetadata). Empty for non-WhatsApp channels — addressee
+        // guard then becomes a no-op (BC-01).
+        group_participants: extract_group_participants(message),
+        // Channel bridges land in per-channel sessions (the default); only
+        // the dashboard WS opts into canonical storage.
+        use_canonical_session: false,
+        // Channel-originated traffic is never internal cron — [SILENT] markers
+        // coming from real users must be treated as literal message content.
+        is_internal_cron: false,
     }
 }
 
@@ -1942,6 +2255,22 @@ async fn dispatch_message(
             if !should_process_group_message(ct_str, ov, message, &[]) {
                 return;
             }
+            // Reply-intent precheck: lightweight LLM classification for group
+            // messages when group_policy is "all" and precheck is enabled.
+            // Skipped for mentions and commands (already filtered above).
+            if ov.reply_precheck && matches!(ov.group_policy, GroupPolicy::All) {
+                let text = text_content(message).unwrap_or("");
+                let sender = &message.sender.display_name;
+                let model = ov.reply_precheck_model.as_deref();
+                if !handle.classify_reply_intent(text, sender, model).await {
+                    debug!(
+                        channel = ct_str,
+                        sender = %sender,
+                        "Reply precheck declined — staying silent"
+                    );
+                    return;
+                }
+            }
         } else {
             // DM
             match ov.dm_policy {
@@ -1982,6 +2311,80 @@ async fn dispatch_message(
     // as normal text forwarded to the agent.
     if let ChannelContent::Command { ref name, ref args } = message.content {
         if is_command_allowed(name, overrides.as_ref()) {
+            // Special-case /agents: send an inline keyboard with one button per agent.
+            if name == "agents" {
+                let agents = handle.list_agents().await.unwrap_or_default();
+                if !agents.is_empty() {
+                    let buttons: Vec<Vec<InteractiveButton>> = agents
+                        .into_iter()
+                        .map(|(_, agent_name)| {
+                            // Telegram callback_data limit is 64 bytes.
+                            // "/agent " is 7 bytes; truncate name to 57 bytes if needed.
+                            let action = {
+                                let prefix = "/agent ";
+                                let safe_name = truncate_utf8(&agent_name, 64 - prefix.len());
+                                format!("{prefix}{safe_name}")
+                            };
+                            vec![InteractiveButton {
+                                label: agent_name,
+                                action,
+                                style: None,
+                                url: None,
+                            }]
+                        })
+                        .collect();
+                    let content = ChannelContent::Interactive {
+                        text: "Select an agent:".to_string(),
+                        buttons,
+                    };
+                    let result = if let Some(tid) = thread_id {
+                        adapter.send_in_thread(&message.sender, content, tid).await
+                    } else {
+                        adapter.send(&message.sender, content).await
+                    };
+                    if let Err(e) = result {
+                        error!("Failed to send /agents interactive message: {e}");
+                    }
+                    return;
+                }
+                // Empty agent list — fall through to handle_command for plain text response.
+            }
+            // Special-case /models: send an inline keyboard with one button per provider.
+            if name == "models" {
+                let providers = handle.list_providers_interactive().await;
+                if !providers.is_empty() {
+                    let buttons: Vec<Vec<InteractiveButton>> = providers
+                        .into_iter()
+                        .map(|(pid, pname, _auth_ok)| {
+                            let action = {
+                                let prefix = "prov:";
+                                let safe_id = truncate_utf8(&pid, 64 - prefix.len());
+                                format!("{prefix}{safe_id}")
+                            };
+                            vec![InteractiveButton {
+                                label: pname,
+                                action,
+                                style: None,
+                                url: None,
+                            }]
+                        })
+                        .collect();
+                    let content = ChannelContent::Interactive {
+                        text: "Select a provider:".to_string(),
+                        buttons,
+                    };
+                    let result = if let Some(tid) = thread_id {
+                        adapter.send_in_thread(&message.sender, content, tid).await
+                    } else {
+                        adapter.send(&message.sender, content).await
+                    };
+                    if let Err(e) = result {
+                        error!("Failed to send /models interactive message: {e}");
+                    }
+                    return;
+                }
+                // Empty provider list — fall through to handle_command for plain text response.
+            }
             let result = handle_command(
                 name,
                 args,
@@ -2073,6 +2476,127 @@ async fn dispatch_message(
         // Image download failed — fall through to text description below
     }
 
+    // Intercept interactive menu callbacks before forwarding to LLM.
+    if let ChannelContent::ButtonCallback { ref action, .. } = message.content {
+        if action.starts_with("prov:") || action.starts_with("model:") || action == "back:providers"
+        {
+            let mid = message
+                .metadata
+                .get("message_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            let Some(message_id) = mid else {
+                debug!("ButtonCallback menu: missing message_id in metadata, ignoring");
+                return;
+            };
+            if action.starts_with("prov:") {
+                let provider_id = action.strip_prefix("prov:").unwrap_or("");
+                let models = handle.list_models_by_provider(provider_id).await;
+                let provider_label = provider_id.to_string();
+                let mut buttons: Vec<Vec<InteractiveButton>> = models
+                    .iter()
+                    .map(|(mid_str, mlabel)| {
+                        let action_str = {
+                            let prefix = "model:";
+                            let safe_id = truncate_utf8(mid_str, 64 - prefix.len());
+                            format!("{prefix}{safe_id}")
+                        };
+                        vec![InteractiveButton {
+                            label: mlabel.clone(),
+                            action: action_str,
+                            style: None,
+                            url: None,
+                        }]
+                    })
+                    .collect();
+                buttons.push(vec![InteractiveButton {
+                    label: "\u{2B05} Back".to_string(),
+                    action: "back:providers".to_string(),
+                    style: None,
+                    url: None,
+                }]);
+                let content = ChannelContent::EditInteractive {
+                    message_id,
+                    text: format!("{provider_label} \u{2014} select a model:"),
+                    buttons,
+                };
+                let result = if let Some(tid) = thread_id {
+                    adapter.send_in_thread(&message.sender, content, tid).await
+                } else {
+                    adapter.send(&message.sender, content).await
+                };
+                if let Err(e) = result {
+                    error!("Failed to send provider models menu: {e}");
+                }
+            } else if action == "back:providers" {
+                let providers = handle.list_providers_interactive().await;
+                let buttons: Vec<Vec<InteractiveButton>> = providers
+                    .into_iter()
+                    .map(|(pid, pname, _auth_ok)| {
+                        let action_str = {
+                            let prefix = "prov:";
+                            let safe_id = truncate_utf8(&pid, 64 - prefix.len());
+                            format!("{prefix}{safe_id}")
+                        };
+                        vec![InteractiveButton {
+                            label: pname,
+                            action: action_str,
+                            style: None,
+                            url: None,
+                        }]
+                    })
+                    .collect();
+                let content = ChannelContent::EditInteractive {
+                    message_id,
+                    text: "Select a provider:".to_string(),
+                    buttons,
+                };
+                let result = if let Some(tid) = thread_id {
+                    adapter.send_in_thread(&message.sender, content, tid).await
+                } else {
+                    adapter.send(&message.sender, content).await
+                };
+                if let Err(e) = result {
+                    error!("Failed to send providers back menu: {e}");
+                }
+            } else if action.starts_with("model:") {
+                let model_id = action.strip_prefix("model:").unwrap_or("");
+                let agent_id = router.resolve(
+                    &message.channel,
+                    &message.sender.platform_id,
+                    message.sender.librefang_user.as_deref(),
+                );
+                let label = {
+                    // Best-effort: look up display name from all providers
+                    // (we don't know which provider this model belongs to here)
+                    model_id.to_string()
+                };
+                let confirmation = if let Some(aid) = agent_id {
+                    match handle.set_model(aid, model_id).await {
+                        Ok(_) => format!("\u{2705} Active model: {label}"),
+                        Err(e) => format!("\u{274C} Could not set model: {e}"),
+                    }
+                } else {
+                    format!("\u{2705} Active model: {label}\n(No agent selected \u{2014} use /agent to choose one)")
+                };
+                let content = ChannelContent::EditInteractive {
+                    message_id,
+                    text: confirmation,
+                    buttons: vec![],
+                };
+                let result = if let Some(tid) = thread_id {
+                    adapter.send_in_thread(&message.sender, content, tid).await
+                } else {
+                    adapter.send(&message.sender, content).await
+                };
+                if let Err(e) = result {
+                    error!("Failed to send model confirmation: {e}");
+                }
+            }
+            return;
+        }
+    }
+
     let text = match &message.content {
         ChannelContent::Text(t) => t.clone(),
         ChannelContent::Command { name, args } => reconstruct_command_text(name, args),
@@ -2141,6 +2665,58 @@ async fn dispatch_message(
                 }
             }
         }
+        ChannelContent::DeleteMessage { ref message_id } => {
+            format!("[Delete message: {message_id}]")
+        }
+        ChannelContent::EditInteractive { ref text, .. } => text.clone(),
+        ChannelContent::Audio {
+            ref url,
+            ref caption,
+            duration_seconds,
+            ..
+        } => match caption {
+            Some(c) => format!("[User sent audio ({duration_seconds}s): {url}]\nCaption: {c}"),
+            None => format!("[User sent audio ({duration_seconds}s): {url}]"),
+        },
+        ChannelContent::Animation {
+            ref url,
+            ref caption,
+            duration_seconds,
+        } => match caption {
+            Some(c) => {
+                format!("[User sent animation ({duration_seconds}s): {url}]\nCaption: {c}")
+            }
+            None => format!("[User sent animation ({duration_seconds}s): {url}]"),
+        },
+        ChannelContent::Sticker { ref file_id } => format!("[User sent sticker: {file_id}]"),
+        ChannelContent::MediaGroup { ref items } => {
+            format!("[User sent media group: {} items]", items.len())
+        }
+        ChannelContent::Poll { ref question, .. } => format!("[Poll: {question}]"),
+        ChannelContent::PollAnswer {
+            ref poll_id,
+            ref option_ids,
+        } => {
+            let question = message
+                .metadata
+                .get("poll_question")
+                .and_then(|v| v.as_str())
+                .unwrap_or(poll_id);
+            let options: Vec<String> = message
+                .metadata
+                .get("poll_options")
+                .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                .unwrap_or_default();
+            if options.is_empty() {
+                format!("[User answered poll {poll_id}: options {option_ids:?}]")
+            } else {
+                let selected: Vec<&str> = option_ids
+                    .iter()
+                    .filter_map(|&i| options.get(i as usize).map(|s| s.as_str()))
+                    .collect();
+                format!("[User answered poll \"{question}\": selected {selected:?}]")
+            }
+        }
     };
 
     // Check if it's a slash command embedded in text (e.g. "/agents")
@@ -2186,6 +2762,80 @@ async fn dispatch_message(
                 | "a2a"
         ) {
             if is_command_allowed(cmd, overrides.as_ref()) {
+                // Special-case /agents: send an inline keyboard with one button per agent.
+                if cmd == "agents" {
+                    let agents = handle.list_agents().await.unwrap_or_default();
+                    if !agents.is_empty() {
+                        let buttons: Vec<Vec<InteractiveButton>> = agents
+                            .into_iter()
+                            .map(|(_, name)| {
+                                // Telegram callback_data limit is 64 bytes.
+                                // "/agent " is 7 bytes; truncate name to 57 bytes if needed.
+                                let action = {
+                                    let prefix = "/agent ";
+                                    let safe_name = truncate_utf8(&name, 64 - prefix.len());
+                                    format!("{prefix}{safe_name}")
+                                };
+                                vec![InteractiveButton {
+                                    label: name,
+                                    action,
+                                    style: None,
+                                    url: None,
+                                }]
+                            })
+                            .collect();
+                        let content = ChannelContent::Interactive {
+                            text: "Select an agent:".to_string(),
+                            buttons,
+                        };
+                        let result = if let Some(tid) = thread_id {
+                            adapter.send_in_thread(&message.sender, content, tid).await
+                        } else {
+                            adapter.send(&message.sender, content).await
+                        };
+                        if let Err(e) = result {
+                            error!("Failed to send /agents interactive message: {e}");
+                        }
+                        return;
+                    }
+                    // Empty agent list — fall through to handle_command for plain text response.
+                }
+                // Special-case /models: send an inline keyboard with one button per provider.
+                if cmd == "models" {
+                    let providers = handle.list_providers_interactive().await;
+                    if !providers.is_empty() {
+                        let buttons: Vec<Vec<InteractiveButton>> = providers
+                            .into_iter()
+                            .map(|(pid, pname, _auth_ok)| {
+                                let action = {
+                                    let prefix = "prov:";
+                                    let safe_id = truncate_utf8(&pid, 64 - prefix.len());
+                                    format!("{prefix}{safe_id}")
+                                };
+                                vec![InteractiveButton {
+                                    label: pname,
+                                    action,
+                                    style: None,
+                                    url: None,
+                                }]
+                            })
+                            .collect();
+                        let content = ChannelContent::Interactive {
+                            text: "Select a provider:".to_string(),
+                            buttons,
+                        };
+                        let result = if let Some(tid) = thread_id {
+                            adapter.send_in_thread(&message.sender, content, tid).await
+                        } else {
+                            adapter.send(&message.sender, content).await
+                        };
+                        if let Err(e) = result {
+                            error!("Failed to send /models interactive message: {e}");
+                        }
+                        return;
+                    }
+                    // Empty provider list — fall through to handle_command for plain text response.
+                }
                 let result = handle_command(
                     cmd,
                     &args,
@@ -2450,12 +3100,26 @@ async fn dispatch_message(
 
     // Streaming path: if the adapter supports progressive output, pipe text
     // deltas directly to it instead of waiting for the full response.
+    //
+    // We use the `_status` variant of the streaming kernel call so we can
+    // distinguish four outcomes once both `send_streaming` and the kernel
+    // have settled:
+    //   1. send_streaming Ok + kernel Ok  → real success
+    //   2. send_streaming Ok + kernel Err → adapter delivered partial text
+    //      but the agent loop ultimately failed; emit Error reaction and
+    //      record_delivery(false) so metrics reflect reality
+    //   3. send_streaming Err + kernel Ok → adapter HTTP failed mid-stream
+    //      but the agent loop produced a clean response; fall back to
+    //      send_response(buffered_text) and emit Done
+    //   4. send_streaming Err + kernel Err → both failed; honor
+    //      suppress_error_responses when delivering the buffered error
+    //      text via the fallback path
     if adapter.supports_streaming() {
         match handle
-            .send_message_streaming_with_sender(agent_id, &text, &sender_ctx)
+            .send_message_streaming_with_sender_status(agent_id, &text, &sender_ctx)
             .await
         {
-            Ok(mut delta_rx) => {
+            Ok((mut delta_rx, status_rx)) => {
                 send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Streaming)
                     .await;
 
@@ -2486,25 +3150,42 @@ async fn dispatch_message(
                     buffered_text = text;
                 }
 
+                // Status is sent after the text channel fully drains, so
+                // awaiting here will not block longer than the stream itself.
+                let kernel_status = status_rx.await.unwrap_or(Ok(()));
+                let kernel_ok = kernel_status.is_ok();
+                let kernel_err_str = kernel_status.as_ref().err().cloned();
+
                 match &stream_result {
                     Ok(()) => {
-                        send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done)
-                            .await;
+                        // Adapter delivered. Final state depends on whether
+                        // the agent loop itself succeeded.
+                        let phase = if kernel_ok {
+                            AgentPhase::Done
+                        } else {
+                            AgentPhase::Error
+                        };
+                        send_lifecycle_reaction(adapter, &message.sender, msg_id, phase).await;
                         handle
                             .record_delivery(
                                 agent_id,
                                 ct_str,
                                 &message.sender.platform_id,
-                                true,
-                                None,
+                                kernel_ok,
+                                kernel_err_str.as_deref(),
                                 thread_id,
                             )
                             .await;
                         if let Some(j) = journal {
+                            let jstatus = if kernel_ok {
+                                crate::message_journal::JournalStatus::Completed
+                            } else {
+                                crate::message_journal::JournalStatus::Failed
+                            };
                             j.update_status(
                                 &message.platform_message_id,
-                                crate::message_journal::JournalStatus::Completed,
-                                None,
+                                jstatus,
+                                kernel_err_str.clone(),
                             )
                             .await;
                         }
@@ -2512,9 +3193,15 @@ async fn dispatch_message(
                     }
                     Err(e) => {
                         warn!("Streaming send failed, falling back to non-streaming: {e}");
-                        // Fall back: re-send the full accumulated text via the
-                        // non-streaming path so the user still gets a response.
-                        if !buffered_text.is_empty() {
+                        // Fall back: re-send the full accumulated text via
+                        // send_response so the user still gets a response.
+                        // Honor suppress_error_responses when the kernel
+                        // failed — the buffered text will contain a
+                        // sanitized error string we should not leak to
+                        // public-feed adapters.
+                        if !buffered_text.is_empty()
+                            && (kernel_ok || !adapter.suppress_error_responses())
+                        {
                             send_response(
                                 adapter,
                                 &message.sender,
@@ -2523,34 +3210,49 @@ async fn dispatch_message(
                                 output_format,
                             )
                             .await;
-                            send_lifecycle_reaction(
-                                adapter,
-                                &message.sender,
-                                msg_id,
-                                AgentPhase::Done,
-                            )
-                            .await;
+                            let phase = if kernel_ok {
+                                AgentPhase::Done
+                            } else {
+                                AgentPhase::Error
+                            };
+                            send_lifecycle_reaction(adapter, &message.sender, msg_id, phase).await;
+                            // Pair the err field with the success flag — when
+                            // kernel succeeded, the fallback send_response
+                            // delivered the real reply, so the transport-side
+                            // stream error is irrelevant to delivery accounting
+                            // (record_delivery=true with err=Some is a
+                            // contradictory signal). When kernel failed, keep
+                            // the kernel error string so metrics know why.
+                            // (`e`, the stream transport error, was already
+                            // logged via warn! above.)
+                            let err_str = if kernel_ok {
+                                None
+                            } else {
+                                kernel_err_str.clone()
+                            };
                             handle
                                 .record_delivery(
                                     agent_id,
                                     ct_str,
                                     &message.sender.platform_id,
-                                    true,
-                                    None,
+                                    kernel_ok,
+                                    err_str.as_deref(),
                                     thread_id,
                                 )
                                 .await;
                             if let Some(j) = journal {
-                                j.update_status(
-                                    &message.platform_message_id,
-                                    crate::message_journal::JournalStatus::Completed,
-                                    None,
-                                )
-                                .await;
+                                let jstatus = if kernel_ok {
+                                    crate::message_journal::JournalStatus::Completed
+                                } else {
+                                    crate::message_journal::JournalStatus::Failed
+                                };
+                                j.update_status(&message.platform_message_id, jstatus, err_str)
+                                    .await;
                             }
                             return;
                         }
-                        // Buffer was empty — fall through to non-streaming path.
+                        // Buffer was empty OR kernel errored on a
+                        // suppress_error_responses adapter — give up cleanly.
                         send_lifecycle_reaction(
                             adapter,
                             &message.sender,
@@ -2558,13 +3260,14 @@ async fn dispatch_message(
                             AgentPhase::Error,
                         )
                         .await;
+                        let err_str = kernel_err_str.unwrap_or_else(|| e.to_string());
                         handle
                             .record_delivery(
                                 agent_id,
                                 ct_str,
                                 &message.sender.platform_id,
                                 false,
-                                Some(&e.to_string()),
+                                Some(&err_str),
                                 thread_id,
                             )
                             .await;
@@ -2572,7 +3275,7 @@ async fn dispatch_message(
                             j.update_status(
                                 &message.platform_message_id,
                                 crate::message_journal::JournalStatus::Failed,
-                                Some(e.to_string()),
+                                Some(err_str),
                             )
                             .await;
                         }
@@ -2588,7 +3291,76 @@ async fn dispatch_message(
         }
     }
 
-    // Non-streaming path: send to agent and relay response (with sender identity).
+    // Non-streaming-adapter path. We route through the kernel's streaming
+    // API (via `_status` variant) so progress events (tool invocations,
+    // errors) get surfaced into the accumulated text — the channel bridge
+    // injects "🔧 tool_name" and "⚠️ tool failed" lines for streaming
+    // consumers, and we want non-streaming adapters (Discord/Slack/Matrix/...)
+    // to show those too. We accumulate deltas and send once via send_response
+    // so output_format and thread_id are still honored.
+    //
+    // The `_status` variant returns a oneshot that resolves to the kernel's
+    // terminal Result. We use it to drive the correct lifecycle reaction
+    // (Done vs Error), accurate `record_delivery` success metric, journal
+    // status, and to honor `suppress_error_responses` on public-feed adapters
+    // (Mastodon) — accumulated text contains a sanitized error string when
+    // the agent loop fails, which we must not leak to a public timeline.
+    //
+    // If the streaming kernel call is unavailable up-front we fall through
+    // to the non-streaming kernel call — preserves the pre-existing
+    // `handle_send_error` retry / re-resolution path.
+    if let Ok((mut delta_rx, status_rx)) = handle
+        .send_message_streaming_with_sender_status(agent_id, &text, &sender_ctx)
+        .await
+    {
+        let mut accumulated = String::new();
+        while let Some(delta) = delta_rx.recv().await {
+            accumulated.push_str(&delta);
+        }
+        // Status is sent after the text channel fully drains, so awaiting
+        // here will not block longer than the stream itself.
+        let kernel_status = status_rx.await.unwrap_or(Ok(()));
+        let success = kernel_status.is_ok();
+        let phase = if success {
+            AgentPhase::Done
+        } else {
+            AgentPhase::Error
+        };
+        send_lifecycle_reaction(adapter, &message.sender, msg_id, phase).await;
+        if !accumulated.is_empty() && (success || !adapter.suppress_error_responses()) {
+            send_response(
+                adapter,
+                &message.sender,
+                accumulated,
+                thread_id,
+                output_format,
+            )
+            .await;
+        }
+        let err_str = kernel_status.as_ref().err().cloned();
+        handle
+            .record_delivery(
+                agent_id,
+                ct_str,
+                &message.sender.platform_id,
+                success,
+                err_str.as_deref(),
+                thread_id,
+            )
+            .await;
+        if let Some(j) = journal {
+            let jstatus = if success {
+                crate::message_journal::JournalStatus::Completed
+            } else {
+                crate::message_journal::JournalStatus::Failed
+            };
+            j.update_status(&message.platform_message_id, jstatus, err_str)
+                .await;
+        }
+        return;
+    }
+
+    // Fallback: streaming kernel call unavailable for this request.
     match handle
         .send_message_with_sender(agent_id, &text, &sender_ctx)
         .await
@@ -3430,6 +4202,27 @@ mod tests {
     use crate::types::ChannelType;
     use std::sync::Mutex;
 
+    /// Serialize every test in this module that reads OR writes
+    /// `LIBREFANG_GROUP_ADDRESSEE_GUARD`. The nested
+    /// `should_process_group_message_v2` module has its own copy of this
+    /// pattern for its tests; without serialization at this level too,
+    /// `test_mention_only_*` tests that live in the outer module flake
+    /// under parallel execution — they read the env var through
+    /// `addressee_guard_enabled()` while v2 tests concurrently mutate
+    /// it, and occasionally see `guard=on` when they expect the default.
+    pub(super) static ADDRESSEE_GUARD_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire the env lock and clear the guard var for the duration of
+    /// the test so reads return `false` deterministically. Intended for
+    /// tests that assume the default (guard-off) behavior.
+    pub(super) fn with_guard_off_locked<F: FnOnce()>(f: F) {
+        let _g = ADDRESSEE_GUARD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LIBREFANG_GROUP_ADDRESSEE_GUARD");
+        f();
+    }
+
     #[test]
     fn test_is_command_allowed_default_allows_everything() {
         // No overrides configured — all commands allowed (current behaviour).
@@ -3716,62 +4509,70 @@ mod tests {
 
     #[test]
     fn test_mention_only_allows_regex_trigger_pattern() {
-        let message = group_text_message("hello MyAgent");
-        let overrides = ChannelOverrides {
-            group_trigger_patterns: vec!["(?i)\\bmyagent\\b".to_string()],
-            ..Default::default()
-        };
-        assert!(should_process_group_message(
-            "whatsapp",
-            &overrides,
-            &message,
-            &[]
-        ));
+        with_guard_off_locked(|| {
+            let message = group_text_message("hello MyAgent");
+            let overrides = ChannelOverrides {
+                group_trigger_patterns: vec!["(?i)\\bmyagent\\b".to_string()],
+                ..Default::default()
+            };
+            assert!(should_process_group_message(
+                "whatsapp",
+                &overrides,
+                &message,
+                &[]
+            ));
+        });
     }
 
     #[test]
     fn test_mention_only_rejects_partial_regex_match() {
-        let message = group_text_message("hello myagenttt");
-        let overrides = ChannelOverrides {
-            group_trigger_patterns: vec!["(?i)\\bmyagent\\b".to_string()],
-            ..Default::default()
-        };
-        assert!(!should_process_group_message(
-            "whatsapp",
-            &overrides,
-            &message,
-            &[]
-        ));
+        with_guard_off_locked(|| {
+            let message = group_text_message("hello myagenttt");
+            let overrides = ChannelOverrides {
+                group_trigger_patterns: vec!["(?i)\\bmyagent\\b".to_string()],
+                ..Default::default()
+            };
+            assert!(!should_process_group_message(
+                "whatsapp",
+                &overrides,
+                &message,
+                &[]
+            ));
+        });
     }
 
     #[test]
     fn test_mention_only_skips_invalid_regex_patterns() {
-        let message = group_text_message("bot please reply");
-        let overrides = ChannelOverrides {
-            group_trigger_patterns: vec!["(".to_string(), "(?i)\\bbot\\b".to_string()],
-            ..Default::default()
-        };
-        assert!(should_process_group_message(
-            "telegram",
-            &overrides,
-            &message,
-            &[]
-        ));
+        with_guard_off_locked(|| {
+            let message = group_text_message("bot please reply");
+            let overrides = ChannelOverrides {
+                group_trigger_patterns: vec!["(".to_string(), "(?i)\\bbot\\b".to_string()],
+                ..Default::default()
+            };
+            assert!(should_process_group_message(
+                "telegram",
+                &overrides,
+                &message,
+                &[]
+            ));
+        });
     }
 
     #[test]
     fn test_mention_only_keeps_existing_mention_behavior() {
-        let mut message = group_text_message("hello there");
-        message
-            .metadata
-            .insert("was_mentioned".to_string(), serde_json::Value::Bool(true));
-        let overrides = ChannelOverrides::default();
-        assert!(should_process_group_message(
-            "telegram",
-            &overrides,
-            &message,
-            &[]
-        ));
+        with_guard_off_locked(|| {
+            let mut message = group_text_message("hello there");
+            message
+                .metadata
+                .insert("was_mentioned".to_string(), serde_json::Value::Bool(true));
+            let overrides = ChannelOverrides::default();
+            assert!(should_process_group_message(
+                "telegram",
+                &overrides,
+                &message,
+                &[]
+            ));
+        });
     }
 
     #[test]
@@ -4169,6 +4970,121 @@ mod tests {
         assert_eq!(content_to_text(&cb), "[Button: approve]");
     }
 
+    #[test]
+    fn test_content_to_text_audio() {
+        let content = ChannelContent::Audio {
+            url: "https://example.com/song.mp3".to_string(),
+            caption: Some("My song".to_string()),
+            duration_seconds: 180,
+            title: Some("Song Title".to_string()),
+            performer: Some("Artist".to_string()),
+        };
+        let text = content_to_text(&content);
+        assert!(
+            text.contains("song.mp3") || text.contains("Song Title") || text.contains("Audio"),
+            "Audio content_to_text should contain meaningful info, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_content_to_text_audio_no_caption() {
+        let content = ChannelContent::Audio {
+            url: "https://example.com/track.mp3".to_string(),
+            caption: None,
+            duration_seconds: 60,
+            title: None,
+            performer: None,
+        };
+        let text = content_to_text(&content);
+        assert!(
+            !text.is_empty(),
+            "Audio without caption should still produce text"
+        );
+    }
+
+    #[test]
+    fn test_content_to_text_animation() {
+        let content = ChannelContent::Animation {
+            url: "https://example.com/funny.gif".to_string(),
+            caption: Some("LOL".to_string()),
+            duration_seconds: 5,
+        };
+        let text = content_to_text(&content);
+        assert!(
+            text.contains("LOL") || text.contains("Animation") || text.contains("funny.gif"),
+            "Animation content_to_text should contain meaningful info, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_content_to_text_sticker() {
+        let content = ChannelContent::Sticker {
+            file_id: "CAACAgIAAxkBAAI".to_string(),
+        };
+        let text = content_to_text(&content);
+        assert!(!text.is_empty(), "Sticker should produce non-empty text");
+    }
+
+    #[test]
+    fn test_content_to_text_media_group() {
+        let content = ChannelContent::MediaGroup {
+            items: vec![
+                crate::types::MediaGroupItem::Photo {
+                    url: "https://example.com/1.jpg".to_string(),
+                    caption: Some("First".to_string()),
+                },
+                crate::types::MediaGroupItem::Video {
+                    url: "https://example.com/2.mp4".to_string(),
+                    caption: None,
+                    duration_seconds: 30,
+                },
+            ],
+        };
+        let text = content_to_text(&content);
+        assert!(
+            text.contains("2") || text.contains("album") || text.contains("media"),
+            "MediaGroup should mention item count or type, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_content_to_text_poll() {
+        let content = ChannelContent::Poll {
+            question: "What is 2+2?".to_string(),
+            options: vec!["3".to_string(), "4".to_string(), "5".to_string()],
+            is_quiz: true,
+            correct_option_id: Some(1),
+            explanation: Some("Basic math".to_string()),
+        };
+        let text = content_to_text(&content);
+        assert!(
+            text.contains("2+2") || text.contains("Poll") || text.contains("quiz"),
+            "Poll should contain the question or type, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_content_to_text_poll_answer() {
+        let content = ChannelContent::PollAnswer {
+            poll_id: "poll_123".to_string(),
+            option_ids: vec![0, 2],
+        };
+        let text = content_to_text(&content);
+        assert!(!text.is_empty(), "PollAnswer should produce non-empty text");
+    }
+
+    #[test]
+    fn test_content_to_text_delete_message() {
+        let content = ChannelContent::DeleteMessage {
+            message_id: "42".to_string(),
+        };
+        let text = content_to_text(&content);
+        assert!(
+            text.contains("42") || text.contains("delete") || text.contains("Delete"),
+            "DeleteMessage should mention message_id or action, got: {text}"
+        );
+    }
+
     mod message_debouncer {
         use super::*;
         use std::collections::HashMap;
@@ -4408,6 +5324,319 @@ mod tests {
             assert!(result.is_some());
             let (drained_msg, _) = result.unwrap();
             assert_content_eq(&drained_msg.content, "1\n2");
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 2 §C — Vocative trigger + addressee guard tests (OB-04, OB-05)
+    // ---------------------------------------------------------------------
+
+    mod vocative_tests {
+        use super::super::is_vocative_trigger;
+
+        #[test]
+        fn matches_at_start_of_turn_with_comma() {
+            assert!(is_vocative_trigger("Signore, dimmi", "Signore"));
+        }
+
+        #[test]
+        fn matches_at_start_of_turn_with_space() {
+            assert!(is_vocative_trigger("Signore chiedi al bot", "Signore"));
+        }
+
+        #[test]
+        fn matches_after_strong_punctuation() {
+            assert!(is_vocative_trigger("ciao. Signore, come va?", "Signore"));
+        }
+
+        #[test]
+        fn matches_with_leading_whitespace() {
+            assert!(is_vocative_trigger("  Signore, ...", "Signore"));
+        }
+
+        #[test]
+        fn rejects_other_capitalized_vocative_before_pattern() {
+            // The Beeper-screenshot case (user directive).
+            assert!(!is_vocative_trigger(
+                "Caterina, chiedi al Signore il pagamento",
+                "Signore"
+            ));
+        }
+
+        #[test]
+        fn rejects_when_not_at_vocative_position() {
+            assert!(!is_vocative_trigger(
+                "Ieri il Signore ha detto di...",
+                "Signore"
+            ));
+        }
+
+        #[test]
+        fn rejects_lowercase_substring() {
+            // Pattern is "Signore" (proper-name); lowercase should not match.
+            assert!(!is_vocative_trigger("il signore è arrivato", "Signore"));
+        }
+
+        #[test]
+        fn rejects_with_alessandro_then_signore() {
+            assert!(!is_vocative_trigger(
+                "Alessandro, dopo chiama il Signore",
+                "Signore"
+            ));
+        }
+
+        #[test]
+        fn word_boundary_signori_not_signore() {
+            assert!(!is_vocative_trigger("Signori, ascoltate", "Signore"));
+        }
+
+        #[test]
+        fn empty_text_returns_false() {
+            assert!(!is_vocative_trigger("", "Signore"));
+        }
+
+        #[test]
+        fn dammi_il_signore_rejected() {
+            assert!(!is_vocative_trigger("dammi il Signore", "Signore"));
+        }
+    }
+
+    mod addressee_tests {
+        use super::super::is_addressed_to_other_participant;
+        use crate::types::ParticipantRef;
+
+        fn roster(names: &[&str]) -> Vec<ParticipantRef> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| ParticipantRef {
+                    jid: format!("{}@s.whatsapp.net", i),
+                    display_name: (*n).to_string(),
+                })
+                .collect()
+        }
+
+        #[test]
+        fn caterina_with_caterina_in_roster_returns_true() {
+            let r = roster(&["Caterina", "Ambrogio"]);
+            assert!(is_addressed_to_other_participant(
+                "Caterina, chiedi...",
+                &r,
+                "Ambrogio"
+            ));
+        }
+
+        #[test]
+        fn agent_addressed_returns_false() {
+            let r = roster(&["Caterina", "Ambrogio"]);
+            assert!(!is_addressed_to_other_participant(
+                "Ambrogio, vieni qui",
+                &r,
+                "Ambrogio"
+            ));
+        }
+
+        #[test]
+        fn no_vocative_returns_false() {
+            let r = roster(&["Caterina", "Ambrogio"]);
+            assert!(!is_addressed_to_other_participant(
+                "stamattina è bello",
+                &r,
+                "Ambrogio"
+            ));
+        }
+
+        #[test]
+        fn exclamation_vocative_recognized() {
+            let r = roster(&["Caterina", "Bot"]);
+            assert!(is_addressed_to_other_participant("Caterina!", &r, "Bot"));
+        }
+
+        #[test]
+        fn beeper_screenshot_full_turn() {
+            let r = roster(&["Caterina", "Bot"]);
+            assert!(is_addressed_to_other_participant(
+                "Caterina, chiedi al Signore il pagamento",
+                &r,
+                "Bot"
+            ));
+        }
+
+        #[test]
+        fn name_not_in_roster_returns_false() {
+            // "Marco," is a vocative but Marco isn't a participant — guard
+            // does not fire (avoids false positives on names that happen to
+            // start a sentence but aren't in the group).
+            let r = roster(&["Caterina", "Bot"]);
+            assert!(!is_addressed_to_other_participant(
+                "Marco, dove sei?",
+                &r,
+                "Bot"
+            ));
+        }
+
+        #[test]
+        fn case_insensitive_match() {
+            let r = roster(&["caterina", "Bot"]);
+            assert!(is_addressed_to_other_participant(
+                "Caterina, vieni qui",
+                &r,
+                "Bot"
+            ));
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // §C wiring tests — should_process_group_message + guard flag behavior
+    // ---------------------------------------------------------------------
+
+    mod should_process_group_message_v2 {
+        use super::super::{should_process_group_message, ParticipantRef};
+        use super::group_text_message;
+        use librefang_types::config::{ChannelOverrides, GroupPolicy};
+        use serde_json::json;
+
+        // Reuse the outer module's env lock so tests across BOTH modules
+        // serialize their reads/writes of LIBREFANG_GROUP_ADDRESSEE_GUARD.
+        // Two independent Mutexes meant v2 tests could mutate the env var
+        // while outer-module `test_mention_only_*` tests read it via
+        // `addressee_guard_enabled()`, causing flakes under `cargo test`
+        // parallel execution.
+        use super::ADDRESSEE_GUARD_ENV_LOCK as ENV_LOCK;
+
+        fn with_guard_on<F: FnOnce()>(f: F) {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("LIBREFANG_GROUP_ADDRESSEE_GUARD", "on");
+            f();
+            std::env::remove_var("LIBREFANG_GROUP_ADDRESSEE_GUARD");
+        }
+
+        fn with_guard_off<F: FnOnce()>(f: F) {
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("LIBREFANG_GROUP_ADDRESSEE_GUARD");
+            f();
+        }
+
+        fn inject_roster(msg: &mut crate::types::ChannelMessage, names: &[&str], agent: &str) {
+            let participants: Vec<ParticipantRef> = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| ParticipantRef {
+                    jid: format!("{i}@s.whatsapp.net"),
+                    display_name: (*n).to_string(),
+                })
+                .collect();
+            msg.metadata.insert(
+                "group_participants".to_string(),
+                serde_json::to_value(&participants).unwrap(),
+            );
+            msg.metadata.insert("agent_name".to_string(), json!(agent));
+        }
+
+        #[test]
+        fn caterina_chiedi_al_signore_rejected_under_guard() {
+            with_guard_on(|| {
+                let mut msg = group_text_message("Caterina, chiedi al Signore il pagamento");
+                inject_roster(&mut msg, &["Caterina", "Ambrogio"], "Ambrogio");
+                let overrides = ChannelOverrides {
+                    group_policy: GroupPolicy::MentionOnly,
+                    group_trigger_patterns: vec!["Signore".to_string()],
+                    ..Default::default()
+                };
+                assert!(!should_process_group_message("whatsapp", &overrides, &msg));
+            });
+        }
+
+        #[test]
+        fn signore_at_start_passes_under_guard() {
+            with_guard_on(|| {
+                let mut msg = group_text_message("Signore, conferma il prossimo appuntamento");
+                inject_roster(&mut msg, &["Caterina", "Ambrogio"], "Ambrogio");
+                let overrides = ChannelOverrides {
+                    group_policy: GroupPolicy::MentionOnly,
+                    group_trigger_patterns: vec!["Signore".to_string()],
+                    ..Default::default()
+                };
+                assert!(should_process_group_message("whatsapp", &overrides, &msg));
+            });
+        }
+
+        #[test]
+        fn owner_no_mention_no_pattern_rejected() {
+            // OB-06: "owner-in-group" doesn't bypass mention_only — there's
+            // no owner short-circuit in librefang-channels (audit confirms).
+            // A plain "ciao a tutti" with no mention is rejected.
+            with_guard_on(|| {
+                let mut msg = group_text_message("ciao a tutti, come va?");
+                inject_roster(&mut msg, &["Caterina", "Ambrogio"], "Ambrogio");
+                let overrides = ChannelOverrides {
+                    group_policy: GroupPolicy::MentionOnly,
+                    group_trigger_patterns: vec!["Signore".to_string()],
+                    ..Default::default()
+                };
+                assert!(!should_process_group_message("whatsapp", &overrides, &msg));
+            });
+        }
+
+        #[test]
+        fn owner_explicit_mention_passes() {
+            with_guard_on(|| {
+                let mut msg = group_text_message("@Bot rispondimi");
+                inject_roster(&mut msg, &["Caterina", "Ambrogio"], "Ambrogio");
+                msg.metadata
+                    .insert("was_mentioned".to_string(), json!(true));
+                let overrides = ChannelOverrides {
+                    group_policy: GroupPolicy::MentionOnly,
+                    ..Default::default()
+                };
+                assert!(should_process_group_message("whatsapp", &overrides, &msg));
+            });
+        }
+
+        #[test]
+        fn legacy_substring_still_works_with_guard_off() {
+            // Backward compat: with the flag default-off (rollback path)
+            // the pre-Phase-2 substring matcher remains authoritative.
+            with_guard_off(|| {
+                let msg = group_text_message("Caterina, chiedi al Signore il pagamento");
+                let overrides = ChannelOverrides {
+                    group_policy: GroupPolicy::MentionOnly,
+                    group_trigger_patterns: vec!["(?i)\\bSignore\\b".to_string()],
+                    ..Default::default()
+                };
+                // Legacy behavior: substring matches → returns true.
+                assert!(should_process_group_message("whatsapp", &overrides, &msg));
+            });
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // BC-02 — SenderContext serde-default for group_participants
+    // ---------------------------------------------------------------------
+
+    mod bc02_tests {
+        use crate::types::SenderContext;
+
+        #[test]
+        fn old_blob_without_group_participants_parses() {
+            // Stored canonical blob from before Phase 2 §C — no
+            // `group_participants` key. Must deserialize cleanly.
+            let json = r#"{
+                "channel": "whatsapp",
+                "user_id": "u1",
+                "display_name": "Alice",
+                "is_group": false,
+                "was_mentioned": false,
+                "thread_id": null,
+                "account_id": null,
+                "auto_route": "off",
+                "auto_route_ttl_minutes": 0,
+                "auto_route_confidence_threshold": 0,
+                "auto_route_sticky_bonus": 0,
+                "auto_route_divergence_count": 0
+            }"#;
+            let ctx: SenderContext = serde_json::from_str(json).expect("BC-02 parse");
+            assert!(ctx.group_participants.is_empty());
         }
     }
 }

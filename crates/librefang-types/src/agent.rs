@@ -127,9 +127,10 @@ pub enum HookEvent {
 pub struct AgentId(pub Uuid);
 
 impl AgentId {
-    /// A fixed namespace UUID for deriving deterministic hand-agent IDs.
-    /// Generated once via UUID v4; never changes.
-    const HAND_NAMESPACE: Uuid = Uuid::from_bytes([
+    /// Fixed namespace UUID for all deterministic agent ID derivation.
+    /// Uses a single namespace with typed prefixes to avoid collisions
+    /// between agents, hands, and hand-roles sharing the same name.
+    const NAMESPACE: Uuid = Uuid::from_bytes([
         0x9b, 0x6a, 0xe3, 0x2d, 0x7a, 0x4f, 0x4c, 0x1e, 0x8d, 0x0f, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5,
         0xf6,
     ]);
@@ -139,12 +140,25 @@ impl AgentId {
         Self(Uuid::new_v4())
     }
 
-    /// Generate a deterministic AgentId for a hand agent.
+    /// Generate a deterministic AgentId from an agent name.
     ///
-    /// Uses UUID v5 (SHA-1) with a fixed namespace so the same `hand_id`
+    /// Uses UUID v5 (SHA-1) so the same agent name always produces the same
+    /// ID across daemon restarts, preserving session history associations.
+    pub fn from_name(name: &str) -> Self {
+        Self(Uuid::new_v5(
+            &Self::NAMESPACE,
+            format!("agent:{name}").as_bytes(),
+        ))
+    }
+
+    /// Generate a deterministic AgentId for a hand.
+    ///
+    /// Uses UUID v5 with a `hand:` prefix so the same `hand_id`
     /// always maps to the same UUID across daemon restarts.
     pub fn from_hand_id(hand_id: &str) -> Self {
-        Self(Uuid::new_v5(&Self::HAND_NAMESPACE, hand_id.as_bytes()))
+        // Backward compat: existing hands used bare hand_id without prefix.
+        // Keep the same input to preserve existing IDs.
+        Self(Uuid::new_v5(&Self::NAMESPACE, hand_id.as_bytes()))
     }
 
     /// Generate a deterministic agent ID for a specific role within a multi-agent hand instance.
@@ -159,7 +173,7 @@ impl AgentId {
             Some(id) => format!("{hand_id}:{role}:{id}"),
             None => format!("{hand_id}:{role}"),
         };
-        Self(Uuid::new_v5(&Self::HAND_NAMESPACE, input.as_bytes()))
+        Self(Uuid::new_v5(&Self::NAMESPACE, input.as_bytes()))
     }
 }
 
@@ -226,11 +240,44 @@ impl std::fmt::Display for SessionId {
     }
 }
 
+/// How sessions are resolved for non-channel (automated) invocations.
+///
+/// Controls whether background ticks, triggers, and `agent_send` calls
+/// reuse the agent's persistent session or create a fresh one each time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    /// Reuse the agent's persistent session (default, backward-compatible).
+    #[default]
+    Persistent,
+    /// Create a fresh session for each invocation.
+    New,
+}
+
+/// Web search augmentation mode.
+///
+/// Controls whether the agent loop automatically searches the web using the
+/// user's message and injects results into the LLM context before the call.
+/// This enables models that don't support tool/function calling (e.g. Ollama
+/// Gemma4) to benefit from web search without needing to invoke the `web_search` tool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchAugmentationMode {
+    /// Disabled.
+    Off,
+    /// Augment only when the model catalog reports `supports_tools == false` (default).
+    #[default]
+    Auto,
+    /// Always search the web before every LLM call.
+    Always,
+}
+
 /// The current lifecycle state of an agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentState {
     /// Agent has been created but not yet started.
+    #[default]
     Created,
     /// Agent is actively running and processing events.
     Running,
@@ -313,7 +360,12 @@ pub struct ResourceQuota {
     /// Maximum tool calls per minute.
     pub max_tool_calls_per_minute: u32,
     /// Maximum LLM tokens per hour.
-    pub max_llm_tokens_per_hour: u64,
+    ///
+    /// - `None` = not configured (inherit global default from `[budget]`).
+    /// - `Some(0)` = explicitly unlimited.
+    /// - `Some(n)` = limit to `n` tokens per hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_llm_tokens_per_hour: Option<u64>,
     /// Maximum network bytes per hour.
     pub max_network_bytes_per_hour: u64,
     /// Maximum cost in USD per hour.
@@ -330,12 +382,25 @@ impl Default for ResourceQuota {
             max_memory_bytes: 256 * 1024 * 1024, // 256 MB
             max_cpu_time_ms: 30_000,             // 30 seconds
             max_tool_calls_per_minute: 60,
-            max_llm_tokens_per_hour: 0, // unlimited by default
+            max_llm_tokens_per_hour: None, // inherit global default
             max_network_bytes_per_hour: 100 * 1024 * 1024, // 100 MB
-            max_cost_per_hour_usd: 0.0, // unlimited by default
-            max_cost_per_day_usd: 0.0,  // unlimited
-            max_cost_per_month_usd: 0.0, // unlimited
+            max_cost_per_hour_usd: 0.0,    // unlimited by default
+            max_cost_per_day_usd: 0.0,     // unlimited
+            max_cost_per_month_usd: 0.0,   // unlimited
         }
+    }
+}
+
+impl ResourceQuota {
+    /// Return the effective hourly token limit as a plain `u64`.
+    ///
+    /// * `None` and `Some(0)` both yield `0` (unlimited).
+    /// * `Some(n)` yields `n`.
+    ///
+    /// Callers that enforce the limit should skip enforcement when the
+    /// returned value is `0`.
+    pub fn effective_token_limit(&self) -> u64 {
+        self.max_llm_tokens_per_hour.unwrap_or(0)
     }
 }
 
@@ -383,6 +448,7 @@ impl ToolProfile {
             Self::Messaging => vec![
                 "agent_send",
                 "agent_list",
+                "channel_send",
                 "memory_store",
                 "memory_list",
                 "memory_recall",
@@ -396,6 +462,7 @@ impl ToolProfile {
                 "web_search",
                 "agent_send",
                 "agent_list",
+                "channel_send",
                 "memory_store",
                 "memory_list",
                 "memory_recall",
@@ -517,6 +584,11 @@ pub struct AgentManifest {
     pub module: String,
     /// Scheduling mode.
     pub schedule: ScheduleMode,
+    /// Session mode for automated (non-channel) invocations.
+    /// Controls whether background ticks, triggers, and `agent_send` calls
+    /// reuse the agent's persistent session or create a fresh one.
+    #[serde(default)]
+    pub session_mode: SessionMode,
     /// LLM model configuration.
     pub model: ModelConfig,
     /// Fallback model chain — tried in order if the primary model fails.
@@ -610,6 +682,45 @@ pub struct AgentManifest {
     /// it survives restarts without requiring tag-based detection.
     #[serde(default)]
     pub is_hand: bool,
+    /// Web search augmentation mode — automatically search the web using the
+    /// user's message and inject results into the LLM context before the call.
+    /// Useful for models that don't support tool/function calling (e.g. Ollama).
+    #[serde(default)]
+    pub web_search_augmentation: WebSearchAugmentationMode,
+    /// Whether this agent participates in background auto-dream consolidation.
+    /// When true AND the global `[auto_dream] enabled = true` config is set,
+    /// the scheduler periodically asks this agent to reflect on and
+    /// consolidate its own memory. Off by default — opt-in per agent because
+    /// consolidation costs tokens.
+    #[serde(default)]
+    pub auto_dream_enabled: bool,
+    /// Optional override for `[auto_dream] min_hours`. When `Some`, this
+    /// agent's time gate uses this value instead of the global setting —
+    /// useful for heterogeneous fleets where a chatty agent wants shorter
+    /// intervals and a quiet agent wants longer. `None` inherits the global.
+    #[serde(default)]
+    pub auto_dream_min_hours: Option<f64>,
+    /// Optional override for `[auto_dream] min_sessions`. Same semantics as
+    /// `auto_dream_min_hours`. `Some(0)` explicitly disables the session
+    /// gate for this agent (still subject to time / lock gates).
+    #[serde(default)]
+    pub auto_dream_min_sessions: Option<u32>,
+    /// Whether to surface tool execution progress (`🔧 tool_name`,
+    /// `⚠️ tool_name failed`) inside the channel reply. When `true`
+    /// (default), the streaming bridge injects short progress lines into
+    /// the user-facing text so they can see what the agent is doing.
+    /// Set to `false` for agents whose output should stay pristine —
+    /// e.g. agents posting to public timelines, or agents whose responses
+    /// are consumed by downstream parsers that would choke on the markers.
+    #[serde(default = "default_true")]
+    pub show_progress: bool,
+    /// Whether background skill evolution review runs after each turn.
+    /// Defaults to `true`. Set to `false` for A2A worker agents or any
+    /// agent where responsiveness to triggers matters more than automatic
+    /// skill distillation — skipping evolution means the agent never holds
+    /// the background LLM budget or concurrency semaphore after a turn.
+    #[serde(default = "default_true")]
+    pub auto_evolve: bool,
 }
 
 fn default_true() -> bool {
@@ -625,6 +736,7 @@ impl Default for AgentManifest {
             author: String::new(),
             module: "builtin:chat".to_string(),
             schedule: ScheduleMode::default(),
+            session_mode: SessionMode::default(),
             model: ModelConfig::default(),
             fallback_models: Vec::new(),
             resources: ResourceQuota::default(),
@@ -653,6 +765,12 @@ impl Default for AgentManifest {
             thinking: None,
             context_injection: Vec::new(),
             is_hand: false,
+            web_search_augmentation: WebSearchAugmentationMode::default(),
+            auto_dream_enabled: false,
+            auto_dream_min_hours: None,
+            auto_dream_min_sessions: None,
+            show_progress: true,
+            auto_evolve: true,
         }
     }
 }
@@ -784,6 +902,59 @@ pub struct AgentEntry {
     /// Whether this agent was spawned by a Hand (true) or is a regular agent (false).
     #[serde(default)]
     pub is_hand: bool,
+
+    // -----------------------------------------------------------------------
+    // Session auto-reset state (mirrors hermes-agent SessionEntry flags)
+    // -----------------------------------------------------------------------
+    /// When `true`, the next call to `execute_llm_agent` will force a hard
+    /// reset (cleared message history) before processing the message.
+    /// The session_id is kept; only the stored messages are wiped.
+    /// Set by operator action or stuck-loop recovery.  Takes priority over
+    /// `resume_pending`.
+    ///
+    /// Named `force_session_wipe` (not `suspended`) to avoid confusion with
+    /// `AgentState::Suspended` / `suspend_agent()`.
+    #[serde(default)]
+    pub force_session_wipe: bool,
+
+    /// When `true`, the agent was interrupted by a restart/shutdown but
+    /// recovery is expected.  Unlike `suspended`, the existing `session_id`
+    /// is preserved and the agent continues on the same transcript.
+    /// Cleared after the next successful turn.
+    #[serde(default)]
+    pub resume_pending: bool,
+
+    /// The reason for the most recent automatic session reset, if any.
+    /// `None` until the first auto-reset occurs.
+    #[serde(default)]
+    pub reset_reason: Option<crate::config::SessionResetReason>,
+}
+
+impl Default for AgentEntry {
+    fn default() -> Self {
+        let now = chrono::Utc::now();
+        Self {
+            id: AgentId::default(),
+            name: String::new(),
+            manifest: AgentManifest::default(),
+            state: AgentState::Created,
+            mode: AgentMode::default(),
+            created_at: now,
+            last_active: now,
+            parent: None,
+            children: Vec::new(),
+            session_id: SessionId::default(),
+            source_toml_path: None,
+            tags: Vec::new(),
+            identity: AgentIdentity::default(),
+            onboarding_completed: false,
+            onboarding_completed_at: None,
+            is_hand: false,
+            force_session_wipe: false,
+            resume_pending: false,
+            reset_reason: None,
+        }
+    }
 }
 
 /// A stored prompt version for an agent.
@@ -1053,14 +1224,16 @@ mod tests {
     fn test_tool_profile_messaging() {
         let tools = ToolProfile::Messaging.tools();
         assert!(tools.contains(&"agent_send".to_string()));
+        assert!(tools.contains(&"channel_send".to_string()));
         assert!(tools.contains(&"memory_recall".to_string()));
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
     }
 
     #[test]
     fn test_tool_profile_automation() {
         let tools = ToolProfile::Automation.tools();
-        assert_eq!(tools.len(), 11);
+        assert!(tools.contains(&"channel_send".to_string()));
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]
@@ -1253,6 +1426,7 @@ mod tests {
             onboarding_completed: false,
             onboarding_completed_at: None,
             is_hand: false,
+            ..Default::default()
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: AgentEntry = serde_json::from_str(&json).unwrap();
@@ -1317,6 +1491,7 @@ mod tests {
             onboarding_completed: false,
             onboarding_completed_at: None,
             is_hand: false,
+            ..Default::default()
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: AgentEntry = serde_json::from_str(&json).unwrap();
