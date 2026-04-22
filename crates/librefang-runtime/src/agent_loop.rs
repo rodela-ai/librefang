@@ -105,6 +105,31 @@ fn is_no_reply(text: &str) -> bool {
     crate::silent_response::is_silent_response(text)
 }
 
+/// Classify a response as a progress-text leak: a short ellipsis-terminated
+/// acknowledgment the model sometimes emits *before* a tool call that the
+/// turn ended without ever producing.
+///
+/// Observed in production when Claude Code / Qwen Code hit an internal limit
+/// after emitting a verbal preamble (e.g. `"Waiting for the script to
+/// complete..."`, `"Let me check that..."`) without the corresponding
+/// `tool_use` block. Without this guard the runtime delivers the preamble
+/// to the channel as the agent's final reply, which reads as nonsense to
+/// the user (cron-triggered ynab report surfaced on Telegram as the
+/// literal string `"Waiting for the script to complete..."`).
+///
+/// Heuristic is intentionally narrow to avoid swallowing legitimate replies:
+/// - Trimmed length ≤ 120 chars (progress preambles are short)
+/// - Ends with `...` or `…`. Two-dot `..` is intentionally excluded —
+///   models almost never emit it deliberately, and skipping it avoids
+///   clipping truncated abbreviations like `"See p.."`.
+fn is_progress_text_leak(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.chars().count() > 120 {
+        return false;
+    }
+    t.ends_with("...") || t.ends_with("…")
+}
+
 /// Returns true if this tool-error content is a "soft" error — one the LLM is
 /// expected to recover from cheaply on the next iteration (approval denials,
 /// sandbox rejections, modify-and-retry hints, argument-truncation nudges).
@@ -579,6 +604,7 @@ fn stage_tool_use_turn(
         role: Role::Assistant,
         content: MessageContent::Blocks(response.content.clone()),
         pinned: false,
+        timestamp: Some(chrono::Utc::now()),
     };
 
     let tool_call_ids: Vec<(String, String)> = response
@@ -1030,6 +1056,7 @@ fn finalize_tool_use_results(
         role: Role::User,
         content: MessageContent::Blocks(tool_result_blocks.clone()),
         pinned: false,
+        timestamp: Some(chrono::Utc::now()),
     };
     session.messages.push(tool_results_msg.clone());
     messages.push(tool_results_msg);
@@ -1702,6 +1729,7 @@ struct PromptSetupContext<'a> {
 struct PreparedMessages {
     messages: Vec<Message>,
     new_messages_start: usize,
+    repair_stats: crate::session_repair::RepairStats,
     /// Repair stats from running `validate_and_repair_with_stats` on the
     /// *persistent* `session.messages` (not the filtered LLM view). When
     /// non-default, the caller MUST persist `session.messages` to disk via
@@ -2050,7 +2078,8 @@ fn prepare_llm_messages(
         .cloned()
         .collect();
 
-    let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
+    let (mut messages, repair_stats) =
+        crate::session_repair::validate_and_repair_with_stats(&llm_messages);
 
     if let Some(cc_msg) = manifest
         .metadata
@@ -2084,8 +2113,35 @@ fn prepare_llm_messages(
     PreparedMessages {
         messages,
         new_messages_start,
+        repair_stats,
         persistent_repair_stats,
     }
+}
+
+/// Emit a single structured log line summarizing any repairs that session
+/// repair applied to the outgoing message history. Silent when the history
+/// was already well-formed (stats equal to default).
+fn log_repair_stats(
+    manifest: &AgentManifest,
+    session: &Session,
+    stats: &crate::session_repair::RepairStats,
+) {
+    if stats == &crate::session_repair::RepairStats::default() {
+        return;
+    }
+    info!(
+        agent = %manifest.name,
+        session_id = %session.id,
+        orphaned = stats.orphaned_results_removed,
+        empty = stats.empty_messages_removed,
+        merged = stats.messages_merged,
+        reordered = stats.results_reordered,
+        synthetic = stats.synthetic_results_inserted,
+        duplicates = stats.duplicates_removed,
+        rescued = stats.misplaced_results_rescued,
+        positional_synthetic = stats.positional_synthetic_inserted,
+        "Session repair applied fixes before LLM call"
+    );
 }
 
 /// Check if web search augmentation should be performed for this agent.
@@ -2725,6 +2781,7 @@ pub async fn run_agent_loop(
     let PreparedMessages {
         mut messages,
         new_messages_start: prepared_new_messages_start,
+        repair_stats,
         persistent_repair_stats,
     } = prepare_llm_messages(
         manifest,
@@ -2732,6 +2789,7 @@ pub async fn run_agent_loop(
         &effective_user_message,
         memory_context_msg,
     );
+    log_repair_stats(manifest, session, &repair_stats);
 
     // Follow-up 2: if `prepare_llm_messages` had to repair the persistent
     // history, the in-memory copy is already clean but disk is still dirty.
@@ -2748,7 +2806,6 @@ pub async fn run_agent_loop(
                     synthetic = persistent_repair_stats.synthetic_results_inserted,
                     reordered = persistent_repair_stats.results_reordered,
                     duplicates = persistent_repair_stats.duplicates_removed,
-                    misplaced_ignored = persistent_repair_stats.misplaced_results_ignored,
                     "Persisted repaired session history after validate_and_repair"
                 );
             }
@@ -2912,6 +2969,7 @@ pub async fn run_agent_loop(
                                     result.summary
                                 )),
                                 pinned: false,
+                                timestamp: None,
                             });
                         }
                         compacted.extend(result.kept_messages);
@@ -3136,6 +3194,39 @@ pub async fn run_agent_loop(
                             .await
                             .map_err(|e| LibreFangError::Memory(e.to_string()))?;
                     }
+                    return Ok(build_silent_agent_loop_result(
+                        total_usage,
+                        iteration + 1,
+                        parsed_directives,
+                        decision_traces,
+                        memories_used.clone(),
+                        experiment_context.clone(),
+                        new_messages_start,
+                    ));
+                }
+
+                // Progress-text-leak guard: model emitted a short ellipsis-
+                // terminated acknowledgment ("Waiting for the script to
+                // complete...") but the turn ended without producing the
+                // tool call that preamble was introducing. Surfacing this
+                // to the channel reads as nonsense; drop as silent and let
+                // the operator retrigger.
+                if response.tool_calls.is_empty()
+                    && !tools_recovered_from_text
+                    && is_progress_text_leak(&text)
+                {
+                    warn!(
+                        agent = %manifest.name,
+                        text_excerpt = %text.chars().take(80).collect::<String>(),
+                        "Progress-text leak detected (ellipsis-terminated short reply without tool_use) — dropping as silent"
+                    );
+                    session
+                        .messages
+                        .push(Message::assistant("[no reply needed]".to_string()));
+                    memory
+                        .save_session_async(session)
+                        .await
+                        .map_err(|e| LibreFangError::Memory(e.to_string()))?;
                     return Ok(build_silent_agent_loop_result(
                         total_usage,
                         iteration + 1,
@@ -3994,6 +4085,7 @@ pub async fn run_agent_loop_streaming(
     let PreparedMessages {
         mut messages,
         new_messages_start: prepared_new_messages_start,
+        repair_stats,
         persistent_repair_stats,
     } = prepare_llm_messages(
         manifest,
@@ -4001,6 +4093,7 @@ pub async fn run_agent_loop_streaming(
         &effective_user_message,
         memory_context_msg,
     );
+    log_repair_stats(manifest, session, &repair_stats);
 
     // Follow-up 2: mirror of the non-streaming path — persist any in-place
     // repair that `prepare_llm_messages` applied to `session.messages` so
@@ -4016,7 +4109,6 @@ pub async fn run_agent_loop_streaming(
                     synthetic = persistent_repair_stats.synthetic_results_inserted,
                     reordered = persistent_repair_stats.results_reordered,
                     duplicates = persistent_repair_stats.duplicates_removed,
-                    misplaced_ignored = persistent_repair_stats.misplaced_results_ignored,
                     "Persisted repaired session history after validate_and_repair (streaming)"
                 );
             }
@@ -4168,6 +4260,7 @@ pub async fn run_agent_loop_streaming(
                                     result.summary
                                 )),
                                 pinned: false,
+                                timestamp: None,
                             });
                         }
                         compacted.extend(result.kept_messages);
@@ -4463,6 +4556,36 @@ pub async fn run_agent_loop_streaming(
                             .await
                             .map_err(|e| LibreFangError::Memory(e.to_string()))?;
                     }
+                    return Ok(build_silent_agent_loop_result(
+                        total_usage,
+                        iteration + 1,
+                        parsed_directives_s,
+                        decision_traces,
+                        memories_used.clone(),
+                        experiment_context.clone(),
+                        new_messages_start,
+                    ));
+                }
+
+                // Progress-text-leak guard (streaming path) — see non-stream
+                // mirror above. Drops ellipsis-terminated short preambles
+                // that arrive without the promised tool_use.
+                if response.tool_calls.is_empty()
+                    && !tools_recovered_from_text
+                    && is_progress_text_leak(&text)
+                {
+                    warn!(
+                        agent = %manifest.name,
+                        text_excerpt = %text.chars().take(80).collect::<String>(),
+                        "Progress-text leak detected (streaming, ellipsis-terminated short reply without tool_use) — dropping as silent"
+                    );
+                    session
+                        .messages
+                        .push(Message::assistant("[no reply needed]".to_string()));
+                    memory
+                        .save_session_async(session)
+                        .await
+                        .map_err(|e| LibreFangError::Memory(e.to_string()))?;
                     return Ok(build_silent_agent_loop_result(
                         total_usage,
                         iteration + 1,
@@ -5599,15 +5722,44 @@ mod tests {
         assert!(is_no_reply("[no reply needed]"));
         assert!(is_no_reply("Some context. [no reply needed]"));
 
-        // Unbracketed variant the model sometimes emits
+        // Unbracketed variant — exact match only (ends_with dropped to avoid prose false-positives)
         assert!(is_no_reply("no reply needed"));
-        assert!(is_no_reply("context here\nno reply needed"));
 
         // Negatives — real responses must never be silenced
         assert!(!is_no_reply(""));
         assert!(!is_no_reply("Just replying normally."));
         assert!(!is_no_reply("NO_REPLY is my favorite token")); // prefix, not suffix
         assert!(!is_no_reply("no reply needed? let me check")); // doesn't end with marker
+        assert!(!is_no_reply("I filed the bug; no reply needed")); // prose ending — not a sentinel
+        assert!(!is_no_reply("context here\nno reply needed")); // multi-line prose ending
+    }
+
+    #[test]
+    fn test_is_progress_text_leak() {
+        // Real production leak — ellipsis-terminated preamble with no tool_use
+        assert!(is_progress_text_leak(
+            "Waiting for the script to complete..."
+        ));
+        assert!(is_progress_text_leak("Let me check that..."));
+        assert!(is_progress_text_leak("Processing..."));
+        assert!(is_progress_text_leak("One moment…"));
+        assert!(is_progress_text_leak("   Checking...   ")); // whitespace
+
+        // Negatives — real replies must never be flagged as leaks
+        assert!(!is_progress_text_leak(""));
+        assert!(!is_progress_text_leak("Done."));
+        assert!(!is_progress_text_leak("Here is the result."));
+        // Two-dot `..` is intentionally not a trigger (too broad, catches
+        // truncated abbreviations). See the `is_progress_text_leak` doc.
+        assert!(!is_progress_text_leak("Running.."));
+        assert!(!is_progress_text_leak("See p.."));
+        // Not an ellipsis, real reply
+        assert!(!is_progress_text_leak("The script ran successfully."));
+        // Over 120 chars — even ending with ellipsis, treat as real content
+        let long =
+            "This is a much longer response where the model actually produced a full explanation of what it did and the ellipsis at the end is just stylistic...";
+        assert!(long.chars().count() > 120);
+        assert!(!is_progress_text_leak(long));
     }
 
     #[test]
@@ -5685,6 +5837,8 @@ mod tests {
             "purge_sentinels.rs", // CLI binary that *removes* the literal — delegates to canonical detector
             "purge_sentinels_test.rs", // fixtures for the CLI
             "bridge.rs",          // librefang-channels: log message in reply-intent precheck
+            "lib.rs",             // librefang-types: legacy is_no_reply helper
+            "mod.rs",             // librefang-kernel: comment in cron delivery guard
         ];
         let offenders: Vec<&str> = stdout
             .lines()
@@ -5948,6 +6102,7 @@ mod tests {
                 role: Role::Assistant,
                 content: MessageContent::Blocks(Vec::new()),
                 pinned: false,
+                timestamp: None,
             },
             tool_call_ids: Vec::new(),
             tool_result_blocks: Vec::new(),
@@ -6016,6 +6171,7 @@ mod tests {
                     },
                 ]),
                 pinned: false,
+                timestamp: None,
             },
             tool_call_ids: vec![
                 ("tool-hard-fail".to_string(), "nonexistent_tool".to_string()),
@@ -6129,6 +6285,7 @@ mod tests {
                 role: Role::User,
                 content: MessageContent::Blocks(vec![waiting_result.clone()]),
                 pinned: false,
+                timestamp: None,
             }],
             context_window_tokens: 0,
             label: None,
@@ -6152,6 +6309,7 @@ mod tests {
                     },
                 ]),
                 pinned: false,
+                timestamp: None,
             },
             tool_call_ids: vec![
                 ("tool-hard-fail".to_string(), "failing_tool".to_string()),
@@ -6337,6 +6495,7 @@ mod tests {
                     provider_metadata: None,
                 }]),
                 pinned: false,
+                timestamp: None,
             });
             session_messages.push(Message {
                 role: Role::User,
@@ -6349,6 +6508,7 @@ mod tests {
                     approval_request_id: None,
                 }]),
                 pinned: false,
+                timestamp: None,
             });
         }
         // Capture the OLD (buggy) index: len BEFORE pushing the current
@@ -6420,6 +6580,7 @@ mod tests {
                     provider_metadata: None,
                 }]),
                 pinned: false,
+                timestamp: None,
             });
             session.messages.push(Message {
                 role: Role::User,
@@ -6432,6 +6593,7 @@ mod tests {
                     approval_request_id: None,
                 }]),
                 pinned: false,
+                timestamp: None,
             });
         }
 
@@ -6481,6 +6643,7 @@ mod tests {
                     provider_metadata: None,
                 }]),
                 pinned: false,
+                timestamp: None,
             });
             session.messages.push(Message {
                 role: Role::User,
@@ -6493,6 +6656,7 @@ mod tests {
                     approval_request_id: None,
                 }]),
                 pinned: false,
+                timestamp: None,
             });
         }
 
@@ -6618,6 +6782,7 @@ mod tests {
                     provider_metadata: None,
                 }]),
                 pinned: false,
+                timestamp: None,
             },
             tool_call_ids: vec![("tool-hard-fail".to_string(), "nonexistent_tool".to_string())],
             tool_result_blocks: vec![ContentBlock::ToolResult {
@@ -9179,6 +9344,7 @@ mod tests {
                     },
                 ]),
                 pinned: false,
+                timestamp: None,
             },
             tool_call_ids: vec![
                 ("tool-a".to_string(), "tool_a".to_string()),
@@ -9291,6 +9457,7 @@ mod tests {
             role: Role::User,
             content: MessageContent::Text("run tool".to_string()),
             pinned: false,
+            timestamp: None,
         });
         session.messages.push(Message {
             role: Role::Assistant,
@@ -9301,6 +9468,7 @@ mod tests {
                 provider_metadata: None,
             }]),
             pinned: false,
+            timestamp: None,
         });
 
         assert!(
@@ -9341,6 +9509,7 @@ mod tests {
                 },
             ]),
             pinned: false,
+            timestamp: None,
         });
         // And the timeout-note assistant message that the prod path pushes
         // right before the failing save:
@@ -9371,6 +9540,7 @@ mod tests {
             role: Role::User,
             content: MessageContent::Text("do the thing".to_string()),
             pinned: false,
+            timestamp: None,
         });
         session.messages.push(Message {
             role: Role::Assistant,
@@ -9381,6 +9551,7 @@ mod tests {
                 provider_metadata: None,
             }]),
             pinned: false,
+            timestamp: None,
         });
         session.messages.push(Message {
             role: Role::User,
@@ -9393,6 +9564,7 @@ mod tests {
                 approval_request_id: None,
             }]),
             pinned: false,
+            timestamp: None,
         });
 
         let before = session.messages.clone();
@@ -9449,6 +9621,7 @@ mod tests {
                 provider_metadata: None,
             }]),
             pinned: false,
+            timestamp: None,
         });
         // The current turn's user message, already pushed by the prod path
         // right before `prepare_llm_messages` is called.
@@ -9521,6 +9694,7 @@ mod tests {
                 provider_metadata: None,
             }]),
             pinned: false,
+            timestamp: None,
         });
         session.messages.push(Message::user("follow-up question"));
 
@@ -9704,6 +9878,7 @@ mod tests {
                     },
                 ]),
                 pinned: false,
+                timestamp: None,
             },
             tool_call_ids: vec![
                 ("t0".to_string(), "web_fetch".to_string()),

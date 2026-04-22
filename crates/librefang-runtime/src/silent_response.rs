@@ -147,7 +147,10 @@ fn matches_canonical(s: &str) -> bool {
 /// leaks the legacy detector accepted.
 fn ends_with_canonical(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
-    for needle in ["no_reply", "[no reply needed]", "no reply needed"] {
+    // "no reply needed" (unbracketed) is excluded from suffix matching to
+    // avoid false positives on prose endings like "I filed the bug; no reply needed".
+    // It is still accepted as an exact whole-message match via matches_canonical().
+    for needle in ["no_reply", "[no reply needed]"] {
         if lower.ends_with(needle) {
             // Boundary check: char immediately before the needle must not
             // be alphanumeric/underscore (avoid `NO_REPLYING`,

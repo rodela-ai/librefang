@@ -205,6 +205,20 @@ pub trait ChannelBridgeHandle: Send + Sync {
         None
     }
 
+    /// Lightweight LLM classification: should the bot reply to this group message?
+    ///
+    /// Returns `true` if the bot should reply, `false` to stay silent.
+    /// Default implementation always returns `true` (fail-open).
+    async fn classify_reply_intent(
+        &self,
+        _message_text: &str,
+        _sender_name: &str,
+        _model: Option<&str>,
+        _bot_name: Option<&str>,
+    ) -> bool {
+        true
+    }
+
     /// Record a delivery result for tracking (optional — default no-op).
     ///
     /// `thread_id` preserves Telegram forum-topic context so cron/workflow
@@ -399,29 +413,6 @@ pub trait ChannelBridgeHandle: Send + Sync {
         _thread_id: Option<&str>,
     ) -> Result<String, String> {
         Err("Channel push not available".to_string())
-    }
-
-    /// Lightweight LLM precheck: should the agent reply to this group message?
-    ///
-    /// `context` contains recent conversation lines (e.g. the message being
-    /// replied to) so the classifier can detect continuations.
-    ///
-    /// Returns `Ok(true)` → reply, `Ok(false)` → stay silent.
-    /// On error the caller fails open (replies anyway).
-    /// Default: always reply (opt-in via `reply_precheck = true` in channel config).
-    async fn classify_reply_intent(
-        &self,
-        _agent_id: AgentId,
-        _message: &str,
-        _context: Option<&str>,
-    ) -> Result<bool, String> {
-        Ok(true)
-    }
-
-    /// Read the custom precheck prompt from the agent's workspace
-    /// (`PRECHECK.md`). Returns `None` if the file doesn't exist.
-    async fn get_precheck_prompt(&self, _agent_id: AgentId) -> Option<String> {
-        None
     }
 
     /// Get the routing aliases for an agent (from `[metadata.routing].aliases`).
@@ -2240,9 +2231,31 @@ async fn dispatch_message(
             if !should_process_group_message(ct_str, ov, message, &[]) {
                 return;
             }
-            // Reply-intent precheck runs post-resolution (after agent_id is
-            // known) so it can use per-agent PRECHECK.md prompts and reply
-            // context.  See the "Post-resolution group filters" block below.
+            // Reply-intent precheck: lightweight LLM classification for group
+            // messages when group_policy is "all" and precheck is enabled.
+            // Skipped for mentions and commands (already filtered above).
+            if ov.reply_precheck && matches!(ov.group_policy, GroupPolicy::All) {
+                let text = text_content(message).unwrap_or("");
+                let sender = &message.sender.display_name;
+                let model = ov.reply_precheck_model.as_deref();
+                let account_id = message.metadata.get("account_id").and_then(|v| v.as_str());
+                let channel_key_for_name = match account_id {
+                    Some(aid) => format!("{}:{}", ct_str, aid),
+                    None => ct_str.to_string(),
+                };
+                let bot_name = router.channel_default_name(&channel_key_for_name);
+                if !handle
+                    .classify_reply_intent(text, sender, model, bot_name.as_deref())
+                    .await
+                {
+                    debug!(
+                        channel = ct_str,
+                        sender = %sender,
+                        "Reply precheck declined — staying silent"
+                    );
+                    return;
+                }
+            }
         } else {
             // DM
             match ov.dm_policy {
@@ -2922,73 +2935,7 @@ async fn dispatch_message(
             return;
         }
     };
-
-    // --- Post-resolution group filters (alias awareness + reply-intent precheck) ---
-    if message.is_group {
-        let was_mentioned = message
-            .metadata
-            .get("was_mentioned")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        // Reply-intent precheck: lightweight LLM call to decide if the agent
-        // should reply. Only for non-mentioned group messages when enabled.
-        // Skipped for @mentions, commands, and DMs (those always get a reply).
-        if !was_mentioned && !matches!(message.content, ChannelContent::Command { .. }) {
-            // Check agent aliases first — if a message contains an alias like
-            // "oye fandango", treat it as an implicit mention (skip precheck).
-            let aliases = handle.get_agent_aliases(agent_id).await;
-            let alias_hit = !aliases.is_empty()
-                && text_content(message).is_some_and(|text| {
-                    let lower = text.to_lowercase();
-                    aliases.iter().any(|a| lower.contains(&a.to_lowercase()))
-                });
-
-            if alias_hit {
-                debug!(
-                    channel = ct_str,
-                    "Group message matched agent alias — treating as mention"
-                );
-            } else if let Some(ref ov) = overrides {
-                if ov.reply_precheck {
-                    // No mention, no alias — run LLM precheck.
-                    // Include reply-to context so the classifier can detect
-                    // conversation continuations (e.g. user replying to the bot).
-                    let reply_context: Option<String> =
-                        message.metadata.get("reply_to").and_then(|rt| {
-                            let sender = rt
-                                .get("sender")
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("someone");
-                            let text = rt.get("text").and_then(|t| t.as_str())?;
-                            Some(format!("[Replying to {sender}: \"{text}\"]"))
-                        });
-                    if let Some(text) = text_content(message) {
-                        match handle
-                            .classify_reply_intent(agent_id, text, reply_context.as_deref())
-                            .await
-                        {
-                            Ok(true) => {
-                                debug!(channel = ct_str, "Reply-intent precheck: REPLY");
-                            }
-                            Ok(false) => {
-                                debug!(
-                                    channel = ct_str,
-                                    "Reply-intent precheck: NO_REPLY — staying silent"
-                                );
-                                return;
-                            }
-                            Err(e) => {
-                                warn!(channel = ct_str, error = %e, "Reply-intent precheck failed — proceeding with reply");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let channel_key = format!("{:?}", message.channel);
+    let channel_key = channel_type_str(&message.channel).to_string();
 
     // RBAC: authorize the user before forwarding to agent
     if let Err(denied) = handle
@@ -3724,7 +3671,7 @@ async fn dispatch_with_blocks(
             return;
         }
     };
-    let channel_key = format!("{:?}", message.channel);
+    let channel_key = channel_type_str(&message.channel).to_string();
 
     // RBAC check
     if let Err(denied) = handle
@@ -5634,6 +5581,106 @@ mod tests {
             }"#;
             let ctx: SenderContext = serde_json::from_str(json).expect("BC-02 parse");
             assert!(ctx.group_participants.is_empty());
+        }
+    }
+
+    mod classify_reply_intent_tests {
+        use super::super::*;
+        use std::sync::{Arc, Mutex};
+
+        struct CapturingHandle {
+            captured_bot_name: Arc<Mutex<Option<Option<String>>>>,
+        }
+
+        impl CapturingHandle {
+            fn new() -> (Self, Arc<Mutex<Option<Option<String>>>>) {
+                let slot = Arc::new(Mutex::new(None));
+                (
+                    Self {
+                        captured_bot_name: Arc::clone(&slot),
+                    },
+                    slot,
+                )
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ChannelBridgeHandle for CapturingHandle {
+            async fn send_message(&self, _: AgentId, _: &str) -> Result<String, String> {
+                Err("not used in test".into())
+            }
+            async fn find_agent_by_name(&self, _: &str) -> Result<Option<AgentId>, String> {
+                Err("not used in test".into())
+            }
+            async fn list_agents(&self) -> Result<Vec<(AgentId, String)>, String> {
+                Err("not used in test".into())
+            }
+            async fn spawn_agent_by_name(&self, _: &str) -> Result<AgentId, String> {
+                Err("not used in test".into())
+            }
+            async fn classify_reply_intent(
+                &self,
+                _message_text: &str,
+                _sender_name: &str,
+                _model: Option<&str>,
+                bot_name: Option<&str>,
+            ) -> bool {
+                *self.captured_bot_name.lock().unwrap() = Some(bot_name.map(|s| s.to_string()));
+                true
+            }
+        }
+
+        #[tokio::test]
+        async fn default_impl_returns_true_with_bot_name() {
+            struct AlwaysTrue;
+            #[async_trait::async_trait]
+            impl ChannelBridgeHandle for AlwaysTrue {
+                async fn send_message(&self, _: AgentId, _: &str) -> Result<String, String> {
+                    Err("not used in test".into())
+                }
+                async fn find_agent_by_name(&self, _: &str) -> Result<Option<AgentId>, String> {
+                    Err("not used in test".into())
+                }
+                async fn list_agents(&self) -> Result<Vec<(AgentId, String)>, String> {
+                    Err("not used in test".into())
+                }
+                async fn spawn_agent_by_name(&self, _: &str) -> Result<AgentId, String> {
+                    Err("not used in test".into())
+                }
+            }
+
+            let h = AlwaysTrue;
+            assert!(
+                h.classify_reply_intent("hello", "user", None, Some("rodelo"))
+                    .await
+            );
+            assert!(h.classify_reply_intent("hello", "user", None, None).await);
+        }
+
+        #[tokio::test]
+        async fn bot_name_is_forwarded_to_implementation() {
+            let (handle, slot) = CapturingHandle::new();
+            handle
+                .classify_reply_intent("rodelo qué hora es?", "Alice", None, Some("rodelo"))
+                .await;
+            assert_eq!(
+                *slot.lock().unwrap(),
+                Some(Some("rodelo".to_string())),
+                "bot_name must be forwarded to the classify_reply_intent implementation"
+            );
+        }
+
+        #[tokio::test]
+        async fn none_bot_name_is_forwarded() {
+            let (handle, slot) = CapturingHandle::new();
+            handle
+                .classify_reply_intent("hey there", "Bob", None, None)
+                .await;
+            assert_eq!(
+                *slot.lock().unwrap(),
+                Some(None),
+                "None bot_name must be forwarded as None"
+            );
         }
     }
 }

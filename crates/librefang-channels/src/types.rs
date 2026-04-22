@@ -659,6 +659,9 @@ pub trait ChannelAdapter: Send + Sync {
 /// HTML-entity-aware: never cuts in the middle of `&...;` sequences
 /// (e.g. `&amp;`, `&lt;`, `&#123;`).
 ///
+/// HTML-tag-aware: never cuts inside an unclosed Telegram HTML tag
+/// (e.g. `<code>`, `<pre>`, `<b>`, `<i>`, `<u>`, `<s>`, `<a>`).
+///
 /// Shared utility used by Telegram, Discord, and Slack adapters.
 #[inline]
 pub fn split_message(text: &str, max_len: usize) -> Vec<&str> {
@@ -706,18 +709,29 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<&str> {
 /// return the byte index of the opening `<` so the caller splits before it.
 /// Otherwise return `pos` unchanged.
 ///
-/// Only `/>` (slash immediately before `>`) marks a tag as self-closing.
-/// A `/` elsewhere in the tag body (e.g. in a URL attribute like
-/// `<a href="https://example.com/path">`) does NOT make the tag self-closing.
-///
 /// Telegram's supported tags: `b`, `i`, `u`, `s`, `code`, `pre`, `a`.
-/// If retreating would produce an empty chunk (result == 0), the caller
-/// should fall back to the original position to avoid an infinite loop.
+/// Matching is case-insensitive.  Self-closing tags are ignored.
+///
+/// The function counts open vs close tags for each tag name.  If any tag
+/// has more opens than closes, the position is retreated to just before the
+/// last unmatched opening tag's `<`.
+///
+/// If retreating would produce an empty chunk (i.e. the result would be 0),
+/// the caller should fall back to the original position to avoid an
+/// infinite loop.
 fn retreat_past_html_tag(text: &str, pos: usize) -> usize {
+    // Only Telegram-supported inline/block tags.
     const TELEGRAM_TAGS: &[&str] = &["b", "i", "u", "s", "code", "pre", "a"];
 
     let slice = &text[..pos];
-    let mut opens: Vec<(String, usize)> = Vec::new();
+
+    // Walk the slice collecting tag events.
+    // We record the byte offset of the `<` for each opening tag so we can
+    // retreat to it if needed.
+    //
+    // Opening tags look like: `<tagname` (followed by `>` or whitespace or `/>`)
+    // Closing tags look like: `</tagname`
+    let mut opens: Vec<(String, usize)> = Vec::new(); // (tag_name, lt_pos) stack of unclosed opens
     let mut i = 0usize;
     let bytes = slice.as_bytes();
     while i < bytes.len() {
@@ -726,14 +740,16 @@ fn retreat_past_html_tag(text: &str, pos: usize) -> usize {
             continue;
         }
         let lt_pos = i;
-        i += 1;
+        i += 1; // skip `<`
         if i >= bytes.len() {
             break;
         }
+        // Detect closing tag
         let is_closing = bytes[i] == b'/';
         if is_closing {
             i += 1;
         }
+        // Read tag name (ASCII letters only)
         let name_start = i;
         while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
             i += 1;
@@ -744,24 +760,29 @@ fn retreat_past_html_tag(text: &str, pos: usize) -> usize {
         }
         let name_lower = name.to_ascii_lowercase();
         if !TELEGRAM_TAGS.contains(&name_lower.as_str()) {
+            // Skip to end of tag to avoid false positives inside attributes
             while i < bytes.len() && bytes[i] != b'>' {
                 i += 1;
             }
             continue;
         }
-        // Advance to `>`. Self-closing requires `/` immediately before `>`.
-        // A `/` elsewhere in the tag (e.g. in a URL) is NOT self-closing.
+        // Advance to the end of the tag (`>`).
+        // A self-closing tag ends with `/>` — the slash must be immediately
+        // before the `>`.  Checking for any `/` inside the tag incorrectly
+        // flags tags whose attributes contain URLs (e.g. `<a href="…/…">`).
         while i < bytes.len() && bytes[i] != b'>' {
             i += 1;
         }
+        // `i` now points at `>` (or is past the end if the tag is unclosed).
         let self_closing = i >= 1 && i < bytes.len() && bytes[i - 1] == b'/';
         if i < bytes.len() {
-            i += 1;
+            i += 1; // consume `>`
         }
         if self_closing {
             continue;
         }
         if is_closing {
+            // Pop the most recent matching open from our stack
             if let Some(last_match) = opens.iter().rposition(|(n, _)| n == &name_lower) {
                 opens.remove(last_match);
             }
@@ -770,6 +791,7 @@ fn retreat_past_html_tag(text: &str, pos: usize) -> usize {
         }
     }
 
+    // If there are unclosed tags, retreat to the earliest unclosed opening `<`.
     if let Some(&(_, lt_pos)) = opens.first() {
         lt_pos
     } else {
@@ -898,6 +920,8 @@ mod tests {
         assert!(text.is_char_boundary(result));
         assert!(result <= 4);
     }
+
+    // ── retreat_past_html_tag regression tests ────────────────────────────
 
     #[test]
     fn test_split_message_multibyte_utf8_no_panic() {

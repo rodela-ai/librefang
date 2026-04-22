@@ -370,8 +370,8 @@ pub async fn execute_tool_raw(
         process_manager,
         process_registry: _,
         sender_id,
-        channel,
-        chat_id,
+        channel: _,
+        chat_id: _,
         checkpoint_manager,
         interrupt,
         dangerous_command_checker,
@@ -381,6 +381,26 @@ pub async fn execute_tool_raw(
         // Filesystem tools
         "file_read" => tool_file_read(input, *workspace_root).await,
         "file_write" => {
+            // Enforce named workspace read-only restrictions before the sandbox resolves the path.
+            // Agents learn absolute workspace paths from TOOLS.md; an absolute path that falls
+            // inside a read-only named workspace must be rejected here.
+            if let (Some(k), Some(agent_id)) = (kernel, caller_agent_id) {
+                let raw = input["path"].as_str().unwrap_or("");
+                if Path::new(raw).is_absolute() {
+                    let ro = k.readonly_workspace_prefixes(agent_id);
+                    if ro.iter().any(|prefix| Path::new(raw).starts_with(prefix)) {
+                        return ToolResult {
+                            tool_use_id: tool_use_id.to_string(),
+                            content: format!(
+                                "Write denied: '{}' is in a read-only named workspace",
+                                raw
+                            ),
+                            is_error: true,
+                            ..Default::default()
+                        };
+                    }
+                }
+            }
             maybe_snapshot(checkpoint_manager, *workspace_root, "pre file_write").await;
             tool_file_write(input, *workspace_root).await
         }
@@ -605,15 +625,7 @@ pub async fn execute_tool_raw(
 
         // Scheduling tools (delegate to CronScheduler via kernel handle)
         "schedule_create" => {
-            tool_schedule_create(
-                input,
-                *kernel,
-                *caller_agent_id,
-                *channel,
-                *chat_id,
-                *sender_id,
-            )
-            .await
+            tool_schedule_create(input, *kernel, *caller_agent_id, *sender_id).await
         }
         "schedule_list" => tool_schedule_list(*kernel, *caller_agent_id).await,
         "schedule_delete" => tool_schedule_delete(input, *kernel).await,
@@ -674,17 +686,7 @@ pub async fn execute_tool_raw(
         "skill_evolve_remove_file" => tool_skill_evolve_remove_file(input, *skill_registry).await,
 
         // Cron scheduling tools
-        "cron_create" => {
-            tool_cron_create(
-                input,
-                *kernel,
-                *caller_agent_id,
-                *channel,
-                *chat_id,
-                *sender_id,
-            )
-            .await
-        }
+        "cron_create" => tool_cron_create(input, *kernel, *caller_agent_id, *sender_id).await,
         "cron_list" => tool_cron_list(*kernel, *caller_agent_id).await,
         "cron_cancel" => tool_cron_cancel(input, *kernel, *caller_agent_id).await,
 
@@ -3273,8 +3275,6 @@ async fn tool_schedule_create(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
     caller_agent_id: Option<&str>,
-    channel: Option<&str>,
-    chat_id: Option<&str>,
     sender_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
@@ -3303,11 +3303,6 @@ async fn tool_schedule_create(
     };
 
     // Build CronJob JSON compatible with kh.cron_create()
-    let delivery = if let (Some(ch), Some(cid)) = (channel, chat_id) {
-        serde_json::json!({ "kind": "channel", "channel": ch, "to": cid })
-    } else {
-        serde_json::json!({ "kind": "last_channel" })
-    };
     let tz = input["tz"].as_str();
     let schedule = if let Some(tz_str) = tz {
         serde_json::json!({ "kind": "cron", "expr": cron_expr, "tz": tz_str })
@@ -3318,12 +3313,18 @@ async fn tool_schedule_create(
         "name": name,
         "schedule": schedule,
         "action": { "kind": "agent_turn", "message": message },
-        "delivery": delivery,
+        "delivery": { "kind": "none" },
     });
-    // Auto-inject sender's peer_id so cron can access their peer-scoped memories
-    if let Some(pid) = sender_id {
-        if !pid.is_empty() && !job_json["peer_id"].is_string() {
-            job_json["peer_id"] = serde_json::Value::String(pid.to_string());
+    if let Some(obj) = job_json.as_object_mut() {
+        if !obj.contains_key("peer_id") {
+            if let Some(pid) = sender_id {
+                if !pid.is_empty() {
+                    obj.insert(
+                        "peer_id".to_string(),
+                        serde_json::Value::String(pid.to_string()),
+                    );
+                }
+            }
         }
     }
 
@@ -3383,77 +3384,15 @@ async fn tool_schedule_delete(
 // Cron scheduling tools (delegated to kernel via KernelHandle trait)
 // ---------------------------------------------------------------------------
 
-/// Validate the `schedule` field of a `cron_create` input before forwarding
-/// it to the kernel. The only validation performed here is to require an
-/// explicit `tz` field whenever `schedule.kind == "cron"`.
-///
-/// This guards against the LLM-side bug where a model emits a cron expression
-/// in the user's local wall-clock time (e.g. "18:30 Madrid") but omits the
-/// timezone, which the scheduler then interprets as UTC and fires at the wrong
-/// hour. By rejecting tz-less cron schedules at the tool boundary we force the
-/// LLM to either supply the IANA tz, set "UTC" intentionally, or ask the user.
-///
-/// Schedules with `kind == "at"` or `kind == "every"` are not affected — `at`
-/// already takes a timezone-anchored RFC3339 timestamp, and `every` is a pure
-/// duration.
-///
-/// The string contents of `tz` are *not* validated here (that's the
-/// scheduler's job via `chrono_tz::Tz::from_str`); we only check that the
-/// field is present and non-empty.
-fn validate_cron_schedule_input(input: &serde_json::Value) -> Result<(), String> {
-    let Some(schedule) = input.get("schedule") else {
-        // Missing schedule entirely is the kernel's problem (the JSON schema
-        // marks `schedule` as required and the kernel will return its own
-        // error). We only enforce the tz rule here.
-        return Ok(());
-    };
-    let kind = schedule.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-    if kind != "cron" {
-        return Ok(());
-    }
-    let tz_present_and_nonempty = schedule
-        .get("tz")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty());
-    if tz_present_and_nonempty {
-        return Ok(());
-    }
-    let expr = schedule
-        .get("expr")
-        .and_then(|v| v.as_str())
-        .unwrap_or("<missing expr>");
-    Err(format!(
-        "cron_create validation error: cron schedule 'expr={expr}' requires an explicit `tz` field. \
-         If the user referred to local wall-clock time, set `schedule.tz` to an IANA timezone \
-         (examples: \"Europe/Madrid\", \"America/New_York\", \"Asia/Tokyo\"). \
-         If the user explicitly asked for UTC, set `schedule.tz` to \"UTC\" to confirm. \
-         If you do not know the user's timezone, ask them in a reply before calling cron_create again."
-    ))
-}
-
 async fn tool_cron_create(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
     caller_agent_id: Option<&str>,
-    channel: Option<&str>,
-    chat_id: Option<&str>,
     sender_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let agent_id = caller_agent_id.ok_or("Agent ID required for cron_create")?;
-    // Reject cron schedules without an explicit tz before touching the kernel,
-    // so the structured error reaches the LLM and it can self-correct.
-    validate_cron_schedule_input(input)?;
-    // Auto-inject delivery from sender context if not already specified in input
     let mut job = input.clone();
-    if !job.get("delivery").is_some_and(|d| d.is_object()) {
-        if let (Some(ch), Some(cid)) = (channel, chat_id) {
-            job["delivery"] = serde_json::json!({ "kind": "channel", "channel": ch, "to": cid });
-        } else {
-            job["delivery"] = serde_json::json!({ "kind": "last_channel" });
-        }
-    }
-    // Auto-inject sender's peer_id so cron can access their peer-scoped memories
     if let (Some(pid), Some(obj)) = (sender_id, job.as_object_mut()) {
         if !pid.is_empty() && !obj.contains_key("peer_id") {
             obj.insert(
@@ -7952,110 +7891,6 @@ mod tests {
         ) -> Result<Vec<librefang_types::memory::GraphMatch>, String> {
             Err("not used".to_string())
         }
-    }
-
-    // -----------------------------------------------------------------
-    // cron_create tz validation (issue #2352)
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn cron_create_with_explicit_tz_passes_validation() {
-        let input = serde_json::json!({
-            "name": "evening reminder",
-            "schedule": {
-                "kind": "cron",
-                "expr": "30 18 * * 1,2,3",
-                "tz": "Europe/Madrid"
-            },
-            "action": { "kind": "system_event", "text": "ping" }
-        });
-        assert!(validate_cron_schedule_input(&input).is_ok());
-    }
-
-    #[test]
-    fn cron_create_without_tz_returns_structured_error() {
-        let input = serde_json::json!({
-            "name": "evening reminder",
-            "schedule": {
-                "kind": "cron",
-                "expr": "30 18 * * 1,2,3"
-            },
-            "action": { "kind": "system_event", "text": "ping" }
-        });
-        let err = validate_cron_schedule_input(&input).expect_err("missing tz must error");
-        assert!(err.contains("IANA"), "error must mention IANA: {err}");
-        assert!(
-            err.contains("timezone"),
-            "error must mention timezone: {err}"
-        );
-        assert!(
-            err.contains("Europe/Madrid"),
-            "error must give an IANA example like Europe/Madrid: {err}"
-        );
-        assert!(
-            err.contains("30 18 * * 1,2,3"),
-            "error should echo the offending cron expr: {err}"
-        );
-    }
-
-    #[test]
-    fn cron_create_with_null_tz_returns_structured_error() {
-        let input = serde_json::json!({
-            "name": "evening reminder",
-            "schedule": {
-                "kind": "cron",
-                "expr": "30 18 * * 1,2,3",
-                "tz": serde_json::Value::Null
-            },
-            "action": { "kind": "system_event", "text": "ping" }
-        });
-        let err = validate_cron_schedule_input(&input).expect_err("null tz must error");
-        assert!(err.contains("IANA"), "error must mention IANA: {err}");
-        assert!(
-            err.contains("Europe/Madrid"),
-            "error must give an IANA example: {err}"
-        );
-    }
-
-    #[test]
-    fn cron_create_with_empty_string_tz_returns_error() {
-        let input = serde_json::json!({
-            "name": "evening reminder",
-            "schedule": {
-                "kind": "cron",
-                "expr": "0 9 * * *",
-                "tz": ""
-            },
-            "action": { "kind": "system_event", "text": "ping" }
-        });
-        let err = validate_cron_schedule_input(&input).expect_err("empty tz must error");
-        assert!(err.contains("IANA"), "error must mention IANA: {err}");
-    }
-
-    #[test]
-    fn cron_create_with_at_schedule_no_tz_required() {
-        let input = serde_json::json!({
-            "name": "one shot",
-            "schedule": {
-                "kind": "at",
-                "at": "2025-01-01T00:00:00Z"
-            },
-            "action": { "kind": "system_event", "text": "ping" }
-        });
-        assert!(validate_cron_schedule_input(&input).is_ok());
-    }
-
-    #[test]
-    fn cron_create_with_every_schedule_no_tz_required() {
-        let input = serde_json::json!({
-            "name": "heartbeat",
-            "schedule": {
-                "kind": "every",
-                "every_secs": 300
-            },
-            "action": { "kind": "system_event", "text": "ping" }
-        });
-        assert!(validate_cron_schedule_input(&input).is_ok());
     }
 
     #[test]
