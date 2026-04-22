@@ -420,20 +420,6 @@ pub trait ChannelBridgeHandle: Send + Sync {
     ) {
     }
 
-    /// Classify the reply intent for a message.
-    #[allow(unused_variables)]
-    async fn classify_reply_intent(
-        &self,
-        _agent_id: AgentId,
-        _message: &str,
-        _sender_id: &str,
-        _is_group: bool,
-        _was_mentioned: bool,
-        _sender_aliases: &[String],
-    ) -> i32 {
-        0
-    }
-
     /// Get custom precheck prompt for an agent.
     async fn get_precheck_prompt(&self, _agent_id: AgentId) -> Option<String> {
         None
@@ -1757,6 +1743,12 @@ fn build_sender_context(
         // sock.groupMetadata). Empty for non-WhatsApp channels — addressee
         // guard then becomes a no-op (BC-01).
         group_participants: extract_group_participants(message),
+        bot_username: None,
+        sender_username: message
+            .metadata
+            .get("sender_username")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         // Channel bridges land in per-channel sessions (the default); only
         // the dashboard WS opts into canonical storage.
         use_canonical_session: false,

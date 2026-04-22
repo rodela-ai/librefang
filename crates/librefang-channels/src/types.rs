@@ -304,6 +304,12 @@ pub struct SenderContext {
     /// Divergence count threshold for `sticky_heuristic` strategy.
     #[serde(default)]
     pub auto_route_divergence_count: u32,
+    /// Bot username for this channel (if applicable).
+    #[serde(default)]
+    pub bot_username: Option<String>,
+    /// Sender's username/handle for this channel (if applicable).
+    #[serde(default)]
+    pub sender_username: Option<String>,
     /// Group participant roster (Phase 2 §C OB-04/OB-05/GS-01).
     ///
     /// Populated by the WhatsApp gateway via `sock.groupMetadata(groupJid)`

@@ -3642,6 +3642,7 @@ system_prompt = "You are a helpful assistant."
             response_format: None,
             prompt_caching: false,
             timeout_secs: Some(10),
+            agent_id: None,
         };
         let response = driver.complete(request).await.map_err(|e| {
             KernelError::LibreFang(LibreFangError::Internal(format!(
@@ -9877,7 +9878,7 @@ system_prompt = "You are a helpful assistant."
                                 // receives its own fresh SessionId.
                                 let wants_new_session = job.session_mode
                                     == Some(librefang_types::agent::SessionMode::New);
-                                let (sender_ctx_owned, mode_override) = if wants_new_session {
+                                let (sender_ctx_owned, _mode_override) = if wants_new_session {
                                     let cron_sender = SenderContext {
                                         channel: "cron".to_string(),
                                         user_id: job.peer_id.clone().unwrap_or_default(),
