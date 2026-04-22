@@ -1763,7 +1763,6 @@ fn build_sender_context(
         // Channel-originated traffic is never internal cron — [SILENT] markers
         // coming from real users must be treated as literal message content.
         is_internal_cron: false,
-
     }
 }
 
@@ -2127,7 +2126,6 @@ async fn dispatch_message(
                         "Reply precheck declined — staying silent"
                     );
                     return;
-
                 }
             }
         } else {

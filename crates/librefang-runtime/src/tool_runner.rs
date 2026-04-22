@@ -335,7 +335,6 @@ pub struct ToolExecContext<'a> {
     /// is preserved across tool calls so previously-approved patterns are not re-blocked.
     pub dangerous_command_checker:
         Option<&'a Arc<tokio::sync::RwLock<crate::dangerous_command::DangerousCommandChecker>>>,
-
 }
 
 /// Execute a tool without running the approval / capability / taint gate.
@@ -374,7 +373,6 @@ pub async fn execute_tool_raw(
         checkpoint_manager,
         interrupt,
         dangerous_command_checker,
-
     } = ctx;
 
     let result = match tool_name {
@@ -1093,7 +1091,6 @@ pub async fn execute_tool(
         checkpoint_manager,
         interrupt,
         dangerous_command_checker,
-
     };
     execute_tool_raw(tool_use_id, tool_name, input, &ctx).await
 }

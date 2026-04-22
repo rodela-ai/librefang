@@ -336,7 +336,6 @@ pub struct SenderContext {
     /// inject `"is_internal_cron": true` through a JSON payload.
     #[serde(skip)]
     pub is_internal_cron: bool,
-
 }
 
 /// Reference to a participant in a group chat.
