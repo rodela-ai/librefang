@@ -29,9 +29,17 @@ const {
   resolveLidProactively,
   checkHeartbeat,
   computeBackoffDelay,
+  isSilentResponse,
+  stripNoReply,
+  createHoldbackAccumulator,
+  SILENT_HOLDBACK_MIN_CHARS,
   echoTracker,
   ECHO_TRACKER_ENABLED,
   EchoTracker,
+  lidToPnJid,
+  lidMapSet,
+  db,
+  LID_PERSIST_ENABLED,
 } = require('./index.js');
 
 // ---------------------------------------------------------------------------
@@ -887,6 +895,97 @@ describe('ID-03 identity_unresolved log shape', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Phase 4 §B (ID-02) — persisted LID cache integration
+// ---------------------------------------------------------------------------
+// These tests exercise the real `db` handle owned by index.js together with
+// the in-memory `lidToPnJid` Map. Each test uses distinct LID keys so runs
+// remain independent.
+describe('ID-02 persisted LID cache wiring', () => {
+  it('exports the write-through helper and the persistence flag', () => {
+    assert.equal(typeof lidMapSet, 'function');
+    assert.ok(lidToPnJid instanceof Map);
+    assert.ok(db, 'db handle must be exported');
+    // Default enabled unless LIBREFANG_LID_PERSIST=off is set in the env.
+    assert.equal(LID_PERSIST_ENABLED, process.env.LIBREFANG_LID_PERSIST !== 'off');
+  });
+
+  it('creates the lid_cache table at boot', () => {
+    const row = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='lid_cache'")
+      .get();
+    assert.equal(row?.name, 'lid_cache');
+  });
+
+  it('mirrors a mapping observation into both the Map and SQLite', () => {
+    const LID = 'integration-a@lid';
+    const PN  = '391230000100@s.whatsapp.net';
+
+    lidMapSet(LID, PN);
+
+    // In-memory authoritative state.
+    assert.equal(lidToPnJid.get(LID), PN);
+
+    // Persisted mirror.
+    const row = db
+      .prepare('SELECT lid, pn_jid, updated_at FROM lid_cache WHERE lid = ?')
+      .get(LID);
+    assert.equal(row?.pn_jid, PN);
+    assert.equal(typeof row?.updated_at, 'number');
+    assert.ok(row.updated_at > 0);
+  });
+
+  it('ignores empty lid or empty pn_jid without touching SQLite', () => {
+    const beforeCount = db.prepare('SELECT COUNT(*) AS c FROM lid_cache').get().c;
+    lidMapSet('', '391230000200@s.whatsapp.net');
+    lidMapSet('integration-b@lid', '');
+    const afterCount = db.prepare('SELECT COUNT(*) AS c FROM lid_cache').get().c;
+    assert.equal(afterCount, beforeCount);
+    assert.equal(lidToPnJid.has('integration-b@lid'), false);
+  });
+
+  it('INSERT OR REPLACE updates pn_jid when the same lid reappears', () => {
+    const LID = 'integration-c@lid';
+    lidMapSet(LID, '391230000300@s.whatsapp.net');
+    lidMapSet(LID, '391230000301@s.whatsapp.net');
+
+    const rows = db
+      .prepare('SELECT pn_jid FROM lid_cache WHERE lid = ?')
+      .all(LID);
+    assert.equal(rows.length, 1, 'primary key must coalesce rows');
+    assert.equal(rows[0].pn_jid, '391230000301@s.whatsapp.net');
+    assert.equal(lidToPnJid.get(LID), '391230000301@s.whatsapp.net');
+  });
+});
+
+// Cross-restart: simulate shutdown + boot by opening a second DB handle at
+// the same path with the lid-cache module directly. We cannot reload
+// index.js in-process (it has module-level setInterval timers); instead we
+// assert that the SQL rows index.js wrote are visible to an independent
+// connection calling `loadAll`, which is exactly what boot-time hydration
+// does.
+describe('ID-02 cross-restart hydration', () => {
+  it('rows written via lidMapSet are visible to lidCache.loadAll on a fresh handle', () => {
+    const Database = require('better-sqlite3');
+    const lidCache = require('./lib/lid-cache');
+
+    const SEED_LID = 'restart-seed@lid';
+    const SEED_PN  = '391230000999@s.whatsapp.net';
+    lidMapSet(SEED_LID, SEED_PN);
+
+    // Open an independent connection against the same file. better-sqlite3
+    // with WAL mode lets readers see committed writes from another handle.
+    const dbPath = process.env.WHATSAPP_DB_PATH;
+    const db2 = new Database(dbPath, { readonly: true });
+    try {
+      const map = lidCache.loadAll(db2);
+      assert.equal(map.get(SEED_LID), SEED_PN);
+    } finally {
+      db2.close();
+    }
+  });
+});
+
 after(() => {
   try {
     const fs = require('node:fs');
@@ -899,4 +998,164 @@ after(() => {
   } catch {}
   // Force exit — SQLite and setInterval timers keep the event loop alive
   setTimeout(() => process.exit(0), 100);
+});
+
+// ---------------------------------------------------------------------------
+// silent_response — gateway-side canonical detector (Phase 2 §B, OB-02/03/07)
+// ---------------------------------------------------------------------------
+describe('isSilentResponse', () => {
+  it('matches the canonical NO_REPLY token', () => {
+    assert.equal(isSilentResponse('NO_REPLY'), true);
+    assert.equal(isSilentResponse('no_reply'), true);
+    assert.equal(isSilentResponse('  NO_REPLY  '), true);
+    assert.equal(isSilentResponse('NO_REPLY.'), true);
+    assert.equal(isSilentResponse('NO_REPLY\n'), true);
+  });
+
+  it('matches the bracketed [no reply needed] form', () => {
+    assert.equal(isSilentResponse('[no reply needed]'), true);
+    assert.equal(isSilentResponse('[NO REPLY NEEDED]'), true);
+    assert.equal(isSilentResponse('[no reply needed].'), true);
+    assert.equal(isSilentResponse('no reply needed'), true);
+  });
+
+  it('matches sentinels glued to emojis', () => {
+    assert.equal(isSilentResponse('NO_REPLY🎩'), true);
+    assert.equal(isSilentResponse('NO_REPLY 😐'), true);
+  });
+
+  it('matches sentinels at the trailing position after context', () => {
+    assert.equal(isSilentResponse('Tutto bene, Signore.\nNO_REPLY'), true);
+    assert.equal(isSilentResponse('Some context. [no reply needed]'), true);
+    assert.equal(isSilentResponse('...a Sua disposizione. 🎩NO_REPLY'), true);
+  });
+
+  it('does not match empty / whitespace-only / normal text', () => {
+    assert.equal(isSilentResponse(''), false);
+    assert.equal(isSilentResponse('   '), false);
+    assert.equal(isSilentResponse('Ok'), false);
+    assert.equal(isSilentResponse('Confermato, rispondo dopo'), false);
+  });
+
+  it('respects word boundaries', () => {
+    assert.equal(isSilentResponse('NO_REPLYING'), false);
+    assert.equal(isSilentResponse('noreply@example.com'), false);
+  });
+
+  it('does not flag embedded substrings inside real replies', () => {
+    assert.equal(isSilentResponse('the NO_REPLY sentinel is documented'), false);
+    assert.equal(isSilentResponse('Ok NO_REPLY received but here is your real answer'), false);
+  });
+
+  it('rejects non-string inputs gracefully', () => {
+    assert.equal(isSilentResponse(null), false);
+    assert.equal(isSilentResponse(undefined), false);
+    assert.equal(isSilentResponse(42), false);
+  });
+});
+
+describe('stripNoReply', () => {
+  it('returns empty string for a whole-message sentinel', () => {
+    assert.equal(stripNoReply('NO_REPLY'), '');
+    assert.equal(stripNoReply('  NO_REPLY  '), '');
+    assert.equal(stripNoReply('[no reply needed]'), '');
+  });
+
+  it('returns the text unchanged when not silent', () => {
+    assert.equal(stripNoReply('Hello world'), 'Hello world');
+    assert.equal(stripNoReply(''), '');
+  });
+
+  it('returns trailing-sentinel text as empty (legacy contract)', () => {
+    // Trailing sentinel collapses the whole message to silent under V2.
+    assert.equal(stripNoReply('Tutto bene. NO_REPLY'), '');
+  });
+});
+
+describe('createHoldbackAccumulator (OB-07 streaming hold-back)', () => {
+  it('NEVER flushes when stream produces only NO_REPLY', async () => {
+    const flushes = [];
+    const acc = createHoldbackAccumulator({ onFlush: (t) => flushes.push(t) });
+    await acc.push('NO_REPLY');
+    const result = await acc.end();
+    assert.equal(flushes.length, 0, 'sock.sendMessage must not be called');
+    assert.equal(result.silent, true);
+    assert.equal(result.flushed, false);
+  });
+
+  it('NEVER flushes for the canonical OB-07 case ["Ok ", "[no reply", " needed]"]', async () => {
+    // This is the user-directive critical case: a streaming source emits
+    // three deltas that, only when concatenated, reveal a sentinel. The
+    // hold-back must keep deferring until end() and then classify silent.
+    const flushes = [];
+    const acc = createHoldbackAccumulator({ onFlush: (t) => flushes.push(t) });
+    await acc.push('Ok ');
+    await acc.push('[no reply');
+    await acc.push(' needed]');
+    const result = await acc.end();
+    assert.equal(flushes.length, 0, 'sock.sendMessage must NEVER be called');
+    assert.equal(result.silent, true);
+  });
+
+  it('flushes legitimate streaming responses once threshold is crossed', async () => {
+    const flushes = [];
+    const acc = createHoldbackAccumulator({ onFlush: (t) => flushes.push(t) });
+    await acc.push('Hello ');
+    await acc.push('world, how are you doing today?');
+    const result = await acc.end();
+    assert.ok(flushes.length >= 1, 'expected at least one flush for non-silent text');
+    assert.equal(result.flushed, true);
+    assert.equal(result.silent, false);
+    // First flush should contain the cumulative buffer at the moment the
+    // threshold was crossed (everything seen so far).
+    assert.ok(flushes[0].includes('Hello'));
+    assert.ok(flushes[0].includes('world'));
+  });
+
+  it('forwards subsequent deltas immediately after the first flush', async () => {
+    const flushes = [];
+    const acc = createHoldbackAccumulator({ onFlush: (t) => flushes.push(t) });
+    await acc.push('This is a long enough chunk to immediately flush past the threshold.');
+    await acc.push(' more');
+    await acc.push(' deltas');
+    await acc.end();
+    assert.equal(flushes.length, 3);
+    assert.equal(flushes[1], ' more');
+    assert.equal(flushes[2], ' deltas');
+  });
+
+  it('handles many empty deltas followed by a real message', async () => {
+    const flushes = [];
+    const acc = createHoldbackAccumulator({ onFlush: (t) => flushes.push(t) });
+    for (let i = 0; i < 10; i++) await acc.push('');
+    await acc.push('Ok sure, here is a sufficiently long real reply.');
+    const result = await acc.end();
+    assert.equal(result.silent, false);
+    assert.ok(flushes.length >= 1);
+  });
+
+  it('treats a short non-sentinel response as silent at end (held forever)', async () => {
+    // Edge case: a 2-char real response like "Ok" never crosses the
+    // threshold, so the hold-back classifier falls through to end(),
+    // which checks isSilentResponse — "Ok" is NOT silent, so end()
+    // flushes the held buffer.
+    const flushes = [];
+    const acc = createHoldbackAccumulator({ onFlush: (t) => flushes.push(t) });
+    await acc.push('Ok');
+    const result = await acc.end();
+    assert.equal(result.silent, false);
+    assert.equal(flushes.length, 1);
+    assert.equal(flushes[0], 'Ok');
+  });
+
+  it('throws when onFlush is missing', () => {
+    assert.throws(() => createHoldbackAccumulator({}), /onFlush/);
+  });
+
+  it('exposes buffered + hasFlushed introspection helpers', async () => {
+    const acc = createHoldbackAccumulator({ onFlush: () => {} });
+    await acc.push('partial');
+    assert.equal(acc.buffered, 'partial');
+    assert.equal(acc.hasFlushed, false);
+  });
 });

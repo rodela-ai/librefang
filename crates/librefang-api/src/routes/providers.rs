@@ -17,6 +17,12 @@ pub fn router() -> axum::Router<std::sync::Arc<super::AppState>> {
             "/models/custom/{*id}",
             axum::routing::delete(remove_custom_model),
         )
+        .route(
+            "/models/overrides/{*id}",
+            axum::routing::get(get_model_overrides)
+                .put(set_model_overrides)
+                .delete(delete_model_overrides),
+        )
         .route("/models/{*id}", axum::routing::get(get_model))
         .route("/providers", axum::routing::get(list_providers))
         .route("/catalog/update", axum::routing::post(catalog_update))
@@ -261,6 +267,8 @@ pub async fn get_model(
                 .get_provider(&m.provider)
                 .map(|p| p.auth_status.is_available())
                 .unwrap_or(m.tier == librefang_types::model_catalog::ModelTier::Custom);
+            let override_key = format!("{}:{}", m.provider, m.id);
+            let overrides = catalog.get_overrides(&override_key);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -277,11 +285,85 @@ pub async fn get_model(
                     "supports_streaming": m.supports_streaming,
                     "aliases": m.aliases,
                     "available": available,
+                    "overrides": overrides,
                 })),
             )
         }
         None => ApiErrorResponse::not_found(format!("Model '{}' not found", id)).into_json_tuple(),
     }
+}
+
+// ── Per-model overrides ─────────────────────────────────────────────────────
+
+/// GET /api/models/overrides/{id} — Get inference parameter overrides for a model.
+pub async fn get_model_overrides(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let catalog = state
+        .kernel
+        .model_catalog_ref()
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    match catalog.get_overrides(&id) {
+        Some(o) => (StatusCode::OK, Json(serde_json::to_value(o).unwrap())),
+        None => (StatusCode::OK, Json(serde_json::json!({}))),
+    }
+}
+
+/// PUT /api/models/overrides/{id} — Set inference parameter overrides for a model.
+pub async fn set_model_overrides(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<librefang_types::model_catalog::ModelOverrides>,
+) -> impl IntoResponse {
+    let overrides_path = state
+        .kernel
+        .home_dir()
+        .join("data")
+        .join("model_overrides.json");
+    let mut catalog = state
+        .kernel
+        .model_catalog_ref()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let previous = catalog.get_overrides(&id).cloned();
+    catalog.set_overrides(id.clone(), body);
+    if let Err(e) = catalog.save_overrides(&overrides_path) {
+        tracing::warn!("Failed to persist model overrides: {e}");
+        // Roll back in-memory change so catalog stays consistent with disk.
+        match previous {
+            Some(prev) => catalog.set_overrides(id, prev),
+            None => {
+                catalog.remove_overrides(&id);
+            }
+        }
+        return ApiErrorResponse::internal(format!("Failed to persist overrides: {e}"))
+            .into_json_tuple();
+    }
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// DELETE /api/models/overrides/{id} — Remove inference parameter overrides for a model.
+pub async fn delete_model_overrides(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let overrides_path = state
+        .kernel
+        .home_dir()
+        .join("data")
+        .join("model_overrides.json");
+    let mut catalog = state
+        .kernel
+        .model_catalog_ref()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    catalog.remove_overrides(&id);
+    if let Err(e) = catalog.save_overrides(&overrides_path) {
+        tracing::warn!("Failed to persist model overrides: {e}");
+    }
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
 /// Attach local-provider probe results to a JSON entry and optionally merge
@@ -359,7 +441,7 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
     // Index probe results by provider list position for O(1) lookup
     let mut probe_map: HashMap<usize, librefang_runtime::provider_health::ProbeResult> =
         HashMap::with_capacity(local_providers.len());
-    for ((idx, _, _), result) in local_providers.iter().zip(probe_results.into_iter()) {
+    for ((idx, _, _), result) in local_providers.iter().zip(probe_results) {
         probe_map.insert(*idx, result);
     }
 
@@ -374,6 +456,7 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
             "key_required": p.key_required,
             "api_key_env": p.api_key_env,
             "base_url": p.base_url,
+            "proxy_url": p.proxy_url,
             "media_capabilities": p.media_capabilities,
             "is_custom": p.is_custom,
         });
@@ -471,7 +554,7 @@ pub(crate) async fn providers_snapshot(state: &Arc<AppState>) -> Vec<serde_json:
 
     let mut probe_map: HashMap<usize, librefang_runtime::provider_health::ProbeResult> =
         HashMap::with_capacity(local_providers.len());
-    for ((idx, _, _), result) in local_providers.iter().zip(probe_results.into_iter()) {
+    for ((idx, _, _), result) in local_providers.iter().zip(probe_results) {
         probe_map.insert(*idx, result);
     }
 
@@ -485,6 +568,7 @@ pub(crate) async fn providers_snapshot(state: &Arc<AppState>) -> Vec<serde_json:
             "key_required": p.key_required,
             "api_key_env": p.api_key_env,
             "base_url": p.base_url,
+            "proxy_url": p.proxy_url,
             "media_capabilities": p.media_capabilities,
             "is_custom": p.is_custom,
         });
@@ -560,6 +644,7 @@ pub async fn get_provider(
         "key_required": provider.key_required,
         "api_key_env": provider.api_key_env,
         "base_url": provider.base_url,
+        "proxy_url": provider.proxy_url,
         "models": models,
     });
 
@@ -681,7 +766,11 @@ pub async fn add_custom_model(
     // Persist to disk. If save fails, roll back the in-memory add so the
     // catalog stays consistent with what's on disk — otherwise the caller
     // sees "added" now but the model vanishes on the next daemon restart.
-    let custom_path = state.kernel.home_dir().join("custom_models.json");
+    let custom_path = state
+        .kernel
+        .home_dir()
+        .join("data")
+        .join("custom_models.json");
     if let Err(e) = catalog.save_custom_models(&custom_path) {
         tracing::warn!("Failed to persist custom models: {e}");
         catalog.remove_custom_model(&id);
@@ -720,7 +809,11 @@ pub async fn remove_custom_model(
             .into_json_tuple();
     }
 
-    let custom_path = state.kernel.home_dir().join("custom_models.json");
+    let custom_path = state
+        .kernel
+        .home_dir()
+        .join("data")
+        .join("custom_models.json");
     if let Err(e) = catalog.save_custom_models(&custom_path) {
         tracing::warn!("Failed to persist custom models: {e}");
         if let Some(entry) = snapshot {
@@ -787,7 +880,13 @@ pub async fn set_provider_key(
             .write()
             .unwrap_or_else(|e| e.into_inner());
         catalog.unsuppress_provider(&name);
-        catalog.save_suppressed(&state.kernel.home_dir().join("suppressed_providers.json"));
+        catalog.save_suppressed(
+            &state
+                .kernel
+                .home_dir()
+                .join("data")
+                .join("suppressed_providers.json"),
+        );
         catalog.detect_auth();
     }
 
@@ -980,7 +1079,13 @@ pub async fn delete_provider_key(
             .write()
             .unwrap_or_else(|e| e.into_inner());
         catalog.suppress_provider(&name);
-        catalog.save_suppressed(&state.kernel.home_dir().join("suppressed_providers.json"));
+        catalog.save_suppressed(
+            &state
+                .kernel
+                .home_dir()
+                .join("data")
+                .join("suppressed_providers.json"),
+        );
         catalog.detect_auth();
     }
 
@@ -1247,6 +1352,22 @@ pub async fn set_provider_url(
             .into_json_tuple();
     }
 
+    // Optional proxy_url in same request
+    let proxy_url = body["proxy_url"].as_str().map(|s| s.trim().to_string());
+    if let Some(ref pu) = proxy_url {
+        if !pu.is_empty()
+            && !pu.starts_with("http://")
+            && !pu.starts_with("https://")
+            && !pu.starts_with("socks5://")
+            && !pu.starts_with("socks5h://")
+        {
+            return ApiErrorResponse::bad_request(
+                "proxy_url must start with http://, https://, socks5://, or socks5h://",
+            )
+            .into_json_tuple();
+        }
+    }
+
     // Update catalog in memory
     {
         let mut catalog = state
@@ -1255,12 +1376,20 @@ pub async fn set_provider_url(
             .write()
             .unwrap_or_else(|e| e.into_inner());
         catalog.set_provider_url(&name, &base_url);
+        if let Some(ref pu) = proxy_url {
+            catalog.set_provider_proxy_url(&name, pu);
+        }
     }
 
     // Persist to config.toml [provider_urls] section
     let config_path = state.kernel.home_dir().join("config.toml");
     if let Err(e) = upsert_provider_url(&config_path, &name, &base_url) {
         return ApiErrorResponse::internal(format!("Failed to save config: {e}")).into_json_tuple();
+    }
+    if let Some(ref pu) = proxy_url {
+        if let Err(e) = upsert_provider_proxy_url(&config_path, &name, pu) {
+            tracing::warn!("Failed to persist proxy_url: {e}");
+        }
     }
 
     // Probe reachability at the new URL
@@ -1308,7 +1437,18 @@ pub async fn set_provider_url(
 pub async fn set_default_provider(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    body: Option<axum::Json<serde_json::Value>>,
 ) -> impl IntoResponse {
+    // Accept optional {"model": "model-id"} body to override the auto-selected model.
+    // This is needed for providers like ollama where models are dynamic and may
+    // not be in the static catalog.
+    let user_model = body
+        .as_ref()
+        .and_then(|b| b.get("model"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .map(String::from);
+
     // Verify the provider exists in the catalog
     let (default_model, env_var) = {
         let catalog = state
@@ -1323,7 +1463,7 @@ pub async fn set_default_provider(
                     .into_json_tuple();
             }
         };
-        let model_id = catalog.default_model_for_provider(&name);
+        let model_id = user_model.or_else(|| catalog.default_model_for_provider(&name));
         (model_id, provider.api_key_env.clone())
     };
 
@@ -1331,7 +1471,7 @@ pub async fn set_default_provider(
         Some(id) => id,
         None => {
             return ApiErrorResponse::bad_request(format!(
-                "No models found for provider '{}'",
+                "No models found for provider '{}'. Specify a model in the request body: {{\"model\": \"model-name\"}}",
                 name
             ))
             .into_json_tuple();
@@ -1480,6 +1620,50 @@ fn upsert_provider_url(
 
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+
+    std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
+    Ok(())
+}
+
+/// Persist a per-provider proxy URL to `[provider_proxy_urls]` in config.toml.
+fn upsert_provider_proxy_url(
+    config_path: &std::path::Path,
+    provider: &str,
+    proxy_url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let content = if config_path.exists() {
+        std::fs::read_to_string(config_path)?
+    } else {
+        String::new()
+    };
+
+    let mut doc: toml::Value = if content.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        toml::from_str(&content)?
+    };
+
+    let root = doc.as_table_mut().ok_or("Config is not a TOML table")?;
+
+    if !root.contains_key("provider_proxy_urls") {
+        root.insert(
+            "provider_proxy_urls".to_string(),
+            toml::Value::Table(toml::map::Map::new()),
+        );
+    }
+    let table = root
+        .get_mut("provider_proxy_urls")
+        .and_then(|v| v.as_table_mut())
+        .ok_or("provider_proxy_urls is not a table")?;
+
+    if proxy_url.is_empty() {
+        table.remove(provider);
+    } else {
+        table.insert(
+            provider.to_string(),
+            toml::Value::String(proxy_url.to_string()),
+        );
     }
 
     std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;

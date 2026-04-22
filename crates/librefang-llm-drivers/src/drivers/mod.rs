@@ -12,6 +12,7 @@ pub mod claude_code;
 pub mod codex_cli;
 pub mod copilot;
 pub mod fallback;
+pub mod fallback_chain;
 pub mod gemini;
 pub mod gemini_cli;
 pub mod openai;
@@ -93,10 +94,11 @@ impl DriverCache {
         let key_hash = hasher.finish();
 
         format!(
-            "{}|{}|{}",
+            "{}|{}|{}|{}",
             config.provider,
             key_hash,
-            config.base_url.as_deref().unwrap_or("")
+            config.base_url.as_deref().unwrap_or(""),
+            config.proxy_url.as_deref().unwrap_or("")
         )
     }
 }
@@ -682,10 +684,18 @@ fn create_driver_from_entry(
         )));
     }
 
+    let proxy_url = config.proxy_url.as_deref();
+
     match entry.api_format {
-        ApiFormat::OpenAI => Ok(Arc::new(openai::OpenAIDriver::new(api_key, base_url))),
-        ApiFormat::Anthropic => Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url))),
-        ApiFormat::Gemini => Ok(Arc::new(gemini::GeminiDriver::new(api_key, base_url))),
+        ApiFormat::OpenAI => Ok(Arc::new(openai::OpenAIDriver::with_proxy(
+            api_key, base_url, proxy_url,
+        ))),
+        ApiFormat::Anthropic => Ok(Arc::new(anthropic::AnthropicDriver::with_proxy(
+            api_key, base_url, proxy_url,
+        ))),
+        ApiFormat::Gemini => Ok(Arc::new(gemini::GeminiDriver::with_proxy(
+            api_key, base_url, proxy_url,
+        ))),
         ApiFormat::ClaudeCode => {
             let mut d = claude_code::ClaudeCodeDriver::with_timeout(
                 config.base_url.clone(),
@@ -713,7 +723,9 @@ fn create_driver_from_entry(
             config.base_url.clone(),
             config.skip_permissions,
         ))),
-        ApiFormat::ChatGpt => Ok(Arc::new(chatgpt::ChatGptDriver::new(api_key, base_url))),
+        ApiFormat::ChatGpt => Ok(Arc::new(chatgpt::ChatGptDriver::with_proxy(
+            api_key, base_url, proxy_url,
+        ))),
         ApiFormat::Copilot => Ok(Arc::new(copilot::CopilotDriver::new(api_key, base_url))),
         ApiFormat::VertexAI => Ok(Arc::new(vertex_ai::VertexAiDriver::new(config)?)),
         ApiFormat::AzureOpenAI => {
@@ -739,11 +751,12 @@ fn create_driver_from_entry(
                 .clone()
                 .or_else(|| std::env::var("AZURE_OPENAI_API_VERSION").ok())
                 .unwrap_or_else(|| "2024-02-01".to_string());
-            Ok(Arc::new(openai::OpenAIDriver::new_azure(
+            Ok(Arc::new(openai::OpenAIDriver::new_azure_with_proxy(
                 api_key,
                 endpoint,
                 deployment,
                 api_version,
+                proxy_url,
             )))
         }
     }
@@ -794,9 +807,10 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             let env_var = format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"));
             std::env::var(&env_var).unwrap_or_default()
         });
-        return Ok(Arc::new(openai::OpenAIDriver::new(
+        return Ok(Arc::new(openai::OpenAIDriver::with_proxy(
             api_key,
             base_url.clone(),
+            config.proxy_url.as_deref(),
         )));
     }
 
@@ -920,6 +934,30 @@ pub fn cli_provider_available(name: &str) -> bool {
     }
 }
 
+/// Check whether any of the given env vars redirect traffic away from official
+/// API hosts. Returns `true` when a proxy/non-official endpoint is detected.
+///
+/// CLI providers inherit environment variables (e.g. `ANTHROPIC_BASE_URL`)
+/// that can silently redirect all requests to a third-party proxy. When that
+/// happens the provider should not appear as "configured".
+///
+/// `env_vars` — env var names to check (first non-empty wins).
+/// `official_hosts` — substrings that identify the official API (e.g.
+/// `"api.anthropic.com"`). If the env var value contains none of them, the
+/// provider is considered proxied.
+pub fn is_proxied_via_env(env_vars: &[&str], official_hosts: &[&str]) -> bool {
+    for var in env_vars {
+        if let Ok(val) = std::env::var(var) {
+            let val = val.trim().trim_end_matches('/').to_lowercase();
+            if val.is_empty() {
+                continue;
+            }
+            return !official_hosts.iter().any(|host| val.contains(host));
+        }
+    }
+    false
+}
+
 /// Check if a provider name refers to a CLI-subprocess-based provider.
 pub fn is_cli_provider(name: &str) -> bool {
     matches!(
@@ -1041,6 +1079,7 @@ mod tests {
             skip_permissions: true,
             message_timeout_secs: 300,
             mcp_bridge: None,
+            proxy_url: None,
         };
         let driver = create_driver(&config);
         assert!(driver.is_ok());
@@ -1057,6 +1096,7 @@ mod tests {
             skip_permissions: true,
             message_timeout_secs: 300,
             mcp_bridge: None,
+            proxy_url: None,
         };
         let driver = create_driver(&config);
         assert!(driver.is_err());
@@ -1179,6 +1219,7 @@ mod tests {
             skip_permissions: true,
             message_timeout_secs: 300,
             mcp_bridge: None,
+            proxy_url: None,
         };
         let driver = create_driver(&config);
         assert!(
@@ -1202,6 +1243,7 @@ mod tests {
             skip_permissions: true,
             message_timeout_secs: 300,
             mcp_bridge: None,
+            proxy_url: None,
         };
         let driver = create_driver(&config);
         assert!(driver.is_err());
@@ -1225,6 +1267,7 @@ mod tests {
             skip_permissions: true,
             message_timeout_secs: 300,
             mcp_bridge: None,
+            proxy_url: None,
         };
         let result = create_driver(&config);
         assert!(result.is_err());
@@ -1257,6 +1300,7 @@ mod tests {
             skip_permissions: true,
             message_timeout_secs: 300,
             mcp_bridge: None,
+            proxy_url: None,
         };
         let driver = create_driver(&config);
         assert!(driver.is_ok());
@@ -1283,6 +1327,7 @@ mod tests {
             skip_permissions: true,
             message_timeout_secs: 300,
             mcp_bridge: None,
+            proxy_url: None,
         };
 
         let driver = create_driver(&config);
@@ -1321,6 +1366,7 @@ mod tests {
             skip_permissions: true,
             message_timeout_secs: 300,
             mcp_bridge: None,
+            proxy_url: None,
         };
         let driver = create_driver(&config);
         assert!(
@@ -1340,6 +1386,7 @@ mod tests {
             skip_permissions: true,
             message_timeout_secs: 300,
             mcp_bridge: None,
+            proxy_url: None,
         };
         // Clear any env var that might interfere
         std::env::remove_var("AZURE_OPENAI_ENDPOINT");
@@ -1368,6 +1415,7 @@ mod tests {
             skip_permissions: true,
             message_timeout_secs: 300,
             mcp_bridge: None,
+            proxy_url: None,
         };
         let d1 = cache.get_or_create(&config).unwrap();
         let d2 = cache.get_or_create(&config).unwrap();
@@ -1387,6 +1435,7 @@ mod tests {
             skip_permissions: true,
             message_timeout_secs: 300,
             mcp_bridge: None,
+            proxy_url: None,
         };
         let config_b = DriverConfig {
             provider: "ollama".to_string(),
@@ -1397,6 +1446,7 @@ mod tests {
             skip_permissions: true,
             message_timeout_secs: 300,
             mcp_bridge: None,
+            proxy_url: None,
         };
         let d_a = cache.get_or_create(&config_a).unwrap();
         let d_b = cache.get_or_create(&config_b).unwrap();
@@ -1419,6 +1469,7 @@ mod tests {
             skip_permissions: true,
             message_timeout_secs: 300,
             mcp_bridge: None,
+            proxy_url: None,
         };
         cache.get_or_create(&config).unwrap();
         assert_eq!(cache.len(), 1);

@@ -2,7 +2,9 @@
 //!
 //! Works with OpenAI, Ollama, vLLM, and any other OpenAI-compatible endpoint.
 
+use crate::backoff::{standard_retry_delay, tool_use_retry_delay};
 use crate::llm_driver::{CompletionRequest, CompletionResponse, LlmDriver, LlmError, StreamEvent};
+use crate::rate_limit_tracker::RateLimitSnapshot;
 use crate::think_filter::{FilterAction, StreamingThinkFilter};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -31,10 +33,19 @@ pub struct OpenAIDriver {
 impl OpenAIDriver {
     /// Create a new OpenAI-compatible driver.
     pub fn new(api_key: String, base_url: String) -> Self {
+        Self::with_proxy(api_key, base_url, None)
+    }
+
+    /// Create a new OpenAI-compatible driver with an optional per-provider proxy.
+    pub fn with_proxy(api_key: String, base_url: String, proxy_url: Option<&str>) -> Self {
+        let client = match proxy_url {
+            Some(url) => librefang_http::proxied_client_with_override(url),
+            None => librefang_http::proxied_client(),
+        };
         Self {
             api_key: Zeroizing::new(api_key),
             base_url,
-            client: librefang_http::proxied_client(),
+            client,
             extra_headers: Vec::new(),
             use_api_key_header: false,
             url_query: None,
@@ -51,15 +62,29 @@ impl OpenAIDriver {
         deployment: String,
         api_version: String,
     ) -> Self {
+        Self::new_azure_with_proxy(api_key, endpoint, deployment, api_version, None)
+    }
+
+    pub fn new_azure_with_proxy(
+        api_key: String,
+        endpoint: String,
+        deployment: String,
+        api_version: String,
+        proxy_url: Option<&str>,
+    ) -> Self {
         let base_url = format!(
             "{}/openai/deployments/{}",
             endpoint.trim_end_matches('/'),
             deployment
         );
+        let client = match proxy_url {
+            Some(url) => librefang_http::proxied_client_with_override(url),
+            None => librefang_http::proxied_client(),
+        };
         Self {
             api_key: Zeroizing::new(api_key),
             base_url,
-            client: librefang_http::proxied_client(),
+            client,
             extra_headers: Vec::new(),
             use_api_key_header: true,
             url_query: Some(format!("api-version={}", api_version)),
@@ -325,17 +350,16 @@ impl OpenAIDriver {
         // Convert messages
         for msg in &request.messages {
             match (&msg.role, &msg.content) {
-                (Role::System, MessageContent::Text(text)) => {
-                    if request.system.is_none() {
-                        oai_messages.push(OaiMessage {
-                            role: "system".to_string(),
-                            content: Some(OaiMessageContent::Text(text.clone())),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            reasoning_content: None,
-                        });
-                    }
+                (Role::System, MessageContent::Text(text)) if request.system.is_none() => {
+                    oai_messages.push(OaiMessage {
+                        role: "system".to_string(),
+                        content: Some(OaiMessageContent::Text(text.clone())),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    });
                 }
+                (Role::System, MessageContent::Text(_)) => {}
                 (Role::User, MessageContent::Text(text)) => {
                     oai_messages.push(OaiMessage {
                         role: "user".to_string(),
@@ -640,9 +664,20 @@ impl LlmDriver for OpenAIDriver {
             let status = resp.status().as_u16();
             if status == 429 {
                 if attempt < max_retries {
-                    let retry_ms = (attempt + 1) as u64 * 2000;
-                    warn!(status, retry_ms, "Rate limited, retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
+                    let retry_after = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(std::time::Duration::from_secs)
+                        .unwrap_or(std::time::Duration::ZERO);
+                    let delay = standard_retry_delay(attempt + 1, retry_after);
+                    warn!(
+                        status,
+                        delay_ms = delay.as_millis(),
+                        "Rate limited, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
                 return Err(LlmError::RateLimited {
@@ -663,9 +698,14 @@ impl LlmDriver for OpenAIDriver {
                     }
                     // If parsing fails, retry on next attempt
                     if attempt < max_retries {
-                        let retry_ms = (attempt + 1) as u64 * 1500;
-                        warn!(status, attempt, retry_ms, "tool_use_failed, retrying");
-                        tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
+                        let delay = tool_use_retry_delay(attempt + 1);
+                        warn!(
+                            status,
+                            attempt,
+                            delay_ms = delay.as_millis(),
+                            "tool_use_failed, retrying"
+                        );
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
                 }
@@ -743,6 +783,23 @@ impl LlmDriver for OpenAIDriver {
                     status,
                     message: body,
                 });
+            }
+
+            // Extract and log rate limit headers before consuming the response body.
+            if let Some(snap) = RateLimitSnapshot::from_headers(resp.headers()) {
+                if snap.has_warning() {
+                    warn!(
+                        target: "librefang::rate_limit",
+                        "OpenAI-compatible rate limit warning:\n{}",
+                        snap.display()
+                    );
+                } else {
+                    debug!(
+                        target: "librefang::rate_limit",
+                        "OpenAI-compatible rate limits OK:\n{}",
+                        snap.display()
+                    );
+                }
             }
 
             let body = resp
@@ -981,9 +1038,20 @@ impl LlmDriver for OpenAIDriver {
             let status = resp.status().as_u16();
             if status == 429 {
                 if attempt < max_retries {
-                    let retry_ms = (attempt + 1) as u64 * 2000;
-                    warn!(status, retry_ms, "Rate limited (stream), retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
+                    let retry_after = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(std::time::Duration::from_secs)
+                        .unwrap_or(std::time::Duration::ZERO);
+                    let delay = standard_retry_delay(attempt + 1, retry_after);
+                    warn!(
+                        status,
+                        delay_ms = delay.as_millis(),
+                        "Rate limited (stream), retrying"
+                    );
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
                 return Err(LlmError::RateLimited {
@@ -1002,12 +1070,14 @@ impl LlmDriver for OpenAIDriver {
                         return Ok(response);
                     }
                     if attempt < max_retries {
-                        let retry_ms = (attempt + 1) as u64 * 1500;
+                        let delay = tool_use_retry_delay(attempt + 1);
                         warn!(
                             status,
-                            attempt, retry_ms, "tool_use_failed (stream), retrying"
+                            attempt,
+                            delay_ms = delay.as_millis(),
+                            "tool_use_failed (stream), retrying"
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
                 }
@@ -1093,6 +1163,23 @@ impl LlmDriver for OpenAIDriver {
                     status,
                     message: body,
                 });
+            }
+
+            // Extract and log rate limit headers before consuming the stream.
+            if let Some(snap) = RateLimitSnapshot::from_headers(resp.headers()) {
+                if snap.has_warning() {
+                    warn!(
+                        target: "librefang::rate_limit",
+                        "OpenAI-compatible rate limit warning (stream):\n{}",
+                        snap.display()
+                    );
+                } else {
+                    debug!(
+                        target: "librefang::rate_limit",
+                        "OpenAI-compatible rate limits OK (stream):\n{}",
+                        snap.display()
+                    );
+                }
             }
 
             // Parse the SSE stream
@@ -1752,6 +1839,7 @@ mod tests {
             response_format: None,
             timeout_secs: None,
             extra_body: None,
+            agent_id: None,
         };
         let oai = driver.build_request(&request).expect("build request");
         let extra = oai.extra_body.as_ref().expect("extra_body present");
@@ -1777,6 +1865,7 @@ mod tests {
             response_format: None,
             timeout_secs: None,
             extra_body: None,
+            agent_id: None,
         };
         let oai = driver.build_request(&request).expect("build request");
         let extra = oai.extra_body.as_ref().expect("extra_body present");
@@ -1802,6 +1891,7 @@ mod tests {
             response_format: None,
             timeout_secs: None,
             extra_body: None,
+            agent_id: None,
         };
         let oai = driver.build_request(&request).expect("build request");
         // Non-ollama: extra_body should mirror the (None) request.extra_body.

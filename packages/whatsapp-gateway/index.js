@@ -8,6 +8,8 @@ const os = require('node:os');
 const { randomUUID } = require('node:crypto');
 const toml = require('toml');
 const { EchoTracker } = require('./lib/echo-tracker');
+const lidCache = require('./lib/lid-cache');
+const { createDedupTracker } = require('./lib/dedup-tracker');
 const {
   isLidJid,
   isGroupJid,
@@ -17,6 +19,18 @@ const {
   resolvePeerId,
   deriveOwnerJids,
 } = require('./lib/identity');
+
+// ---------------------------------------------------------------------------
+// Persisted LID cache (ID-02, Phase 4 §B)
+// ---------------------------------------------------------------------------
+// The in-memory `lidToPnJid` Map is populated on every senderPn observation
+// and every successful `resolveLidProactively` call. To survive restarts, we
+// mirror every insertion into the SQLite `lid_cache` table (init'd below,
+// loaded into the Map at boot). Failures are logged as
+// `lid_cache_write_failed` and never block the caller.
+// Flag `LIBREFANG_LID_PERSIST=off` disables persistence (in-memory only) —
+// useful for ephemeral CI runs or debugging with a fresh map each boot.
+const LID_PERSIST_ENABLED = process.env.LIBREFANG_LID_PERSIST !== 'off';
 
 // ---------------------------------------------------------------------------
 // Echo tracker (EB-01, Phase 3 §A)
@@ -69,6 +83,18 @@ db.exec(`
     updated_at TEXT DEFAULT (datetime('now'))
   );
 `);
+
+// Phase 4 §B (ID-02): persisted LID → phone-number JID cache.
+if (LID_PERSIST_ENABLED) {
+  try {
+    lidCache.init(db);
+  } catch (err) {
+    console.warn(JSON.stringify({
+      event: 'lid_cache_init_failed',
+      error: err.message,
+    }));
+  }
+}
 
 console.log(`[gateway] SQLite message store initialized: ${DB_PATH}`);
 
@@ -308,6 +334,45 @@ let ownJid = null;
 //                       owner is recognised, even before any senderPn event.
 const lidToPnJid = new Map();    // '<digits>@lid' → '<digits>@s.whatsapp.net'
 const ownerLidJids = new Set();  // '<digits>@lid'
+
+// Phase 4 §B (ID-02): boot-time rehydrate from SQLite. Keeps the 10000 most
+// recently updated entries (prune runs before load so the eviction budget is
+// enforced immediately, independent of how large the on-disk table grew
+// between restarts).
+if (LID_PERSIST_ENABLED) {
+  try {
+    lidCache.prune(db, lidCache.DEFAULT_KEEP);
+    const persisted = lidCache.loadAll(db);
+    for (const [lid, pn] of persisted) lidToPnJid.set(lid, pn);
+    if (persisted.size > 0) {
+      console.log(`[gateway] LID cache hydrated from SQLite: ${persisted.size} entries`);
+    }
+  } catch (err) {
+    console.warn(JSON.stringify({
+      event: 'lid_cache_load_failed',
+      error: err.message,
+    }));
+  }
+}
+
+// Write-through helper. Updates the in-memory Map first (authoritative for
+// the hot path) then mirrors to SQLite best-effort. SQL failures are logged
+// but NEVER thrown — identity resolution must keep working even if the DB
+// becomes read-only mid-session.
+function lidMapSet(lid, pnJid) {
+  if (!lid || !pnJid) return;
+  lidToPnJid.set(lid, pnJid);
+  if (!LID_PERSIST_ENABLED) return;
+  try {
+    lidCache.upsert(db, lid, pnJid);
+  } catch (err) {
+    console.warn(JSON.stringify({
+      event: 'lid_cache_write_failed',
+      lid,
+      error: err.message,
+    }));
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Phase 2 §C — Group participant roster cache (GS-01 minimal)
@@ -588,23 +653,13 @@ setInterval(() => {
 // ---------------------------------------------------------------------------
 // Message deduplication — Baileys can deliver the same message multiple times
 // ---------------------------------------------------------------------------
-const recentMessageIds = new Map(); // Map<msgId, timestamp>
-const DEDUP_WINDOW_MS = 60_000; // 1 minute
-
-function isDuplicate(msgId) {
-  if (!msgId) return false;
-  if (recentMessageIds.has(msgId)) return true;
-  recentMessageIds.set(msgId, Date.now());
-  return false;
-}
-
-// Cleanup dedup cache every 2 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, ts] of recentMessageIds) {
-    if (now - ts > DEDUP_WINDOW_MS) recentMessageIds.delete(id);
-  }
-}, 2 * 60 * 1000);
+// Two-phase (wasProcessed / markProcessed): Baileys re-emits `messages.upsert`
+// for a msgId whose previous handling ended in decrypt failure (null payload /
+// SessionError / PreKeyError). That retransmit is the ONLY window for
+// `assertSessions` to recover the Signal session. A mark-on-sight dedup
+// blocks the retransmit and strands the sender — 2026-04-16 outage, see
+// lib/dedup-tracker.js docstring.
+const dedupTracker = createDedupTracker({ windowMs: 60_000 });
 
 // ---------------------------------------------------------------------------
 // Step F: Escalation deduplication — debounce NOTIFY_OWNER per stranger
@@ -707,28 +762,180 @@ function extractNotifyOwner(responseText) {
 }
 
 // ---------------------------------------------------------------------------
-// NO_REPLY sentinel — agent-side convention to silently decline to answer.
+// Silent-response sentinel — gateway-side mirror of the canonical Rust
+// detector at crates/librefang-runtime/src/silent_response.rs.
 // ---------------------------------------------------------------------------
-// The agent prompts instruct the LLM to emit a bare `NO_REPLY` token when it
-// decides a message doesn't warrant a reply. Ideally it is the entire
-// response, but in practice we see two leaks:
-//   1. Trailing token:  "Tutto bene, Signore.\nNO_REPLY"
-//   2. Concatenated:    "...a Sua disposizione. 🎩NO_REPLY"   ← no separator
-// Both must be scrubbed before the text hits WhatsApp. The helper returns
-// the cleaned text, or `''` when the entire response was a NO_REPLY sentinel
-// and the caller should suppress delivery entirely.
+// Two-layer protection (Phase 2 §B, OB-02 / OB-03 / OB-07):
+//
+//   1. `isSilentResponse(text)` classifies a complete (or accumulated)
+//      response as silent — case-insensitive, with trailing punctuation /
+//      whitespace / emoji tolerance, and proper word boundaries. Mirrors
+//      the Rust canonical detector so both layers of the stack agree.
+//
+//   2. `createHoldbackAccumulator({onFlush, onSilent})` is the streaming
+//      gate: it BUFFERS deltas instead of forwarding them and only
+//      releases a flush once it can prove the cumulative text is NOT
+//      sentinel-shaped (length threshold + classifier check). If the
+//      stream ends silent, NO partial chunk ever escaped. This replaces
+//      the post-hoc `stripNoReply` scrub which had a window where a
+//      mid-stream "[no reply" prefix would already have been forwarded
+//      as a WhatsApp message edit before the trailing " needed]" arrived.
+//
+// Toggle: `LIBREFANG_SILENT_V2=off` reverts to the legacy regex-scrub
+// path, kept for one release as the rollback hatch.
+const SILENT_V2_ENABLED = !['off', '0', 'false', 'no'].includes(
+  String(process.env.LIBREFANG_SILENT_V2 || '').toLowerCase(),
+);
+
+// Hold-back window: the accumulator will not flush until the buffer has
+// grown past this many chars OR the stream has ended. 32 is empirically
+// long enough to cover the longest sentinel form ("[no reply needed]" =
+// 18 chars) plus comfortable headroom for emoji/punctuation tolerance.
+const SILENT_HOLDBACK_MIN_CHARS = 32;
+
+// Match a buffer that LOOKS like it is becoming a silent sentinel.
+// Used by the hold-back accumulator to keep buffering when the prefix
+// is still ambiguous (e.g. the model has streamed `"Ok [no reply"` and
+// we don't yet know whether the next delta closes it or extends into
+// real text).
+const SILENT_PREFIX_RE = /^\s*(\[?\s*no[_\s]?reply(?:\s*needed)?\s*\]?\s*[\s.!?]*)$/i;
+
+function isSilentResponse(text) {
+  if (typeof text !== 'string' || text.length === 0) return false;
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+
+  if (!SILENT_V2_ENABLED) {
+    // Legacy detector — bit-for-bit equivalent to pre-Phase-2 behaviour.
+    return (
+      trimmed === 'NO_REPLY' ||
+      trimmed.endsWith('NO_REPLY') ||
+      trimmed === '[no reply needed]' ||
+      trimmed.endsWith('[no reply needed]') ||
+      trimmed === 'no reply needed' ||
+      trimmed.endsWith('no reply needed')
+    );
+  }
+
+  // Strip trailing punctuation, whitespace, and any non-ASCII (emoji).
+  // Walk by code points (handles surrogate pairs for emojis correctly).
+  let end = trimmed.length;
+  while (end > 0) {
+    let unitStart = end - 1;
+    // If we're on a low surrogate, the actual code point starts one earlier.
+    const lowUnit = trimmed.charCodeAt(unitStart);
+    if (lowUnit >= 0xDC00 && lowUnit <= 0xDFFF && unitStart > 0) {
+      const highUnit = trimmed.charCodeAt(unitStart - 1);
+      if (highUnit >= 0xD800 && highUnit <= 0xDBFF) unitStart -= 1;
+    }
+    const c = trimmed.codePointAt(unitStart);
+    const ch = String.fromCodePoint(c);
+    const isStrippable =
+      /\s/.test(ch) ||
+      ch === '.' || ch === ',' || ch === ';' || ch === ':' || ch === '!' || ch === '?' ||
+      c > 0x7F;
+    if (!isStrippable) break;
+    end = unitStart;
+  }
+  const stripped = trimmed.slice(0, end);
+  const lower = stripped.toLowerCase();
+
+  if (lower === 'no_reply' || lower === '[no reply needed]' || lower === 'no reply needed') {
+    return true;
+  }
+  for (const needle of ['no_reply', '[no reply needed]', 'no reply needed']) {
+    if (lower.endsWith(needle)) {
+      const cut = lower.length - needle.length;
+      if (cut === 0) return true;
+      const prev = lower[cut - 1];
+      // Word-boundary check: prev char must NOT be alphanumeric or _.
+      if (!/[a-z0-9_]/.test(prev)) return true;
+    }
+  }
+  return false;
+}
+
+// Legacy entry point preserved for the non-streaming and final-response
+// scrub call sites (lines that historically called stripNoReply on a
+// fully-formed response). When the response is a sentinel, returns ''
+// so callers can short-circuit delivery; otherwise returns the text
+// unchanged (the canonical V2 detector decides whole-message silence,
+// no partial scrubbing — partial scrubbing was the bug).
 function stripNoReply(text) {
   if (typeof text !== 'string' || !text) return text || '';
-  if (text.trim() === 'NO_REPLY') return '';
-  // `\bNO_REPLY\b` matches even when glued to an emoji (🎩NO_REPLY) because
-  // emoji code points are not word characters. Strip every standalone
-  // occurrence, collapse the whitespace it leaves behind.
-  const stripped = text
-    .replace(/\bNO_REPLY\b/g, '')
-    .replace(/[ \t]+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-  return stripped === 'NO_REPLY' ? '' : stripped;
+  if (isSilentResponse(text)) return '';
+  if (!SILENT_V2_ENABLED) {
+    // Legacy in-text scrub kept under the rollback flag.
+    const stripped = text
+      .replace(/\bNO_REPLY\b/g, '')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    return stripped === 'NO_REPLY' ? '' : stripped;
+  }
+  return text;
+}
+
+/**
+ * Streaming hold-back accumulator (OB-07).
+ *
+ * Buffers incoming deltas and decides — at every delta — whether the
+ * cumulative text has clearly diverged from any silent-response shape.
+ * Only then does it call `onFlush(buf)` once. After the first flush, all
+ * subsequent deltas are forwarded immediately via `onFlush(delta)` so
+ * progressive WhatsApp edits keep working unchanged.
+ *
+ * If the stream concludes silent, `onSilent(buf)` fires and `onFlush`
+ * is NEVER called — guaranteeing zero partial sentinel leaks.
+ *
+ * @param {object} cfg
+ * @param {(text: string) => (Promise<void> | void)} cfg.onFlush  forward
+ *   text to the channel (e.g. sock.sendMessage / WhatsApp edit)
+ * @param {(text: string) => (Promise<void> | void)} [cfg.onSilent] optional
+ *   notification for diagnostics / OBS-01 logging
+ * @param {number} [cfg.minChars=32] hold-back threshold
+ */
+function createHoldbackAccumulator({ onFlush, onSilent, minChars = SILENT_HOLDBACK_MIN_CHARS } = {}) {
+  if (typeof onFlush !== 'function') {
+    throw new TypeError('createHoldbackAccumulator requires onFlush callback');
+  }
+  let buf = '';
+  let flushed = false;
+
+  async function push(delta) {
+    if (typeof delta !== 'string' || delta.length === 0) return;
+    if (flushed) {
+      await onFlush(delta);
+      return;
+    }
+    buf += delta;
+    const looksLikeSentinel = SILENT_PREFIX_RE.test(buf);
+    if (buf.trim().length >= minChars && !looksLikeSentinel && !isSilentResponse(buf)) {
+      flushed = true;
+      await onFlush(buf);
+    }
+  }
+
+  async function end() {
+    if (flushed) return { silent: false, flushed: true };
+    if (buf.trim().length === 0 || isSilentResponse(buf)) {
+      if (typeof onSilent === 'function') await onSilent(buf);
+      try {
+        console.log(JSON.stringify({
+          event: 'silent_response_gateway',
+          final: true,
+          silent: true,
+          preview: buf.slice(0, 40),
+        }));
+      } catch { /* noop */ }
+      return { silent: true, flushed: false };
+    }
+    flushed = true;
+    await onFlush(buf);
+    return { silent: false, flushed: true };
+  }
+
+  return { push, end, get buffered() { return buf; }, get hasFlushed() { return flushed; } };
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,7 +1243,7 @@ async function startConnection() {
           for (const r of results || []) {
             if (r && r.exists && r.lid) {
               ownerLidJids.add(r.lid);
-              if (r.jid) lidToPnJid.set(r.lid, r.jid);
+              if (r.jid) lidMapSet(r.lid, r.jid);
             }
           }
           if (ownerLidJids.size > 0) {
@@ -1072,8 +1279,10 @@ async function startConnection() {
       // Skip status broadcasts
       if (msg.key.remoteJid === 'status@broadcast') continue;
 
-      // Deduplication: skip if we've already processed this message ID
-      if (isDuplicate(msg.key.id)) {
+      // Read-only dedup check: do NOT mark here. Marking happens after the
+      // decrypt-failure branch below so WA's retransmit of a failed-decrypt
+      // msgId can reach the session-recovery path instead of being stranded.
+      if (dedupTracker.wasProcessed(msg.key.id)) {
         console.log(`[gateway] Skipping duplicate message: ${msg.key.id}`);
         continue;
       }
@@ -1086,6 +1295,20 @@ async function startConnection() {
 
       const sender = msg.key.remoteJid || '';
       const innerMsg = msg.message || {};
+
+      // Libsignal decrypt failure surfaces as `msg.message == null`. We
+      // intentionally do NOT mark the id as processed so that WA's
+      // retransmit of the same msgId can reach this branch again after
+      // the session recovers. Marking on first sight would strand the
+      // sender permanently behind a "duplicate message" skip.
+      if (!msg.message && !msg.key.fromMe && sender) {
+        console.warn(`[gateway] Decrypt failed for ${msg.key.id} from ${sender} — leaving unmarked so WA can retransmit`);
+        continue;
+      }
+
+      // Decrypt succeeded. Mark so subsequent retransmits of this msgId
+      // are deduped.
+      dedupTracker.markProcessed(msg.key.id);
 
       // --- FASE 4: Handle reactions ---
       if (innerMsg.reactionMessage) {
@@ -1175,7 +1398,7 @@ async function startConnection() {
       // Cache LID → phone-number JID when we see both on the same message.
       // Side effect lives OUTSIDE resolvePeerId — Plan 01 §Concerns #1.
       if (isLid && senderPnRaw) {
-        lidToPnJid.set(sender, senderPnRaw);
+        lidMapSet(sender, senderPnRaw);
       }
 
       // CS-02: first-seen LID without senderPn AND not in cache — proactively
@@ -1183,7 +1406,14 @@ async function startConnection() {
       // the next message in the burst resolves synchronously.
       // Side effect lives OUTSIDE resolvePeerId — Plan 01 §Concerns #1.
       if (isLid && !senderPnRaw && !lidToPnJid.has(sender)) {
-        await resolveLidProactively(sock, sender, lidToPnJid, 5000);
+        const tag = await resolveLidProactively(sock, sender, lidToPnJid, 5000);
+        // On 'resolved' the function already wrote into the Map; mirror that
+        // into SQLite via the write-through helper. The double-set into the
+        // Map is a no-op (same key, same value).
+        if (tag === 'resolved') {
+          const pn = lidToPnJid.get(sender);
+          if (pn) lidMapSet(sender, pn);
+        }
       }
 
       // Centralized resolution — Phase 4 §A (ID-01).
@@ -1400,9 +1630,32 @@ async function startConnection() {
               .replace(RELAY_RE, '')
               .replace(/\[no reply needed\]/gi, '');
           }
-          // Also scrub the plain `NO_REPLY` sentinel — it leaks mid-stream,
-          // trailing, and glued to emojis. When the whole chunk is a
-          // NO_REPLY (or strips down to empty), skip the edit entirely.
+          // OB-07 hold-back gate: until we have already established a
+          // visible WhatsApp message (streamMsgKey != null), refuse to
+          // flush a chunk that is shorter than the hold-back threshold OR
+          // whose accumulated text still LOOKS like a silent sentinel.
+          // Once committed, subsequent edits are unconditional — the
+          // model has clearly diverged from any sentinel shape.
+          if (SILENT_V2_ENABLED && !streamMsgKey) {
+            const trimmedCum = cleaned.trim();
+            if (
+              trimmedCum.length < SILENT_HOLDBACK_MIN_CHARS ||
+              SILENT_PREFIX_RE.test(trimmedCum) ||
+              isSilentResponse(cleaned)
+            ) {
+              try {
+                console.log(JSON.stringify({
+                  event: 'silent_response_gateway',
+                  final: false,
+                  silent: true,
+                  preview: trimmedCum.slice(0, 40),
+                }));
+              } catch { /* noop */ }
+              return;
+            }
+          }
+          // Final scrub for trailing-sentinel residue (e.g. ".... NO_REPLY"
+          // arriving after the hold-back window has elapsed).
           cleaned = stripNoReply(cleaned);
           cleaned = cleaned.trim();
           if (!cleaned) return;
@@ -2745,6 +2998,10 @@ module.exports = {
   resolveLidProactively,
   checkHeartbeat,
   computeBackoffDelay,
+  isSilentResponse,
+  stripNoReply,
+  createHoldbackAccumulator,
+  SILENT_HOLDBACK_MIN_CHARS,
   getGroupParticipants,
   invalidateGroupRoster,
   groupMetadataCache,
@@ -2753,4 +3010,9 @@ module.exports = {
   echoTracker,
   ECHO_TRACKER_ENABLED,
   EchoTracker,
+  // Phase 4 §B (ID-02) — persisted LID cache (testing + introspection)
+  lidToPnJid,
+  lidMapSet,
+  db,
+  LID_PERSIST_ENABLED,
 };

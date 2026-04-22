@@ -432,7 +432,7 @@ fn reorder_tool_results(messages: &mut Vec<Message>) -> usize {
 
     // Insert in reverse order so indices remain valid
     let mut sorted_insertions: Vec<(usize, Vec<ContentBlock>)> = insertions.into_iter().collect();
-    sorted_insertions.sort_by(|a, b| b.0.cmp(&a.0));
+    sorted_insertions.sort_by_key(|b| std::cmp::Reverse(b.0));
 
     for (orig_assistant_idx, blocks) in sorted_insertions {
         if let Some(&current_idx) = current_assistant_positions.get(&orig_assistant_idx) {
@@ -528,7 +528,7 @@ fn insert_synthetic_results(messages: &mut Vec<Message>) -> usize {
 
     // Insert in reverse order so indices stay valid
     let mut sorted: Vec<(usize, Vec<ContentBlock>)> = grouped.into_iter().collect();
-    sorted.sort_by(|a, b| b.0.cmp(&a.0));
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.0));
 
     for (assistant_idx, blocks) in sorted {
         let insert_pos = assistant_idx + 1;
@@ -810,11 +810,13 @@ fn should_replace_kept_tool_result(
         && candidate_status != ToolExecutionStatus::WaitingApproval
 }
 
-/// Phase 2e: Remove aborted assistant messages.
+/// Phase 2e: Remove empty assistant messages.
 ///
-/// An assistant message with no content blocks (or only empty text blocks)
-/// that is followed by a user message with ToolResults is considered aborted.
-/// This handles cases where the LLM was interrupted mid-tool-use.
+/// An assistant message with no content blocks (or only empty text / unknown
+/// blocks) is always invalid. Providers like Moonshot/Kimi reject the whole
+/// session with HTTP 400 ("assistant message must not be empty") when such a
+/// message survives — including when it sits at the tail of the transcript.
+/// This pass strips them unconditionally regardless of position (fixes #2809).
 fn remove_aborted_assistant_messages(messages: Vec<Message>) -> Vec<Message> {
     let mut result = Vec::with_capacity(messages.len());
 
@@ -972,16 +974,15 @@ pub fn prune_heartbeat_turns(messages: &mut Vec<Message>, keep_recent: usize) {
 
     for (i, msg) in messages.iter().enumerate().take(prune_end) {
         if msg.role == Role::Assistant {
+            // Delegate to the canonical silent-response detector so the
+            // heartbeat prune logic stays in lock-step with the rest of the
+            // runtime (single source of truth — see silent_response.rs).
             let is_no_reply = match &msg.content {
-                MessageContent::Text(text) => {
-                    let t = text.trim();
-                    t == "NO_REPLY" || t == "[no reply needed]"
-                }
+                MessageContent::Text(text) => crate::silent_response::is_silent_response(text),
                 MessageContent::Blocks(blocks) => {
                     blocks.len() == 1
                         && matches!(&blocks[0], ContentBlock::Text { text, .. } if {
-                            let t = text.trim();
-                            t == "NO_REPLY" || t == "[no reply needed]"
+                            crate::silent_response::is_silent_response(text)
                         })
                 }
             };
@@ -1035,7 +1036,7 @@ fn content_to_blocks(content: MessageContent) -> Vec<ContentBlock> {
 // ---------------------------------------------------------------------------
 
 /// Check if a message contains any `ToolUse` blocks.
-fn message_has_tool_use(msg: &Message) -> bool {
+pub fn message_has_tool_use(msg: &Message) -> bool {
     match &msg.content {
         MessageContent::Blocks(blocks) => blocks
             .iter()
@@ -1046,7 +1047,7 @@ fn message_has_tool_use(msg: &Message) -> bool {
 
 /// Check if a message contains only `ToolResult` blocks (i.e. it is a tool-
 /// result delivery, not a fresh user question).
-fn message_is_only_tool_results(msg: &Message) -> bool {
+pub fn message_is_only_tool_results(msg: &Message) -> bool {
     match &msg.content {
         MessageContent::Blocks(blocks) => {
             !blocks.is_empty()
@@ -1500,6 +1501,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_trailing_empty_assistant_removed() {
+        // Regression for #2809: a trailing empty assistant (from an aborted
+        // stream) must be stripped, otherwise providers like Moonshot/Kimi
+        // return HTTP 400 on the next turn.
+        let messages = vec![
+            Message::user("Hi"),
+            Message::assistant("Hello"),
+            Message::user("What's up?"),
+            Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![]),
+                pinned: false,
+            },
+        ];
+
+        let (repaired, stats) = validate_and_repair_with_stats(&messages);
+        assert!(
+            stats.empty_messages_removed > 0,
+            "trailing empty assistant must be stripped"
+        );
+        for msg in &repaired {
+            if msg.role == Role::Assistant {
+                assert!(
+                    !is_empty_or_blank_content(&msg.content),
+                    "no empty assistant messages may survive repair"
+                );
+            }
+        }
+        assert!(
+            matches!(repaired.last().map(|m| &m.role), Some(Role::User)),
+            "trailing message should now be the user turn"
+        );
+    }
+
+    #[test]
+    fn test_lone_empty_assistant_removed() {
+        // Edge case exposed by #2809: even a single-message transcript with
+        // only an empty assistant message should be stripped rather than
+        // passed through as-is.
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![]),
+            pinned: false,
+        }];
+
+        let (repaired, stats) = validate_and_repair_with_stats(&messages);
+        assert_eq!(repaired.len(), 0);
+        assert!(stats.empty_messages_removed > 0);
     }
 
     #[test]

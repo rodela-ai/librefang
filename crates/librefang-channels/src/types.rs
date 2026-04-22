@@ -316,18 +316,27 @@ pub struct SenderContext {
     /// this field still deserialize cleanly.
     #[serde(default)]
     pub group_participants: Vec<ParticipantRef>,
-    /// Bot username for this channel (if applicable).
+    /// When true, the kernel session resolver treats this invocation as
+    /// non-channel for *storage* purposes: messages persist to
+    /// `entry.session_id` instead of `SessionId::for_channel(agent, channel)`.
+    /// `channel` itself is still used for routing cache keys so the assistant
+    /// auto-router stays per-surface (`webui` vs `telegram` etc.).
+    ///
+    /// Set by the dashboard WebSocket handler so the webui chat view shares a
+    /// session with `agent_send` / triggers and so `list_agent_sessions` /
+    /// `switch_agent_session` actually affect what the user sees.
     #[serde(default)]
-    pub bot_username: Option<String>,
-    /// Sender's username/handle for this channel (if applicable).
-    #[serde(default)]
-    pub sender_username: Option<String>,
-    /// Group members (legacy field, prefer group_participants).
-    #[serde(default)]
-    pub group_members: Vec<ParticipantRef>,
-    /// Chat ID for this context (legacy field, prefer chat_id).
-    #[serde(default)]
-    pub chat_id_legacy: Option<String>,
+    pub use_canonical_session: bool,
+    /// Set by the kernel's internal cron runner only — never by external API
+    /// callers. Gates [SILENT] marker processing so a regular user who
+    /// happens to type "[SILENT]" in chat does not accidentally suppress
+    /// their session history.
+    ///
+    /// Intentionally excluded from serialization so external callers cannot
+    /// inject `"is_internal_cron": true` through a JSON payload.
+    #[serde(skip)]
+    pub is_internal_cron: bool,
+
 }
 
 /// Reference to a participant in a group chat.

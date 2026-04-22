@@ -34,10 +34,19 @@ pub struct GeminiDriver {
 impl GeminiDriver {
     /// Create a new Gemini driver.
     pub fn new(api_key: String, base_url: String) -> Self {
+        Self::with_proxy(api_key, base_url, None)
+    }
+
+    /// Create a new Gemini driver with an optional per-provider proxy.
+    pub fn with_proxy(api_key: String, base_url: String, proxy_url: Option<&str>) -> Self {
+        let client = match proxy_url {
+            Some(url) => librefang_http::proxied_client_with_override(url),
+            None => librefang_http::proxied_client(),
+        };
         Self {
             api_key: Zeroizing::new(api_key),
             base_url,
-            client: librefang_http::proxied_client(),
+            client,
         }
     }
 }
@@ -1286,6 +1295,7 @@ mod tests {
             response_format: None,
             timeout_secs: None,
             extra_body: None,
+            agent_id: None,
         };
 
         let tools = convert_tools(&request);
@@ -1308,6 +1318,7 @@ mod tests {
             response_format: None,
             timeout_secs: None,
             extra_body: None,
+            agent_id: None,
         };
 
         let tools = convert_tools(&request);

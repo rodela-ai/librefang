@@ -38,6 +38,7 @@ impl KernelConfig {
             "triggers",
             "approval",
             "approval_policy", // alias for approval
+            "notification",
             "max_cron_jobs",
             "include",
             "exec_policy",
@@ -52,6 +53,7 @@ impl KernelConfig {
             "thinking",
             "budget",
             "provider_urls",
+            "provider_proxy_urls",
             "provider_regions",
             "provider_api_keys",
             "vertex_ai",

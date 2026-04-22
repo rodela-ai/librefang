@@ -79,8 +79,13 @@ pub trait KernelHandle: Send + Sync {
     /// Claim the next available task (optionally filtered by assignee). Returns task JSON or None.
     async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String>;
 
-    /// Mark a task as completed with a result string.
-    async fn task_complete(&self, task_id: &str, result: &str) -> Result<(), String>;
+    /// Mark a task as completed with a result string. `agent_id` identifies the completer.
+    async fn task_complete(
+        &self,
+        agent_id: &str,
+        task_id: &str,
+        result: &str,
+    ) -> Result<(), String>;
 
     /// List tasks, optionally filtered by status.
     async fn task_list(&self, status: Option<&str>) -> Result<Vec<serde_json::Value>, String>;
@@ -173,8 +178,9 @@ pub trait KernelHandle: Send + Sync {
         agent_id: &str,
         tool_name: &str,
         action_summary: &str,
+        session_id: Option<&str>,
     ) -> Result<librefang_types::approval::ApprovalDecision, String> {
-        let _ = (agent_id, tool_name, action_summary);
+        let _ = (agent_id, tool_name, action_summary, session_id);
         Ok(librefang_types::approval::ApprovalDecision::Approved)
     }
 
@@ -185,8 +191,9 @@ pub trait KernelHandle: Send + Sync {
         tool_name: &str,
         action_summary: &str,
         deferred: librefang_types::tool::DeferredToolExecution,
+        session_id: Option<&str>,
     ) -> Result<librefang_types::tool::ToolApprovalSubmission, String> {
-        let _ = (agent_id, tool_name, action_summary, deferred);
+        let _ = (agent_id, tool_name, action_summary, deferred, session_id);
         Err("Approval system not available".to_string())
     }
 
@@ -268,6 +275,7 @@ pub trait KernelHandle: Send + Sync {
 
     /// Send a message to a user on a named channel adapter (e.g., "email", "telegram").
     /// When `thread_id` is provided, the message is sent as a thread reply.
+    /// When `account_id` is provided, routes through the specific configured bot with that ID.
     /// Returns a confirmation string on success.
     async fn send_channel_message(
         &self,
@@ -275,14 +283,16 @@ pub trait KernelHandle: Send + Sync {
         recipient: &str,
         message: &str,
         thread_id: Option<&str>,
+        account_id: Option<&str>,
     ) -> Result<String, String> {
-        let _ = (channel, recipient, message, thread_id);
+        let _ = (channel, recipient, message, thread_id, account_id);
         Err("Channel send not available".to_string())
     }
 
     /// Send media content (image/file) to a user on a named channel adapter.
     /// `media_type` is "image" or "file", `media_url` is the URL, `caption` is optional text.
     /// When `thread_id` is provided, the media is sent as a thread reply.
+    /// When `account_id` is provided, routes through the specific configured bot with that ID.
     #[allow(clippy::too_many_arguments)]
     async fn send_channel_media(
         &self,
@@ -293,9 +303,10 @@ pub trait KernelHandle: Send + Sync {
         caption: Option<&str>,
         filename: Option<&str>,
         thread_id: Option<&str>,
+        account_id: Option<&str>,
     ) -> Result<String, String> {
         let _ = (
-            channel, recipient, media_type, media_url, caption, filename, thread_id,
+            channel, recipient, media_type, media_url, caption, filename, thread_id, account_id,
         );
         Err("Channel media send not available".to_string())
     }
@@ -303,6 +314,8 @@ pub trait KernelHandle: Send + Sync {
     /// Send a local file (raw bytes) to a user on a named channel adapter.
     /// Used by the `channel_send` tool when `file_path` is provided.
     /// When `thread_id` is provided, the file is sent as a thread reply.
+    /// When `account_id` is provided, routes through the specific configured bot with that ID.
+    #[allow(clippy::too_many_arguments)]
     async fn send_channel_file_data(
         &self,
         channel: &str,
@@ -311,8 +324,11 @@ pub trait KernelHandle: Send + Sync {
         filename: &str,
         mime_type: &str,
         thread_id: Option<&str>,
+        account_id: Option<&str>,
     ) -> Result<String, String> {
-        let _ = (channel, recipient, data, filename, mime_type, thread_id);
+        let _ = (
+            channel, recipient, data, filename, mime_type, thread_id, account_id,
+        );
         Err("Channel file data send not available".to_string())
     }
 
@@ -326,6 +342,7 @@ pub trait KernelHandle: Send + Sync {
         is_quiz: bool,
         correct_option_id: Option<u8>,
         explanation: Option<&str>,
+        account_id: Option<&str>,
     ) -> Result<(), String> {
         let _ = (
             channel,
@@ -335,6 +352,7 @@ pub trait KernelHandle: Send + Sync {
             is_quiz,
             correct_option_id,
             explanation,
+            account_id,
         );
         Err("Channel poll send not available".to_string())
     }
@@ -532,4 +550,17 @@ pub trait KernelHandle: Send + Sync {
     ) -> Result<(), String> {
         Ok(())
     }
+
+    /// Run a forked agent turn that collapses to a single text response.
+    async fn run_forked_agent_oneshot(
+        &self,
+        _agent_id: &str,
+        _prompt: &str,
+        _allowed_tools: Option<Vec<String>>,
+    ) -> Result<String, String> {
+        Err("run_forked_agent_oneshot not available in this KernelHandle".to_string())
+    }
+
+    /// Fire an `agent:step` external hook event.
+    fn fire_agent_step(&self, _agent_id: &str, _step: u32) {}
 }

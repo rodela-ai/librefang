@@ -88,6 +88,8 @@ async fn test_http_connect_calls_oauth_provider_load_token() {
         headers: vec![],
         oauth_provider: Some(provider.clone()),
         oauth_config: None,
+        taint_scanning: true,
+        roots: vec![],
     };
 
     let result = McpConnection::connect(config).await;

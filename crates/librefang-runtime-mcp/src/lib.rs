@@ -171,6 +171,29 @@ pub struct McpServerConfig {
     /// Optional OAuth config from config.toml (discovery fallback).
     #[serde(default)]
     pub oauth_config: Option<librefang_types::config::McpOAuthConfig>,
+    /// Enable outbound taint scanning for this MCP server (default: true).
+    ///
+    /// When `false`, the credential/PII heuristic is skipped for arguments
+    /// sent to this server. This is an escape hatch for trusted local servers
+    /// (browser automation, database adapters, …) whose tool results contain
+    /// opaque session handles that would otherwise trip the credential heuristic.
+    ///
+    /// Key-name blocking (`Authorization`, `secret`, …) remains active even
+    /// when this is `false` — only the content-based heuristic is disabled.
+    #[serde(default = "default_taint_scanning")]
+    pub taint_scanning: bool,
+    /// Root directories advertised to this MCP server via the MCP Roots capability.
+    ///
+    /// Each entry is an absolute path (e.g. `/home/user/project`).  librefang
+    /// converts these to `file://` URIs and declares `roots` in the client
+    /// capabilities during the MCP `initialize` handshake. Servers that support
+    /// Roots use this list to scope their file-system operations rather than
+    /// falling back to their own hard-coded allowed-directories list.
+    ///
+    /// This field is populated at runtime by the kernel (home dir + agent
+    /// workspaces dir) and is never serialised to / deserialised from config.
+    #[serde(skip)]
+    pub roots: Vec<String>,
 }
 
 impl std::fmt::Debug for McpServerConfig {
@@ -186,6 +209,8 @@ impl std::fmt::Debug for McpServerConfig {
                 &self.oauth_provider.as_ref().map(|_| "..."),
             )
             .field("oauth_config", &self.oauth_config)
+            .field("taint_scanning", &self.taint_scanning)
+            .field("roots", &self.roots)
             .finish()
     }
 }
@@ -200,12 +225,18 @@ impl Clone for McpServerConfig {
             headers: self.headers.clone(),
             oauth_provider: self.oauth_provider.clone(),
             oauth_config: self.oauth_config.clone(),
+            taint_scanning: self.taint_scanning,
+            roots: self.roots.clone(),
         }
     }
 }
 
 fn default_timeout() -> u64 {
     60
+}
+
+fn default_taint_scanning() -> bool {
+    true
 }
 
 /// Transport type for MCP server connections.
@@ -243,6 +274,83 @@ type DynRmcpClient = rmcp::service::RunningService<
     rmcp::service::RoleClient,
     Box<dyn rmcp::service::DynService<rmcp::service::RoleClient>>,
 >;
+
+/// MCP client handler that declares the `roots` capability and responds to
+/// `roots/list` requests with a pre-configured list of root directories.
+struct RootsClientHandler {
+    client_info: rmcp::model::ClientInfo,
+    roots: Arc<Vec<rmcp::model::Root>>,
+}
+
+impl RootsClientHandler {
+    fn new(roots: Vec<String>) -> Self {
+        let mcp_roots: Vec<rmcp::model::Root> = roots
+            .iter()
+            .map(|path| {
+                // Use the `url` crate to build a well-formed file URI so that
+                // reserved characters (spaces, #, %) are percent-encoded and
+                // the Windows drive-letter triple-slash form is handled
+                // correctly.  Fall back to the raw string if the path is
+                // already a URI or cannot be parsed as a filesystem path.
+                let uri = if path.starts_with("file://") {
+                    path.clone()
+                } else {
+                    url::Url::from_file_path(path)
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|_| {
+                            // Url::from_file_path requires an absolute path;
+                            // for relative or exotic paths fall back gracefully.
+                            let forward = path.replace('\\', "/");
+                            if forward.starts_with('/') {
+                                format!("file://{forward}")
+                            } else {
+                                format!("file:///{forward}")
+                            }
+                        })
+                };
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string());
+                let mut root = rmcp::model::Root::new(uri);
+                if let Some(n) = name {
+                    root = root.with_name(n);
+                }
+                root
+            })
+            .collect();
+
+        let mut capabilities = rmcp::model::ClientCapabilities::default();
+        capabilities.roots = Some(rmcp::model::RootsCapabilities { list_changed: None });
+
+        let client_info = rmcp::model::ClientInfo::new(
+            capabilities,
+            rmcp::model::Implementation::new("librefang", env!("CARGO_PKG_VERSION")),
+        );
+
+        Self {
+            client_info,
+            roots: Arc::new(mcp_roots),
+        }
+    }
+}
+
+impl rmcp::ClientHandler for RootsClientHandler {
+    fn get_info(&self) -> rmcp::model::ClientInfo {
+        self.client_info.clone()
+    }
+
+    fn list_roots(
+        &self,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleClient>,
+    ) -> impl std::future::Future<
+        Output = Result<rmcp::model::ListRootsResult, rmcp::model::ErrorData>,
+    > + Send
+           + '_ {
+        let roots = Arc::clone(&self.roots);
+        async move { Ok(rmcp::model::ListRootsResult::new((*roots).clone())) }
+    }
+}
 
 /// An active connection to an MCP server.
 pub struct McpConnection {
@@ -372,17 +480,27 @@ impl McpConnection {
     pub async fn connect(config: McpServerConfig) -> Result<Self, String> {
         let mut initial_auth_state: Option<crate::mcp_oauth::McpAuthState> = None;
 
+        let roots = config.roots.clone();
         let (inner, discovered_tools) = match &config.transport {
             McpTransport::Stdio { command, args } => {
-                Self::connect_stdio(command, args, &config.env).await?
+                Self::connect_stdio(command, args, &config.env, roots).await?
             }
             McpTransport::Sse { url } => Self::connect_sse(url).await?,
             McpTransport::Http { url } => {
+                // Only advertise local filesystem roots to local servers.
+                // Remote MCP servers (GitHub, Slack, …) don't operate on
+                // the local filesystem and shouldn't receive host paths.
+                let http_roots = if Self::is_local_url(url) {
+                    roots
+                } else {
+                    vec![]
+                };
                 let (inner, tools, auth_state) = Self::connect_streamable_http(
                     url,
                     &config.headers,
                     config.oauth_provider.as_ref(),
                     config.oauth_config.as_ref(),
+                    http_roots,
                 )
                 .await?;
                 initial_auth_state = Some(auth_state);
@@ -393,6 +511,8 @@ impl McpConnection {
                 headers,
                 tools,
             } => {
+                // HttpCompat is a static tool-declaration protocol; it does not
+                // perform an MCP initialize handshake, so roots don't apply.
                 Self::validate_http_compat_config(base_url, headers, tools)?;
                 Self::connect_http_compat(base_url).await?
             }
@@ -422,6 +542,9 @@ impl McpConnection {
                     let declared_tools = tools.clone();
                     conn.register_http_compat_tools(&declared_tools);
                 } else if let McpInner::Sse { .. } = &conn.inner {
+                    // SSE is a unidirectional transport (client-initiated
+                    // requests only). Do NOT declare roots capability — the
+                    // server cannot send a roots/list request back over SSE.
                     conn.sse_initialize().await?;
                     conn.sse_discover_tools().await?;
                 }
@@ -443,6 +566,7 @@ impl McpConnection {
         command: &str,
         args: &[String],
         extra_env: &[String],
+        roots: Vec<String>,
     ) -> Result<(McpInner, Option<Vec<rmcp::model::Tool>>), String> {
         use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
         use rmcp::ServiceExt;
@@ -502,7 +626,9 @@ impl McpConnection {
             command.to_string()
         };
 
-        let args_owned: Vec<String> = args.to_vec();
+        // Expand environment variable references ($VAR, ${VAR}) in args so
+        // templates can use e.g. "$HOME" without wrapping in `sh -c`.
+        let args_owned: Vec<String> = args.iter().map(|a| expand_env_vars(a)).collect();
         let env_owned: Vec<String> = extra_env.to_vec();
 
         let transport = TokioChildProcess::new(
@@ -535,11 +661,18 @@ impl McpConnection {
         )
         .map_err(|e| format!("Failed to spawn MCP server '{resolved_command}': {e}"))?;
 
-        let client = ()
-            .into_dyn()
-            .serve(transport)
-            .await
-            .map_err(|e| format!("MCP handshake failed for '{resolved_command}': {e}"))?;
+        let client = if roots.is_empty() {
+            ().into_dyn()
+                .serve(transport)
+                .await
+                .map_err(|e| format!("MCP handshake failed for '{resolved_command}': {e}"))?
+        } else {
+            RootsClientHandler::new(roots)
+                .into_dyn()
+                .serve(transport)
+                .await
+                .map_err(|e| format!("MCP handshake failed for '{resolved_command}': {e}"))?
+        };
 
         // Discover tools via rmcp (with timeout)
         let timeout = std::time::Duration::from_secs(60);
@@ -583,6 +716,7 @@ impl McpConnection {
         headers: &[String],
         oauth_provider: Option<&std::sync::Arc<dyn crate::mcp_oauth::McpOAuthProvider>>,
         oauth_config: Option<&librefang_types::config::McpOAuthConfig>,
+        roots: Vec<String>,
     ) -> Result<
         (
             McpInner,
@@ -633,7 +767,15 @@ impl McpConnection {
 
         let transport = StreamableHttpClientTransport::from_config(config);
 
-        match ().into_dyn().serve(transport).await {
+        let serve_result = if roots.is_empty() {
+            ().into_dyn().serve(transport).await
+        } else {
+            RootsClientHandler::new(roots)
+                .into_dyn()
+                .serve(transport)
+                .await
+        };
+        match serve_result {
             Ok(client) => {
                 // Discover tools via rmcp (with timeout)
                 let timeout = std::time::Duration::from_secs(60);
@@ -751,6 +893,10 @@ impl McpConnection {
     }
 
     /// Send the MCP `initialize` handshake over SSE transport.
+    ///
+    /// SSE is unidirectional (client → server), so we never declare the
+    /// `roots` capability here — the server has no channel to send
+    /// `roots/list` back to us.
     async fn sse_initialize(&mut self) -> Result<(), String> {
         let params = serde_json::json!({
             "protocolVersion": "2024-11-05",
@@ -919,6 +1065,31 @@ impl McpConnection {
 
     // --- Shared ---
 
+    /// Returns `true` when `url` resolves to the local machine.
+    /// Used to decide whether filesystem roots are meaningful for an HTTP MCP server.
+    ///
+    /// Uses proper host parsing rather than substring matching to avoid false
+    /// positives on attacker-controlled domains like `127.0.0.1.evil.com`.
+    fn is_local_url(url: &str) -> bool {
+        // Delegate to the `url` crate so that all RFC 3986 authority components
+        // (userinfo, host, port) are parsed correctly.  This prevents attacks
+        // like `http://127.0.0.1@attacker.com/` and `http://localhost.evil.com/`
+        // that would fool substring or naive split-based checks.
+        let parsed = match url::Url::parse(url) {
+            Ok(u) => u,
+            Err(_) => return false,
+        };
+        let host = match parsed.host() {
+            Some(h) => h,
+            None => return false,
+        };
+        match host {
+            url::Host::Domain(d) => d.eq_ignore_ascii_case("localhost"),
+            url::Host::Ipv4(addr) => addr.octets()[0] == 127,
+            url::Host::Ipv6(addr) => addr == std::net::Ipv6Addr::LOCALHOST,
+        }
+    }
+
     fn check_ssrf(url: &str, label: &str) -> Result<(), String> {
         let lower = url.to_lowercase();
         if lower.contains("169.254.169.254") || lower.contains("metadata.google") {
@@ -982,11 +1153,13 @@ impl McpConnection {
         // `librefang_types::taint::check_outbound_text_violation` for
         // exactly which patterns trip it) — not a full information-
         // flow tracker. Copy-pasted obfuscation still bypasses it.
-        if let Some(violation) = scan_mcp_arguments_for_taint(arguments) {
-            // `violation` is already a redacted rule description from
-            // the scanner — do NOT concatenate the raw payload or the
-            // offending value into the error surface.
-            return Err(violation);
+        if self.config.taint_scanning {
+            if let Some(violation) = scan_mcp_arguments_for_taint(arguments) {
+                // `violation` is already a redacted rule description from
+                // the scanner — do NOT concatenate the raw payload or the
+                // offending value into the error surface.
+                return Err(violation);
+            }
         }
 
         // Resolve to an owned String immediately so the borrow of self.original_names
@@ -1020,11 +1193,10 @@ impl McpConnection {
                 };
 
                 let mut params = rmcp::model::CallToolRequestParams::new(raw_name.clone());
-                if let Some(obj) = arguments.as_object() {
-                    if !obj.is_empty() {
-                        params.arguments = Some(obj.clone());
-                    }
-                }
+                // Always send an object — MCP spec requires `arguments` to
+                // be an object, and some servers (e.g. filesystem) reject
+                // `undefined`/`null` even for zero-parameter tools.
+                params.arguments = Some(arguments.as_object().cloned().unwrap_or_default());
 
                 let timeout = std::time::Duration::from_secs(self.config.timeout_secs);
                 let result: rmcp::model::CallToolResult =
@@ -1462,6 +1634,57 @@ pub fn normalize_name(name: &str) -> String {
     name.to_lowercase().replace('-', "_")
 }
 
+/// Expand `$VAR` and `${VAR}` references in a string using the process
+/// environment. Unknown variables are left as-is. This allows MCP server
+/// templates to reference `$HOME`, `$USER`, etc. without requiring a shell
+/// wrapper (`sh -c`), which the security check blocks.
+fn expand_env_vars(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '$' {
+            let braced = chars.peek() == Some(&'{');
+            if braced {
+                chars.next(); // consume '{'
+            }
+            let mut var_name = String::new();
+            while let Some(&c) = chars.peek() {
+                if braced {
+                    if c == '}' {
+                        chars.next();
+                        break;
+                    }
+                } else if !c.is_ascii_alphanumeric() && c != '_' {
+                    break;
+                }
+                var_name.push(c);
+                chars.next();
+            }
+            if var_name.is_empty() {
+                result.push('$');
+                if braced {
+                    result.push('{');
+                }
+            } else if let Ok(val) = std::env::var(&var_name) {
+                result.push_str(&val);
+            } else {
+                // Unknown var — keep original text
+                result.push('$');
+                if braced {
+                    result.push('{');
+                }
+                result.push_str(&var_name);
+                if braced {
+                    result.push('}');
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1577,6 +1800,33 @@ mod tests {
             "rate": 1.5,
         });
         assert!(scan_mcp_arguments_for_taint(&args).is_none());
+    }
+
+    #[test]
+    fn test_scan_mcp_arguments_allows_date_prefixed_session_handle() {
+        // Regression for issue #2652: Camofox MCP returns tabIds of the
+        // form `tab-YYYY-MM-DD-<uuid-segments>`. These must pass the
+        // taint scanner so the LLM can pass them to subsequent tool calls.
+        let args = serde_json::json!({
+            "tabId": "tab-2026-04-16-abc123-def456-ghi789",
+        });
+        assert!(
+            scan_mcp_arguments_for_taint(&args).is_none(),
+            "date-prefixed tabId must not be blocked"
+        );
+    }
+
+    #[test]
+    fn test_scan_mcp_arguments_still_blocks_real_token_in_tab_shaped_key() {
+        // A credential-shaped VALUE under a session-like KEY must still be blocked.
+        // Key-name allowlisting must NOT bypass value-content checks.
+        let args = serde_json::json!({
+            "tabId": "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890",
+        });
+        assert!(
+            scan_mcp_arguments_for_taint(&args).is_some(),
+            "real credential under session-like key must still be blocked"
+        );
     }
 
     #[test]
@@ -1729,6 +1979,8 @@ mod tests {
             headers: vec![],
             oauth_provider: None,
             oauth_config: None,
+            taint_scanning: true,
+            roots: vec![],
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -1758,6 +2010,8 @@ mod tests {
             headers: vec![],
             oauth_provider: None,
             oauth_config: None,
+            taint_scanning: true,
+            roots: vec![],
         };
         let json = serde_json::to_string(&sse_config).unwrap();
         let back: McpServerConfig = serde_json::from_str(&json).unwrap();
@@ -1791,6 +2045,8 @@ mod tests {
             headers: vec![],
             oauth_provider: None,
             oauth_config: None,
+            taint_scanning: true,
+            roots: vec![],
         };
         let json = serde_json::to_string(&http_compat_config).unwrap();
         let back: McpServerConfig = serde_json::from_str(&json).unwrap();
@@ -1819,6 +2075,8 @@ mod tests {
             headers: vec!["Authorization: Bearer test-token-456".to_string()],
             oauth_provider: None,
             oauth_config: None,
+            taint_scanning: true,
+            roots: vec![],
         };
         let json = serde_json::to_string(&http_config).unwrap();
         let back: McpServerConfig = serde_json::from_str(&json).unwrap();
@@ -1863,6 +2121,8 @@ mod tests {
                 headers: vec![],
                 oauth_provider: None,
                 oauth_config: None,
+                taint_scanning: true,
+                roots: vec![],
             },
             tools: Vec::new(),
             original_names: HashMap::new(),
@@ -2028,6 +2288,8 @@ mod tests {
             headers: vec![],
             oauth_provider: None,
             oauth_config: None,
+            taint_scanning: true,
+            roots: vec![],
         })
         .await
         .unwrap();
@@ -2064,6 +2326,35 @@ mod tests {
         );
         assert!(McpConnection::check_ssrf("http://metadata.google.internal/v1/", "test").is_err());
         assert!(McpConnection::check_ssrf("https://api.example.com/mcp", "test").is_ok());
+    }
+
+    #[test]
+    fn test_is_local_url() {
+        // Standard loopback addresses
+        assert!(McpConnection::is_local_url("http://127.0.0.1:8080/mcp"));
+        assert!(McpConnection::is_local_url("http://localhost/mcp"));
+        assert!(McpConnection::is_local_url("http://LOCALHOST/mcp"));
+        assert!(McpConnection::is_local_url("http://[::1]:3000/mcp"));
+        // Full 127.0.0.0/8 range
+        assert!(McpConnection::is_local_url("http://127.2.3.4/mcp"));
+        assert!(McpConnection::is_local_url("http://127.255.255.255/mcp"));
+        // Remote hosts
+        assert!(!McpConnection::is_local_url("https://api.github.com/mcp"));
+        assert!(!McpConnection::is_local_url("https://mcp.example.com/mcp"));
+        // Security: domain spoofing — "127." prefix in domain name must not match
+        assert!(!McpConnection::is_local_url(
+            "https://127.0.0.1.evil.com/mcp"
+        ));
+        // Security: userinfo spoofing — "127.0.0.1@attacker.com" must not match
+        assert!(!McpConnection::is_local_url(
+            "http://127.0.0.1@attacker.com/mcp"
+        ));
+        // Security: subdomain of localhost must not match
+        assert!(!McpConnection::is_local_url(
+            "http://localhost.evil.com/mcp"
+        ));
+        // 0.0.0.0 is a listen address, not a loopback target
+        assert!(!McpConnection::is_local_url("http://0.0.0.0:4545/mcp"));
     }
 
     /// `extract_auth_header_from_error` returns `None` for any

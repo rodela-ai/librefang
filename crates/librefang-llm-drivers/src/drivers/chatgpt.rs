@@ -175,6 +175,14 @@ pub struct ChatGptDriver {
 
 impl ChatGptDriver {
     pub fn new(session_token: String, base_url: String) -> Self {
+        Self::with_proxy(session_token, base_url, None)
+    }
+
+    pub fn with_proxy(session_token: String, base_url: String, proxy_url: Option<&str>) -> Self {
+        let client = match proxy_url {
+            Some(url) => librefang_http::proxied_client_with_override(url),
+            None => librefang_http::proxied_client(),
+        };
         Self {
             session_token: Zeroizing::new(session_token),
             base_url: if base_url.is_empty() {
@@ -183,7 +191,7 @@ impl ChatGptDriver {
                 base_url
             },
             token_cache: ChatGptTokenCache::new(),
-            client: librefang_http::proxied_client(),
+            client,
         }
     }
 
@@ -1036,6 +1044,7 @@ mod tests {
             response_format: None,
             timeout_secs: None,
             extra_body: None,
+            agent_id: None,
         };
         let api_req = ChatGptDriver::build_responses_request(&req);
         assert_eq!(api_req.model, "gpt-4o");
@@ -1070,6 +1079,7 @@ mod tests {
             response_format: None,
             timeout_secs: None,
             extra_body: None,
+            agent_id: None,
         };
         let api_req = ChatGptDriver::build_responses_request(&req);
         assert_eq!(api_req.instructions.as_deref(), Some("System prompt."));
@@ -1096,6 +1106,7 @@ mod tests {
             response_format: Some(ResponseFormat::Json),
             timeout_secs: None,
             extra_body: None,
+            agent_id: None,
         };
         let api_req = ChatGptDriver::build_responses_request(&req);
         let instructions = api_req.instructions.expect("instructions");
@@ -1131,6 +1142,7 @@ mod tests {
             }),
             timeout_secs: None,
             extra_body: None,
+            agent_id: None,
         };
         let api_req = ChatGptDriver::build_responses_request(&req);
         let instructions = api_req.instructions.expect("instructions");

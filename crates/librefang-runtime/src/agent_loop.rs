@@ -4,15 +4,19 @@
 //! calling the LLM, executing tool calls, and saving the conversation.
 
 use crate::auth_cooldown::{CooldownVerdict, ProviderCooldown};
+use crate::checkpoint_manager::CheckpointManager;
 use crate::context_budget::{apply_context_guard, truncate_tool_result_dynamic, ContextBudget};
 use crate::context_engine::ContextEngine;
 use crate::context_overflow::{recover_from_overflow, RecoveryStage};
 use crate::embedding::EmbeddingDriver;
 use crate::kernel_handle::KernelHandle;
-use crate::llm_driver::{CompletionRequest, LlmDriver, LlmError, StreamEvent};
+use crate::llm_driver::{
+    CompletionRequest, LlmDriver, LlmError, StreamEvent, PHASE_RESPONSE_COMPLETE,
+};
 use crate::llm_errors;
 use crate::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
 use crate::mcp::McpConnection;
+use crate::tool_budget::{ToolBudgetEnforcer, ToolResultEntry};
 use crate::tool_runner;
 use crate::web_search::WebToolsContext;
 use crate::workspace_sandbox::{ERR_PATH_TRAVERSAL, ERR_SANDBOX_ESCAPE};
@@ -51,6 +55,18 @@ const TOOL_TIMEOUT_SECS: u64 = 600;
 /// Raised from 3 to 5 to allow longer-form generation.
 const MAX_CONTINUATIONS: u32 = 5;
 
+/// Maximum number of concurrent LLM calls across all agents.
+///
+/// Each in-flight LLM call holds the full request + response body in RAM.
+/// On a 256 MB deployment with many hand-agents firing simultaneously this
+/// is the dominant memory spike.  Callers queue (`.await`) rather than
+/// fail when the limit is reached; the existing per-call timeout still fires.
+const MAX_CONCURRENT_LLM_CALLS: usize = 5;
+
+/// Process-global semaphore that caps simultaneous LLM HTTP calls.
+static LLM_CONCURRENCY: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_LLM_CALLS));
+
 /// Maximum message history size before auto-trimming to prevent context overflow.
 /// With tool calls each user turn can consume 4-6 messages, so 40 gives roughly
 /// 7-10 real conversation turns instead of the previous 3-5.
@@ -65,23 +81,28 @@ const MAX_CONSECUTIVE_ALL_FAILED: u32 = 3;
 /// Used by channel_bridge to detect this case without fragile string matching.
 pub const TIMEOUT_PARTIAL_OUTPUT_MARKER: &str = "[partial_output_delivered]";
 
-/// Check if a response is a NO_REPLY. Matches:
-/// - Exact `"NO_REPLY"` (original behaviour)
-/// - Text ending with `NO_REPLY` (model sometimes adds context before it,
-///   either on the same line or on a new line)
-/// - Exact `"[no reply needed]"` — the runtime writes this placeholder back
-///   into the session when the agent chooses silence (see `agent_loop.rs`
-///   silent-turn handling), so the LLM sometimes mimics it on later turns.
-/// - Text ending with `"[no reply needed]"` (same reasoning as above)
-/// - Unbracketed `"no reply needed"` variant the model occasionally emits
+/// Notify the stream consumer that the LLM has finished producing text for
+/// this turn so the UI can unblock input before the agent loop's remaining
+/// post-processing (session persistence, proactive memory extraction) lands
+/// the final `response` event. Fire-and-forget: send failures are ignored
+/// because a disconnected consumer is not fatal to the turn.
+async fn signal_response_complete(tx: &mpsc::Sender<StreamEvent>) {
+    let _ = tx
+        .send(StreamEvent::PhaseChange {
+            phase: PHASE_RESPONSE_COMPLETE.to_string(),
+            detail: None,
+        })
+        .await;
+}
+
+/// Check if a response is a silent-reply sentinel.
+///
+/// Thin delegate to the canonical `silent_response::is_silent_response` —
+/// the single source of truth for `NO_REPLY` / `[no reply needed]` /
+/// `no reply needed` detection (case-insensitive, punctuation- and
+/// emoji-tolerant). See `crates/librefang-runtime/src/silent_response.rs`.
 fn is_no_reply(text: &str) -> bool {
-    let t = text.trim();
-    t == "NO_REPLY"
-        || t.ends_with("NO_REPLY")
-        || t == "[no reply needed]"
-        || t.ends_with("[no reply needed]")
-        || t == "no reply needed"
-        || t.ends_with("no reply needed")
+    crate::silent_response::is_silent_response(text)
 }
 
 /// Returns true if this tool-error content is a "soft" error — one the LLM is
@@ -537,6 +558,7 @@ struct ToolExecutionContext<'a> {
     available_tool_names: &'a [String],
     caller_id_str: &'a str,
     skill_registry: Option<&'a SkillRegistry>,
+    allowed_skills: &'a [String],
     mcp_connections: Option<&'a tokio::sync::Mutex<Vec<McpConnection>>>,
     web_ctx: Option<&'a WebToolsContext>,
     browser_ctx: Option<&'a crate::browser::BrowserManager>,
@@ -548,8 +570,10 @@ struct ToolExecutionContext<'a> {
     docker_config: Option<&'a librefang_types::config::DockerSandboxConfig>,
     hooks: Option<&'a crate::hooks::HookRegistry>,
     process_manager: Option<&'a crate::process_manager::ProcessManager>,
+    process_registry: Option<&'a crate::process_registry::ProcessRegistry>,
     sender_user_id: Option<&'a str>,
     sender_channel: Option<&'a str>,
+    checkpoint_manager: Option<&'a Arc<CheckpointManager>>,
     context_budget: &'a ContextBudget,
     context_engine: Option<&'a dyn ContextEngine>,
     context_window_tokens: usize,
@@ -560,6 +584,13 @@ struct ToolExecutionContext<'a> {
     iteration: u32,
     streaming: bool,
     agent_id_str: &'a str,
+    opts: &'a LoopOptions,
+    /// Per-session interrupt handle propagated into tool execution so that
+    /// long-running tools (shell_exec, agent_send, …) can observe a /stop
+    /// signal without polling a global flag.
+    interrupt: Option<crate::interrupt::SessionInterrupt>,
+    dangerous_command_checker:
+        Option<&'a Arc<tokio::sync::RwLock<crate::dangerous_command::DangerousCommandChecker>>>,
 }
 
 async fn execute_single_tool_call(
@@ -574,8 +605,10 @@ async fn execute_single_tool_call(
             } else {
                 warn!(tool = %tool_call.name, "Circuit breaker triggered");
             }
-            if let Err(e) = ctx.memory.save_session_async(ctx.session).await {
-                warn!("Failed to save session on circuit break: {e}");
+            if !ctx.opts.is_fork {
+                if let Err(e) = ctx.memory.save_session_async(ctx.session).await {
+                    warn!("Failed to save session on circuit break: {e}");
+                }
             }
             let hook_ctx = crate::hooks::HookContext {
                 agent_name: &ctx.manifest.name,
@@ -584,6 +617,7 @@ async fn execute_single_tool_call(
                 data: serde_json::json!({
                     "reason": "circuit_break",
                     "error": msg.as_str(),
+                    "is_fork": ctx.opts.is_fork,
                 }),
             };
             fire_hook_best_effort(ctx.hooks, &hook_ctx);
@@ -607,6 +641,38 @@ async fn execute_single_tool_call(
             });
         }
         _ => {}
+    }
+
+    // Fork-mode runtime tool allowlist (from LoopOptions::allowed_tools).
+    // The request schema wasn't filtered — that would break Anthropic prompt
+    // cache alignment — so the model may try any tool in its manifest. We
+    // reject non-allowed calls here with a synthetic error result so the
+    // model can see the rejection and adapt. Defense-in-depth for derivative
+    // calls like auto-dream, which only want `memory_*` but share the full
+    // tool prefix with the parent turn for cache alignment.
+    if let Some(allow) = ctx.opts.allowed_tools.as_ref() {
+        if !allow.iter().any(|t| t == &tool_call.name) {
+            let msg = format!(
+                "Tool `{}` is not permitted in this fork invocation. Allowed: {}",
+                tool_call.name,
+                allow.join(", ")
+            );
+            warn!(
+                tool = %tool_call.name,
+                is_fork = ctx.opts.is_fork,
+                "Tool call outside fork allowlist — denied"
+            );
+            return Ok(ExecutedToolCall {
+                result: librefang_types::tool::ToolResult {
+                    tool_use_id: tool_call.id.clone(),
+                    content: msg.clone(),
+                    is_error: true,
+                    status: librefang_types::tool::ToolExecutionStatus::Error,
+                    ..Default::default()
+                },
+                final_content: msg,
+            });
+        }
     }
 
     if ctx.streaming {
@@ -669,6 +735,7 @@ async fn execute_single_tool_call(
             Some(ctx.available_tool_names),
             Some(ctx.caller_id_str),
             ctx.skill_registry,
+            Some(ctx.allowed_skills),
             ctx.mcp_connections,
             ctx.web_ctx,
             ctx.browser_ctx,
@@ -684,8 +751,13 @@ async fn execute_single_tool_call(
             ctx.tts_engine,
             ctx.docker_config,
             ctx.process_manager,
+            ctx.process_registry,
             ctx.sender_user_id,
             ctx.sender_channel,
+            ctx.checkpoint_manager,
+            ctx.interrupt.clone(),
+            Some(ctx.session.id.to_string()).as_deref(),
+            ctx.dangerous_command_checker,
         ),
     )
     .await
@@ -845,7 +917,49 @@ fn finalize_tool_use_results(
         return ToolResultOutcomeSummary::default();
     }
 
+    // Compute outcome_summary from the original (pre-budget) content so that
+    // is_soft_error_content checks match the actual tool error text, not the
+    // [Tool output too large ...] replacement that Layer 3 may substitute.
+    // This must happen before Layer 3 mutates the blocks.
     let outcome_summary = ToolResultOutcomeSummary::from_blocks(tool_result_blocks);
+
+    // Layer 3: per-turn aggregate budget enforcement.
+    // Convert ToolResult blocks into ToolResultEntry values, run the enforcer,
+    // then write back any content that was modified (persisted or truncated).
+    {
+        let enforcer = ToolBudgetEnforcer::default();
+        let mut entries: Vec<ToolResultEntry> = tool_result_blocks
+            .iter()
+            .filter_map(|b| {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = b
+                {
+                    Some(ToolResultEntry {
+                        tool_use_id: tool_use_id.clone(),
+                        content: content.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        enforcer.enforce_turn_budget(&mut entries);
+
+        // Write back potentially-modified content using the same index order
+        // (only ToolResult blocks participate; Text guidance blocks are skipped).
+        let mut entry_iter = entries.into_iter();
+        for block in tool_result_blocks.iter_mut() {
+            if let ContentBlock::ToolResult { content, .. } = block {
+                if let Some(entry) = entry_iter.next() {
+                    *content = entry.content;
+                }
+            }
+        }
+    }
     append_tool_result_guidance_blocks(tool_result_blocks);
 
     let tool_results_msg = Message {
@@ -1080,6 +1194,57 @@ pub enum LoopPhase {
 /// Implementations should be non-blocking (fire-and-forget) to avoid slowing the loop.
 pub type PhaseCallback = Arc<dyn Fn(LoopPhase) + Send + Sync>;
 
+/// Options that modify how `run_agent_loop` / `run_agent_loop_streaming`
+/// behave for non-standard invocations.
+///
+/// Passed by reference because callers typically hold one `LoopOptions` per
+/// kernel streaming entry; a clone-per-call would allocate unnecessarily.
+///
+/// `Default::default()` corresponds to a normal user-initiated main turn:
+/// session gets saved, AgentLoopEnd hooks fire with `is_fork: false`, and
+/// there's no extra runtime tool allowlist beyond the manifest's.
+#[derive(Debug, Clone, Default)]
+pub struct LoopOptions {
+    /// When true, this invocation is a *derivative* turn (a "fork") rather
+    /// than a user-initiated main turn. Semantically:
+    ///
+    /// - The working session's new messages are **not** persisted to disk.
+    ///   Derivative calls are ephemeral by design; they must not pollute
+    ///   the agent's canonical conversation history.
+    /// - The `AgentLoopEnd` hook context's `data` payload gets `is_fork:
+    ///   true`, so subscribers that should only react to real turns (like
+    ///   the auto-dream trigger) can filter themselves out and avoid
+    ///   recursion.
+    ///
+    /// Cache alignment: fork turns share the parent's session messages
+    /// as a prefix (caller prepares the session), so the Anthropic
+    /// prompt cache can hit. Setting `is_fork = true` does *not* change
+    /// what gets sent to the provider — only what happens at the
+    /// post-response persistence boundary.
+    pub is_fork: bool,
+    /// Runtime tool allowlist. When `Some`, any `tool_use` the model
+    /// emits that names a tool outside this list is denied at execute
+    /// time (a synthetic error result is returned to the model so it can
+    /// adapt). When `None`, no extra filter beyond the agent manifest's
+    /// built-in `capabilities.tools` is applied.
+    ///
+    /// This is enforced at *execute* time rather than by stripping tools
+    /// from the request schema, so the request body stays byte-identical
+    /// to the parent turn and the Anthropic prompt cache keeps hitting.
+    /// The model may "try" a disallowed tool (wasting a few tokens on
+    /// the `tool_use` block) but cannot actually invoke it — same
+    /// defense-in-depth as libre-code's `createAutoMemCanUseTool`.
+    pub allowed_tools: Option<Vec<String>>,
+    /// Per-session interrupt handle.  When `Some`, long-running tools
+    /// (shell_exec, sub-process tools) poll this flag and abort promptly
+    /// when it is set.  When `None`, no interrupt checking is performed.
+    ///
+    /// The handle is created once per session/turn and cloned into each
+    /// `ToolExecutionContext` so that cancelling the parent session
+    /// interrupts all its in-flight tools without affecting other sessions.
+    pub interrupt: Option<crate::interrupt::SessionInterrupt>,
+}
+
 /// Result of an agent loop execution.
 #[derive(Debug, Default)]
 pub struct AgentLoopResult {
@@ -1121,6 +1286,10 @@ pub struct AgentLoopResult {
     /// own index — which would go stale if the loop trims session history.
     /// Always in range [0, session.messages.len()] after the loop returns.
     pub new_messages_start: usize,
+    /// True when the agent used enough tool calls that skill evolution review
+    /// is recommended. The kernel checks this to trigger background skill
+    /// creation/improvement suggestions. Threshold: 5+ tool calls.
+    pub skill_evolution_suggested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1447,6 +1616,7 @@ struct RecallSetupContext<'a> {
     sender_user_id: Option<&'a str>,
     stable_prefix_mode: bool,
     streaming: bool,
+    opts: &'a LoopOptions,
 }
 
 struct PromptSetup {
@@ -1484,6 +1654,7 @@ struct FinalizeEndTurnContext<'a> {
     messages: &'a [Message],
     sender_user_id: Option<&'a str>,
     streaming: bool,
+    opts: &'a LoopOptions,
 }
 
 struct FinalizeEndTurnResultData {
@@ -1659,7 +1830,13 @@ async fn setup_recalled_memories(ctx: RecallSetupContext<'_>) -> RecallSetup {
         )
     };
 
-    if !ctx.stable_prefix_mode {
+    // Fork turns skip auto_retrieve: (a) it would add memory fragments
+    // to the prompt that the parent turn didn't have, breaking byte-
+    // alignment with the cached prefix and missing the Anthropic cache
+    // entirely; (b) the fork is by definition a short derivative task
+    // (dream / memory extraction) whose context should be exactly the
+    // parent's, not a fresh retrieval.
+    if !ctx.stable_prefix_mode && !ctx.opts.is_fork {
         if let Some(pm_store_arc) = ctx.proactive_memory {
             let user_id = ctx.session.agent_id.0.to_string();
             match pm_store_arc
@@ -1760,6 +1937,15 @@ fn build_prompt_setup(ctx: PromptSetupContext<'_>) -> PromptSetup {
         None
     };
 
+    // Instruct the model to match the user's language for both thinking and
+    // response. Applied unconditionally so it covers models that generate
+    // reasoning traces without an explicit thinking config (e.g. Gemma4,
+    // Qwen3 via Ollama). Models that cannot follow this instruction are
+    // unaffected.
+    system_prompt.push_str(
+        "\n\nIMPORTANT: Always use the same language as the user's message for both your thinking process and your response.",
+    );
+
     PromptSetup {
         system_prompt,
         memory_context_msg,
@@ -1816,6 +2002,174 @@ fn prepare_llm_messages(
     }
 }
 
+/// Check if web search augmentation should be performed for this agent.
+fn should_augment_web_search(manifest: &AgentManifest) -> bool {
+    use librefang_types::agent::WebSearchAugmentationMode;
+    match manifest.web_search_augmentation {
+        WebSearchAugmentationMode::Off => false,
+        WebSearchAugmentationMode::Always => true,
+        WebSearchAugmentationMode::Auto => {
+            // Auto: augment when model catalog says supports_tools == false.
+            // If model is not in catalog (None), assume tools are supported (conservative).
+            let supports = manifest
+                .metadata
+                .get("model_supports_tools")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            !supports
+        }
+    }
+}
+
+/// System prompt for LLM-based search query generation.
+/// Designed to work with small local models (Gemma, Llama, Qwen, etc.).
+const SEARCH_QUERY_GEN_PROMPT: &str = r#"You are a search query generator. Analyze the conversation and generate 1-3 concise, diverse web search queries that would help answer the user's latest message.
+
+Rules:
+- Respond ONLY with a JSON object: {"queries": ["query1", "query2"]}
+- Each query should be concise (3-8 words) and search-engine-friendly
+- Generate queries in the same language as the user's message
+- If the question is purely conversational (greetings, thanks, etc.), return: {"queries": []}
+- Prioritize queries that retrieve factual, up-to-date information
+- Today's date: "#;
+
+/// Use the LLM to generate focused search queries from the conversation history.
+/// Falls back to `None` on any failure (caller uses raw user message instead).
+async fn generate_search_queries(
+    driver: &dyn LlmDriver,
+    manifest: &AgentManifest,
+    session_messages: &[Message],
+    user_message: &str,
+) -> Option<Vec<String>> {
+    // Build a compact conversation summary from the last few messages
+    let recent: Vec<&Message> = session_messages
+        .iter()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    let mut history = String::new();
+    for msg in &recent {
+        let role = match msg.role {
+            Role::System => continue,
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+        };
+        let text = msg.content.text_content();
+        if !text.is_empty() {
+            history.push_str(&format!("{role}: {text}\n"));
+        }
+    }
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let system = format!("{SEARCH_QUERY_GEN_PROMPT}{today}");
+
+    let request = CompletionRequest {
+        model: strip_provider_prefix(&manifest.model.model, &manifest.model.provider),
+        messages: vec![Message::user(format!("{history}\nUser: {user_message}"))],
+        tools: vec![],
+        max_tokens: 200,
+        temperature: 0.0,
+        system: Some(system),
+        thinking: None,
+        prompt_caching: false,
+        response_format: None,
+        timeout_secs: Some(15),
+        extra_body: None,
+        agent_id: None,
+    };
+
+    let response =
+        match tokio::time::timeout(std::time::Duration::from_secs(15), driver.complete(request))
+            .await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                debug!("Search query generation LLM error: {e}");
+                return None;
+            }
+            Err(_) => {
+                debug!("Search query generation timed out");
+                return None;
+            }
+        };
+
+    let text = response.text();
+    // Extract JSON from response — find the outermost { }
+    let start = text.find('{')?;
+    let end = text.rfind('}')? + 1;
+    let json_str = &text[start..end];
+
+    let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let queries: Vec<String> = parsed["queries"]
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if queries.is_empty() {
+        debug!("LLM determined no search needed for this message");
+        // Return empty vec to signal "no search needed" (distinct from None = "generation failed")
+        Some(Vec::new())
+    } else {
+        debug!(
+            count = queries.len(),
+            "Generated search queries: {:?}", queries
+        );
+        Some(queries)
+    }
+}
+
+/// Perform web search augmentation — optionally generate queries via LLM,
+/// search the web, and return formatted results for context injection.
+async fn web_search_augment(
+    manifest: &AgentManifest,
+    user_message: &str,
+    web_ctx: Option<&WebToolsContext>,
+    driver: &dyn LlmDriver,
+    session_messages: &[Message],
+) -> Option<String> {
+    if !should_augment_web_search(manifest) {
+        return None;
+    }
+    let ctx = web_ctx?;
+
+    // Try LLM-based query generation.
+    // Some(vec![...]) = generated queries, Some(vec![]) = no search needed, None = generation failed
+    let queries =
+        match generate_search_queries(driver, manifest, session_messages, user_message).await {
+            Some(q) if q.is_empty() => return None, // LLM says no search needed
+            Some(q) => q,
+            None => vec![user_message.to_string()], // Generation failed, fall back to raw message
+        };
+
+    // Search with each query and collect results
+    let mut all_results = String::new();
+    for query in &queries {
+        match ctx.search.search(query, 3).await {
+            Ok(results) if !results.trim().is_empty() => {
+                all_results.push_str(&results);
+                all_results.push('\n');
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(%query, "Web search augmentation query failed: {e}");
+            }
+        }
+    }
+
+    if all_results.trim().is_empty() {
+        None
+    } else {
+        debug!("Web search augmentation: injecting search results");
+        Some(all_results)
+    }
+}
+
 /// Serialize session messages into a JSON array for auto_memorize.
 fn serialize_session_messages(
     messages: &[librefang_types::message::Message],
@@ -1861,6 +2215,7 @@ fn build_silent_agent_loop_result(
         experiment_context,
         latency_ms: 0,
         new_messages_start,
+        skill_evolution_suggested: false,
     }
 }
 
@@ -1949,27 +2304,45 @@ async fn finalize_successful_end_turn(
         .unwrap_or(10);
     crate::session_repair::prune_heartbeat_turns(&mut ctx.session.messages, keep_recent);
 
-    ctx.memory
-        .save_session_async(ctx.session)
-        .await
-        .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+    // Fork turns are ephemeral — skip the persist so the parent agent's
+    // canonical session history isn't polluted by derivative calls like
+    // auto-dream consolidation. The LLM already ran and we have its
+    // response in memory; we just don't write messages back to disk.
+    if !ctx.opts.is_fork {
+        ctx.memory
+            .save_session_async(ctx.session)
+            .await
+            .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+    }
 
-    let interaction_text = format!(
-        "User asked: {}\nI responded: {}",
-        ctx.user_message, end_turn.final_response
-    );
-    remember_interaction_best_effort(
-        ctx.memory,
-        ctx.embedding_driver,
-        ctx.session.agent_id,
-        &interaction_text,
-        ctx.streaming,
-    )
-    .await;
+    // Post-turn memory writes and context-engine updates are skipped for
+    // fork turns. Three reasons: (1) the fork's conversation is ephemeral
+    // by design — persisting its content to the memory bank would leak
+    // derivative artefacts into long-term memory; (2) `context_engine`
+    // state tracked across real turns (summary chains, token budgets)
+    // shouldn't be advanced by a fork that doesn't count as a real user
+    // interaction; (3) critical — `auto_memorize` below would fire
+    // `run_forked_agent_oneshot` again on the fork's own completion,
+    // recursing into another fork, ad infinitum. Gating here is what
+    // stops that cycle.
+    if !ctx.opts.is_fork {
+        let interaction_text = format!(
+            "User asked: {}\nI responded: {}",
+            ctx.user_message, end_turn.final_response
+        );
+        remember_interaction_best_effort(
+            ctx.memory,
+            ctx.embedding_driver,
+            ctx.session.agent_id,
+            &interaction_text,
+            ctx.streaming,
+        )
+        .await;
 
-    if let Some(engine) = ctx.context_engine {
-        if let Err(e) = engine.after_turn(ctx.session.agent_id, ctx.messages).await {
-            warn!("Context engine after_turn failed: {e}");
+        if let Some(engine) = ctx.context_engine {
+            if let Err(e) = engine.after_turn(ctx.session.agent_id, ctx.messages).await {
+                warn!("Context engine after_turn failed: {e}");
+            }
         }
     }
 
@@ -1981,6 +2354,7 @@ async fn finalize_successful_end_turn(
         agent = %ctx.manifest.name,
         iterations = end_turn.iteration + 1,
         tokens = end_turn.total_usage.total(),
+        is_fork = ctx.opts.is_fork,
         "{}",
         if ctx.streaming {
             "Streaming agent loop completed"
@@ -1989,36 +2363,38 @@ async fn finalize_successful_end_turn(
         }
     );
 
-    if let Some(pm_store) = ctx.proactive_memory {
-        let user_id = ctx.session.agent_id.0.to_string();
-        let new_messages = &ctx.session.messages[end_turn.new_messages_start..];
-        let messages_json = serialize_session_messages(new_messages);
-        match pm_store
-            .auto_memorize(&user_id, &messages_json, ctx.sender_user_id)
-            .await
-        {
-            Ok(result) if result.has_content => {
-                debug!(
-                    memories = result.memories.len(),
-                    relations = result.relations.len(),
-                    "{}",
+    if !ctx.opts.is_fork {
+        if let Some(pm_store) = ctx.proactive_memory {
+            let user_id = ctx.session.agent_id.0.to_string();
+            let new_messages = &ctx.session.messages[end_turn.new_messages_start..];
+            let messages_json = serialize_session_messages(new_messages);
+            match pm_store
+                .auto_memorize(&user_id, &messages_json, ctx.sender_user_id)
+                .await
+            {
+                Ok(result) if result.has_content => {
+                    debug!(
+                        memories = result.memories.len(),
+                        relations = result.relations.len(),
+                        "{}",
+                        if ctx.streaming {
+                            "Proactive memory (streaming): stored {} memories, {} relations"
+                        } else {
+                            "Proactive memory: stored {} memories, {} relations"
+                        }
+                    );
+                    end_turn
+                        .memories_saved
+                        .extend(result.memories.iter().map(|m| m.content.clone()));
+                    end_turn.memory_conflicts.extend(result.conflicts);
+                }
+                Ok(_) => {}
+                Err(e) => {
                     if ctx.streaming {
-                        "Proactive memory (streaming): stored {} memories, {} relations"
+                        warn!("Proactive memory auto_memorize failed (streaming): {e}");
                     } else {
-                        "Proactive memory: stored {} memories, {} relations"
+                        warn!("Proactive memory auto_memorize failed: {e}");
                     }
-                );
-                end_turn
-                    .memories_saved
-                    .extend(result.memories.iter().map(|m| m.content.clone()));
-                end_turn.memory_conflicts.extend(result.conflicts);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                if ctx.streaming {
-                    warn!("Proactive memory auto_memorize failed (streaming): {e}");
-                } else {
-                    warn!("Proactive memory auto_memorize failed: {e}");
                 }
             }
         }
@@ -2031,10 +2407,12 @@ async fn finalize_successful_end_turn(
         data: serde_json::json!({
             "iterations": end_turn.iteration + 1,
             "response_length": end_turn.final_response.len(),
+            "is_fork": ctx.opts.is_fork,
         }),
     };
     fire_hook_best_effort(ctx.hooks, &hook_ctx);
 
+    let tool_call_count = end_turn.decision_traces.len();
     Ok(AgentLoopResult {
         response: end_turn.final_response,
         total_usage: end_turn.total_usage,
@@ -2050,6 +2428,9 @@ async fn finalize_successful_end_turn(
         experiment_context: end_turn.experiment_context,
         latency_ms: 0,
         new_messages_start: end_turn.new_messages_start,
+        // Suggest skill evolution when the agent used 5+ tool calls,
+        // indicating a non-trivial task that might be worth saving as a skill.
+        skill_evolution_suggested: tool_call_count >= 5,
     })
 }
 
@@ -2081,10 +2462,13 @@ pub async fn run_agent_loop(
     hooks: Option<&crate::hooks::HookRegistry>,
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    checkpoint_manager: Option<Arc<CheckpointManager>>,
+    process_registry: Option<&crate::process_registry::ProcessRegistry>,
     user_content_blocks: Option<Vec<ContentBlock>>,
     proactive_memory: Option<Arc<librefang_memory::ProactiveMemoryStore>>,
     context_engine: Option<&dyn ContextEngine>,
     pending_messages: Option<&tokio::sync::Mutex<mpsc::Receiver<AgentLoopSignal>>>,
+    opts: &LoopOptions,
 ) -> LibreFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting agent loop");
 
@@ -2146,6 +2530,7 @@ pub async fn run_agent_loop(
         sender_user_id: sender_user_id.as_deref(),
         stable_prefix_mode,
         streaming: false,
+        opts,
     })
     .await;
 
@@ -2199,13 +2584,48 @@ pub async fn run_agent_loop(
         None => user_message.to_string(),
     };
 
+    // Prompt injection guard: scan user message for injection attempts before
+    // it reaches the LLM. Threats are logged and a warning prefix is prepended
+    // to the message — the message itself is never silently dropped so users
+    // are not confused by missing replies.
+    let injection_prefix_storage;
+    let (guarded_user_message, guarded_user_content_blocks) =
+        if let Some(warning) = crate::injection_guard::scan_message(user_message) {
+            warn!(
+                event = "injection_guard",
+                threats = ?warning.threat_ids,
+                summary = %warning.summary,
+                agent = %manifest.name,
+                "Prompt injection indicators detected in user message"
+            );
+            let prefix = crate::injection_guard::warning_prefix(&warning);
+            injection_prefix_storage = format!("{prefix}{user_message}");
+            // For multimodal messages prepend the warning as an extra text block.
+            let prefixed_blocks = user_content_blocks.map(|blocks| {
+                let mut out = blocks;
+                out.insert(
+                    0,
+                    ContentBlock::Text {
+                        text: prefix,
+                        provider_metadata: None,
+                    },
+                );
+                out
+            });
+            (injection_prefix_storage.as_str(), prefixed_blocks)
+        } else {
+            // No injection detected — pass the original message through; the
+            // storage binding is left unused on this branch.
+            (user_message, user_content_blocks)
+        };
+
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
     // use multimodal message format so the LLM receives the image for vision.
     push_filtered_user_message(
         session,
-        user_message,
-        user_content_blocks,
+        guarded_user_message,
+        guarded_user_content_blocks,
         &pii_filter,
         &privacy_config,
         sender_prefix.as_deref(),
@@ -2220,6 +2640,25 @@ pub async fn run_agent_loop(
         &effective_user_message,
         memory_context_msg,
     );
+
+    // Web search augmentation: generate search queries via LLM, search the web,
+    // and inject results into context for models without tool/function calling.
+    if let Some(search_results) = web_search_augment(
+        manifest,
+        user_message,
+        web_ctx,
+        driver.as_ref(),
+        &session.messages,
+    )
+    .await
+    {
+        messages.insert(
+            0,
+            Message::user(format!(
+                "[Web search results — use these to inform your response]\n{search_results}"
+            )),
+        );
+    }
 
     let mut total_usage = TokenUsage::default();
     let final_response;
@@ -2244,17 +2683,129 @@ pub async fn run_agent_loop(
     let mut loop_guard = LoopGuard::new(loop_guard_config);
     let mut consecutive_max_tokens: u32 = 0;
 
+    // Per-session dangerous command checker — shared across all tool executions
+    // in this loop so that session allowlist entries are honored throughout.
+    let session_checker = Arc::new(tokio::sync::RwLock::new(
+        crate::dangerous_command::DangerousCommandChecker::default(),
+    ));
+
     // Build context budget from model's actual context window (or fallback to default)
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
+    // Context compressor — triggers LLM-based summarisation when token usage
+    // exceeds 80% of the context window, before falling back to brute-force trim.
+    let context_compressor = crate::context_compressor::ContextCompressor::with_defaults();
     let mut any_tools_executed = false;
     let mut decision_traces: Vec<DecisionTrace> = Vec::new();
     let mut hallucination_retried = false;
     let mut action_nudge_retried = false;
     let mut consecutive_all_failed: u32 = 0;
+    // Seed with a pre-loop estimate so that should_compress fires on the very
+    // first iteration even for single-turn conversations.  Without this, the
+    // check is always `0 < threshold`, which is always false.
+    let mut last_prompt_tokens: usize = crate::compactor::estimate_token_count(
+        &messages,
+        Some(&system_prompt),
+        Some(available_tools),
+    );
+
+    // Inform the context engine of the active model and context window before
+    // the loop starts so threshold calculations use the correct parameters.
+    if let Some(engine) = context_engine {
+        let initial_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+        engine.update_model(&initial_model, ctx_window);
+    }
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
+
+        // Check for session-scoped interrupt at each iteration boundary.
+        // This allows a /stop signal to abort the loop between LLM calls
+        // without affecting other concurrent sessions.
+        if opts.interrupt.as_ref().is_some_and(|i| i.is_cancelled()) {
+            debug!(iteration, "Agent loop interrupted by session cancel signal");
+            return Ok(AgentLoopResult {
+                silent: true,
+                new_messages_start,
+                ..Default::default()
+            });
+        }
+
+        // Fire agent:step external hook (fire-and-forget).
+        if let Some(ref k) = kernel {
+            k.fire_agent_step(&agent_id_str, iteration);
+        }
+
+        // Pluggable context engine: threshold-gated compaction. When the
+        // engine signals that the current token count has crossed its
+        // compression threshold, run a compaction pass *before* assemble so
+        // the assembled context is already trimmed.
+        //
+        // `last_prompt_tokens` carries the prompt-token count from the
+        // previous LLM call — never a running sum.  This correctly gates
+        // `should_compress` on each turn's own input cost.  On the first
+        // iteration `last_prompt_tokens` is 0, so compaction can only fire
+        // when the model's context window itself (via `ctx_window`) is
+        // below threshold.  `total_usage` (accumulated across iterations) is
+        // never read here, so it remains a clean snapshot for the kernel
+        // budget tracker and is never mutated by the compaction path.
+        if let Some(engine) = context_engine {
+            if engine.should_compress(last_prompt_tokens, ctx_window) {
+                debug!(
+                    iteration,
+                    last_prompt_tokens, ctx_window, "Context engine requested compaction"
+                );
+                // Normalize the model ID before passing to the engine — raw
+                // manifest values may carry a provider prefix (e.g.
+                // "openrouter/google/gemini-2.5-flash") that drivers don't
+                // understand when used as a summarisation model.
+                let compact_model =
+                    strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+                match engine
+                    .compact(
+                        session.agent_id,
+                        &messages,
+                        driver.clone(),
+                        &compact_model,
+                        ctx_window,
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        debug!(
+                            kept = result.kept_messages.len(),
+                            "Context engine compaction complete"
+                        );
+                        // Inject the LLM-generated summary as a synthetic user message
+                        // so the agent retains context about what was compacted.
+                        // Without this, the summary is silently discarded and the agent
+                        // loses all knowledge of earlier turns.
+                        let mut compacted = Vec::with_capacity(result.kept_messages.len() + 1);
+                        if !result.summary.is_empty() {
+                            compacted.push(Message {
+                                role: Role::User,
+                                content: MessageContent::Text(format!(
+                                    "[Context compaction summary] Earlier conversation turns \
+                                     were summarised to preserve context space. Summary of \
+                                     removed messages: {}",
+                                    result.summary
+                                )),
+                                pinned: false,
+                            });
+                        }
+                        compacted.extend(result.kept_messages);
+                        messages = compacted;
+                        // `last_prompt_tokens` is intentionally NOT reset here.
+                        // A second compaction should only fire after the next
+                        // LLM call raises it above threshold again.  Resetting
+                        // to 0 would cause premature re-trigger.
+                    }
+                    Err(e) => {
+                        warn!("Context engine compaction failed (continuing): {e}");
+                    }
+                }
+            }
+        }
 
         // Context assembly — use context engine if available, else inline logic
         if let Some(engine) = context_engine {
@@ -2271,14 +2822,59 @@ pub async fn run_agent_loop(
                 warn!("Context overflow unrecoverable — suggest /reset or /compact");
             }
         } else {
-            // Inline fallback: overflow recovery + context guard
-            let recovery =
-                recover_from_overflow(&mut messages, &system_prompt, available_tools, ctx_window);
-            if recovery == RecoveryStage::FinalError {
-                warn!("Context overflow unrecoverable — suggest /reset or /compact");
-            }
-            if recovery != RecoveryStage::None {
+            // Inline fallback: LLM-based context compression (soft), then
+            // overflow recovery (hard trim), then context guard.
+            let (compressed, compression_events) = context_compressor
+                .compress_if_needed(
+                    messages.clone(),
+                    &system_prompt,
+                    available_tools,
+                    ctx_window,
+                    &manifest.model.model,
+                    driver.clone(),
+                )
+                .await;
+            if !compression_events.is_empty() {
+                messages = compressed;
                 messages = crate::session_repair::validate_and_repair(&messages);
+                // Keep session.messages in sync with the compressed LLM working copy
+                // so subsequent turns don't re-read the uncompressed history.
+                session.messages = messages.clone();
+                // Re-estimate after soft compression; only invoke hard trim if still
+                // above the 70% threshold used by recover_from_overflow.
+                let remaining_tokens = crate::compactor::estimate_token_count(
+                    &messages,
+                    Some(&system_prompt),
+                    Some(available_tools),
+                );
+                let hard_trim_threshold = (ctx_window as f64 * 0.70) as usize;
+                if remaining_tokens > hard_trim_threshold {
+                    let recovery = recover_from_overflow(
+                        &mut messages,
+                        &system_prompt,
+                        available_tools,
+                        ctx_window,
+                    );
+                    if recovery == RecoveryStage::FinalError {
+                        warn!("Context overflow unrecoverable — suggest /reset or /compact");
+                    }
+                    if recovery != RecoveryStage::None {
+                        messages = crate::session_repair::validate_and_repair(&messages);
+                    }
+                }
+            } else {
+                let recovery = recover_from_overflow(
+                    &mut messages,
+                    &system_prompt,
+                    available_tools,
+                    ctx_window,
+                );
+                if recovery == RecoveryStage::FinalError {
+                    warn!("Context overflow unrecoverable — suggest /reset or /compact");
+                }
+                if recovery != RecoveryStage::None {
+                    messages = crate::session_repair::validate_and_repair(&messages);
+                }
             }
             apply_context_guard(&mut messages, &context_budget, available_tools);
         }
@@ -2323,6 +2919,7 @@ pub async fn run_agent_loop(
             } else {
                 Some(manifest.model.extra_params.clone())
             },
+            agent_id: Some(agent_id_str.clone()),
         };
 
         // Notify phase: Thinking
@@ -2341,6 +2938,23 @@ pub async fn run_agent_loop(
         let mut response = call_with_retry(&*driver, request, Some(provider_name), None).await?;
 
         accumulate_token_usage(&mut total_usage, &response.usage);
+
+        // Snapshot prompt tokens for the next iteration's should_compress check.
+        // This is the per-turn input cost, NOT a running sum — we deliberately
+        // do NOT accumulate into last_prompt_tokens.
+        //
+        // Some drivers (gemini_cli, codex_cli) return input_tokens = 0.  Fall
+        // back to a local estimate so should_compress is not permanently
+        // suppressed for those providers.
+        last_prompt_tokens = if response.usage.input_tokens > 0 {
+            response.usage.input_tokens as usize
+        } else {
+            crate::compactor::estimate_token_count(
+                &messages,
+                Some(&system_prompt),
+                Some(available_tools),
+            )
+        };
 
         // Strip image base64 from earlier messages (LLM already processed them)
         strip_processed_image_data(&mut messages);
@@ -2379,14 +2993,28 @@ pub async fn run_agent_loop(
 
                 // NO_REPLY: agent intentionally chose not to reply
                 if is_no_reply(&text) || parsed_directives.silent {
+                    let reason = if parsed_directives.silent {
+                        crate::silent_response::SilentReason::PolicyBlock
+                    } else {
+                        crate::silent_response::SilentReason::NoReply
+                    };
+                    info!(
+                        event = "silent_response_detected",
+                        agent = %manifest.name,
+                        reason = ?reason,
+                        source = "agent_loop.non_streaming",
+                        "Agent chose silent completion"
+                    );
                     debug!(agent = %manifest.name, "Agent chose NO_REPLY/silent — silent completion");
                     session
                         .messages
                         .push(Message::assistant("[no reply needed]".to_string()));
-                    memory
-                        .save_session_async(session)
-                        .await
-                        .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+                    if !opts.is_fork {
+                        memory
+                            .save_session_async(session)
+                            .await
+                            .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+                    }
                     return Ok(build_silent_agent_loop_result(
                         total_usage,
                         iteration + 1,
@@ -2426,7 +3054,10 @@ pub async fn run_agent_loop(
                     }
                     Some(EndTurnRetry::HallucinatedAction) => {
                         hallucination_retried = true;
-                        warn!(
+                        // One-shot corrective retry — expected in mixed-capability
+                        // model fleets and not an error condition. Keep as info
+                        // so operators can still see how often it fires.
+                        info!(
                             agent = %manifest.name,
                             iteration,
                             "Detected hallucinated action — agent claimed action without tool calls, retrying"
@@ -2440,7 +3071,7 @@ pub async fn run_agent_loop(
                     }
                     Some(EndTurnRetry::ActionIntent) => {
                         action_nudge_retried = true;
-                        warn!(
+                        info!(
                             agent = %manifest.name,
                             iteration,
                             "User requested action but LLM responded without tool calls — nudging retry"
@@ -2481,6 +3112,7 @@ pub async fn run_agent_loop(
                         messages: &messages,
                         sender_user_id: sender_user_id.as_deref(),
                         streaming: false,
+                        opts,
                     },
                     FinalizeEndTurnResultData {
                         final_response,
@@ -2524,6 +3156,7 @@ pub async fn run_agent_loop(
                         available_tool_names: &staged.allowed_tool_names,
                         caller_id_str: &staged.caller_id_str,
                         skill_registry,
+                        allowed_skills: &manifest.skills,
                         mcp_connections,
                         web_ctx,
                         browser_ctx,
@@ -2535,8 +3168,10 @@ pub async fn run_agent_loop(
                         docker_config,
                         hooks,
                         process_manager,
+                        process_registry,
                         sender_user_id: sender_user_id.as_deref(),
                         sender_channel: sender_channel.as_deref(),
+                        checkpoint_manager: checkpoint_manager.as_ref(),
                         context_budget: &context_budget,
                         context_engine,
                         context_window_tokens: ctx_window,
@@ -2547,13 +3182,21 @@ pub async fn run_agent_loop(
                         iteration,
                         streaming: false,
                         agent_id_str: agent_id_str.as_str(),
+                        opts,
+                        interrupt: opts.interrupt.clone(),
+                        dangerous_command_checker: Some(&session_checker),
                     };
                     let executed = execute_single_tool_call(&mut tool_exec_ctx, tool_call).await?;
 
+                    // Layer 2: per-result budget — persist oversized outputs to disk.
+                    let budgeted_content = ToolBudgetEnforcer::default().maybe_persist_result(
+                        &executed.final_content,
+                        &executed.result.tool_use_id,
+                    );
                     staged.append_result(ContentBlock::ToolResult {
                         tool_use_id: executed.result.tool_use_id.clone(),
                         tool_name: tool_call.name.clone(),
-                        content: executed.final_content,
+                        content: budgeted_content,
                         is_error: executed.result.is_error,
                         status: executed.result.status,
                         approval_request_id: executed.result.approval_request_id.clone(),
@@ -2618,9 +3261,13 @@ pub async fn run_agent_loop(
                     iteration_outcomes.accumulate(staged.commit(session, &mut messages));
                 }
 
-                // Interim save after tool execution to prevent data loss on crash
-                if let Err(e) = memory.save_session_async(session).await {
-                    warn!("Failed to interim-save session: {e}");
+                // Interim save after tool execution to prevent data loss on crash.
+                // Skipped for fork turns — forks are ephemeral and must not
+                // pollute the canonical session even on mid-turn crashes.
+                if !opts.is_fork {
+                    if let Err(e) = memory.save_session_async(session).await {
+                        warn!("Failed to interim-save session: {e}");
+                    }
                 }
                 // Track consecutive all-failed iterations to cap wasted retries.
                 // (soft errors — approval denials, sandbox rejections, truncation —
@@ -2649,6 +3296,7 @@ pub async fn run_agent_loop(
                             "reason": "tool_failure",
                             "error_count": hard_error_count,
                             "consecutive_all_failed": consecutive_all_failed,
+                            "is_fork": opts.is_fork,
                         }),
                     };
                     fire_hook_best_effort(hooks, &ctx);
@@ -2674,8 +3322,10 @@ pub async fn run_agent_loop(
                         crate::reply_directives::parse_directives(&text);
                     let text = cleaned_text;
                     session.messages.push(Message::assistant(&text));
-                    if let Err(e) = memory.save_session_async(session).await {
-                        warn!("Failed to save session on max continuations: {e}");
+                    if !opts.is_fork {
+                        if let Err(e) = memory.save_session_async(session).await {
+                            warn!("Failed to save session on max continuations: {e}");
+                        }
                     }
                     if pure_text_overflow {
                         warn!(
@@ -2699,6 +3349,7 @@ pub async fn run_agent_loop(
                         data: serde_json::json!({
                             "iterations": iteration + 1,
                             "reason": "max_continuations",
+                            "is_fork": opts.is_fork,
                         }),
                     };
                     fire_hook_best_effort(hooks, &ctx);
@@ -2709,6 +3360,7 @@ pub async fn run_agent_loop(
                         cost_usd: None,
                         silent: false,
                         directives: reply_directives_from_parsed(parsed_directives),
+                        skill_evolution_suggested: decision_traces.len() >= 5,
                         decision_traces,
                         memories_saved,
                         memories_used,
@@ -2730,9 +3382,13 @@ pub async fn run_agent_loop(
         }
     }
 
-    // Save session before failing so conversation history is preserved
-    if let Err(e) = memory.save_session_async(session).await {
-        warn!("Failed to save session on max iterations: {e}");
+    // Save session before failing so conversation history is preserved.
+    // Fork turns skip — they're ephemeral and must not pollute canonical
+    // session history even when the loop bailed out.
+    if !opts.is_fork {
+        if let Err(e) = memory.save_session_async(session).await {
+            warn!("Failed to save session on max iterations: {e}");
+        }
     }
 
     // Fire AgentLoopEnd hook on max iterations exceeded
@@ -2743,6 +3399,7 @@ pub async fn run_agent_loop(
         data: serde_json::json!({
             "reason": "max_iterations_exceeded",
             "iterations": max_iterations,
+            "is_fork": opts.is_fork,
         }),
     };
     fire_hook_best_effort(hooks, &ctx);
@@ -2857,6 +3514,14 @@ async fn call_with_retry(
     let mut last_error = None;
 
     for attempt in 0..=MAX_RETRIES {
+        // Acquire the permit inside the retry loop so it is held only during
+        // the actual HTTP round-trip and released before any backoff sleep.
+        // Holding it across retries would block a slot for the full backoff
+        // duration (up to minutes on rate-limit), starving other agents.
+        let _permit = LLM_CONCURRENCY
+            .acquire()
+            .await
+            .expect("LLM_CONCURRENCY semaphore closed");
         match driver.complete(request.clone()).await {
             Ok(response) => {
                 record_retry_success(provider, cooldown);
@@ -2922,6 +3587,12 @@ async fn stream_with_retry(
     let mut last_error = None;
 
     for attempt in 0..=MAX_RETRIES {
+        // Same rationale as call_with_retry: acquire inside the loop so
+        // the permit is not held during backoff sleeps between retries.
+        let _permit = LLM_CONCURRENCY
+            .acquire()
+            .await
+            .expect("LLM_CONCURRENCY semaphore closed");
         match driver.stream(request.clone(), tx.clone()).await {
             Ok(response) => {
                 record_retry_success(provider, cooldown);
@@ -3019,10 +3690,13 @@ pub async fn run_agent_loop_streaming(
     hooks: Option<&crate::hooks::HookRegistry>,
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    checkpoint_manager: Option<Arc<CheckpointManager>>,
+    process_registry: Option<&crate::process_registry::ProcessRegistry>,
     user_content_blocks: Option<Vec<ContentBlock>>,
     proactive_memory: Option<Arc<librefang_memory::ProactiveMemoryStore>>,
     context_engine: Option<&dyn ContextEngine>,
     pending_messages: Option<&tokio::sync::Mutex<mpsc::Receiver<AgentLoopSignal>>>,
+    opts: &LoopOptions,
 ) -> LibreFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting streaming agent loop");
 
@@ -3083,6 +3757,7 @@ pub async fn run_agent_loop_streaming(
         sender_user_id: sender_user_id.as_deref(),
         stable_prefix_mode,
         streaming: true,
+        opts,
     })
     .await;
 
@@ -3136,13 +3811,48 @@ pub async fn run_agent_loop_streaming(
         None => user_message.to_string(),
     };
 
+    // Prompt injection guard: scan user message for injection attempts before
+    // it reaches the LLM. Threats are logged and a warning prefix is prepended
+    // to the message — the message itself is never silently dropped so users
+    // are not confused by missing replies.
+    let injection_prefix_storage;
+    let (guarded_user_message, guarded_user_content_blocks) =
+        if let Some(warning) = crate::injection_guard::scan_message(user_message) {
+            warn!(
+                event = "injection_guard",
+                threats = ?warning.threat_ids,
+                summary = %warning.summary,
+                agent = %manifest.name,
+                "Prompt injection indicators detected in user message"
+            );
+            let prefix = crate::injection_guard::warning_prefix(&warning);
+            injection_prefix_storage = format!("{prefix}{user_message}");
+            // For multimodal messages prepend the warning as an extra text block.
+            let prefixed_blocks = user_content_blocks.map(|blocks| {
+                let mut out = blocks;
+                out.insert(
+                    0,
+                    ContentBlock::Text {
+                        text: prefix,
+                        provider_metadata: None,
+                    },
+                );
+                out
+            });
+            (injection_prefix_storage.as_str(), prefixed_blocks)
+        } else {
+            // No injection detected — pass the original message through; the
+            // storage binding is left unused on this branch.
+            (user_message, user_content_blocks)
+        };
+
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
     // use multimodal message format so the LLM receives the image for vision.
     push_filtered_user_message(
         session,
-        user_message,
-        user_content_blocks,
+        guarded_user_message,
+        guarded_user_content_blocks,
         &pii_filter,
         &privacy_config,
         sender_prefix.as_deref(),
@@ -3157,6 +3867,25 @@ pub async fn run_agent_loop_streaming(
         &effective_user_message,
         memory_context_msg,
     );
+
+    // Web search augmentation: generate search queries via LLM, search the web,
+    // and inject results into context for models without tool/function calling.
+    if let Some(search_results) = web_search_augment(
+        manifest,
+        user_message,
+        web_ctx,
+        driver.as_ref(),
+        &session.messages,
+    )
+    .await
+    {
+        messages.insert(
+            0,
+            Message::user(format!(
+                "[Web search results — use these to inform your response]\n{search_results}"
+            )),
+        );
+    }
 
     let mut total_usage = TokenUsage::default();
     let final_response;
@@ -3181,17 +3910,115 @@ pub async fn run_agent_loop_streaming(
     let mut loop_guard = LoopGuard::new(loop_guard_config);
     let mut consecutive_max_tokens: u32 = 0;
 
+    // Per-session dangerous command checker — shared across all tool executions
+    // in this loop so that session allowlist entries are honored throughout.
+    let session_checker = Arc::new(tokio::sync::RwLock::new(
+        crate::dangerous_command::DangerousCommandChecker::default(),
+    ));
+
     // Build context budget from model's actual context window (or fallback to default)
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
+    // Context compressor — LLM-based soft compression before hard trim.
+    let context_compressor = crate::context_compressor::ContextCompressor::with_defaults();
     let mut any_tools_executed = false;
     let mut decision_traces: Vec<DecisionTrace> = Vec::new();
     let mut hallucination_retried = false;
     let mut action_nudge_retried = false;
     let mut consecutive_all_failed: u32 = 0;
+    // Seed with a pre-loop estimate so that should_compress fires on the very
+    // first iteration even for single-turn conversations.  Without this, the
+    // check is always `0 < threshold`, which is always false.
+    let mut last_prompt_tokens: usize = crate::compactor::estimate_token_count(
+        &messages,
+        Some(&system_prompt),
+        Some(available_tools),
+    );
+
+    // Inform the context engine of the active model and context window before
+    // the loop starts so threshold calculations use the correct parameters.
+    if let Some(engine) = context_engine {
+        let initial_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+        engine.update_model(&initial_model, ctx_window);
+    }
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
+
+        // Check for session-scoped interrupt at each iteration boundary.
+        if opts.interrupt.as_ref().is_some_and(|i| i.is_cancelled()) {
+            debug!(
+                iteration,
+                "Streaming agent loop interrupted by session cancel signal"
+            );
+            return Ok(AgentLoopResult {
+                silent: true,
+                new_messages_start,
+                ..Default::default()
+            });
+        }
+
+        // Pluggable context engine: threshold-gated compaction (same as the
+        // non-streaming loop). `last_prompt_tokens` carries only the previous
+        // turn's prompt cost — never the cumulative total.  `total_usage`
+        // (accumulated) is never read or written here.
+        if let Some(engine) = context_engine {
+            if engine.should_compress(last_prompt_tokens, ctx_window) {
+                debug!(
+                    iteration,
+                    last_prompt_tokens,
+                    ctx_window,
+                    "Context engine requested compaction (streaming path)"
+                );
+                // Normalize the model ID before passing to the engine — raw
+                // manifest values may carry a provider prefix (e.g.
+                // "openrouter/google/gemini-2.5-flash") that drivers don't
+                // understand when used as a summarisation model.
+                let compact_model =
+                    strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
+                match engine
+                    .compact(
+                        session.agent_id,
+                        &messages,
+                        driver.clone(),
+                        &compact_model,
+                        ctx_window,
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        debug!(
+                            kept = result.kept_messages.len(),
+                            "Context engine compaction complete (streaming)"
+                        );
+                        // Inject the LLM-generated summary as a synthetic user message
+                        // so the agent retains context about what was compacted.
+                        // Without this, the summary is silently discarded and the agent
+                        // loses all knowledge of earlier turns.
+                        let mut compacted = Vec::with_capacity(result.kept_messages.len() + 1);
+                        if !result.summary.is_empty() {
+                            compacted.push(Message {
+                                role: Role::User,
+                                content: MessageContent::Text(format!(
+                                    "[Context compaction summary] Earlier conversation turns \
+                                     were summarised to preserve context space. Summary of \
+                                     removed messages: {}",
+                                    result.summary
+                                )),
+                                pinned: false,
+                            });
+                        }
+                        compacted.extend(result.kept_messages);
+                        messages = compacted;
+                        // `last_prompt_tokens` is NOT reset — see non-streaming
+                        // comment for rationale.
+                    }
+                    Err(e) => {
+                        warn!("Context engine compaction failed (continuing, streaming): {e}");
+                    }
+                }
+            }
+        }
 
         // Context assembly — use context engine if available, else inline logic
         let recovery = if let Some(engine) = context_engine {
@@ -3206,13 +4033,60 @@ pub async fn run_agent_loop_streaming(
                 .await?;
             result.recovery
         } else {
-            let recovery =
-                recover_from_overflow(&mut messages, &system_prompt, available_tools, ctx_window);
-            if recovery != RecoveryStage::None {
+            // LLM-based soft compression first, then hard overflow recovery.
+            let (compressed, compression_events) = context_compressor
+                .compress_if_needed(
+                    messages.clone(),
+                    &system_prompt,
+                    available_tools,
+                    ctx_window,
+                    &manifest.model.model,
+                    driver.clone(),
+                )
+                .await;
+            if !compression_events.is_empty() {
+                messages = compressed;
                 messages = crate::session_repair::validate_and_repair(&messages);
+                // Keep session.messages in sync with the compressed LLM working copy
+                // so subsequent turns don't re-read the uncompressed history.
+                session.messages = messages.clone();
+                // Re-estimate after soft compression; only invoke hard trim if still
+                // above the 70% threshold used by recover_from_overflow.
+                let remaining_tokens = crate::compactor::estimate_token_count(
+                    &messages,
+                    Some(&system_prompt),
+                    Some(available_tools),
+                );
+                let hard_trim_threshold = (ctx_window as f64 * 0.70) as usize;
+                let recovery = if remaining_tokens > hard_trim_threshold {
+                    let r = recover_from_overflow(
+                        &mut messages,
+                        &system_prompt,
+                        available_tools,
+                        ctx_window,
+                    );
+                    if r != RecoveryStage::None {
+                        messages = crate::session_repair::validate_and_repair(&messages);
+                    }
+                    r
+                } else {
+                    RecoveryStage::None
+                };
+                apply_context_guard(&mut messages, &context_budget, available_tools);
+                recovery
+            } else {
+                let recovery = recover_from_overflow(
+                    &mut messages,
+                    &system_prompt,
+                    available_tools,
+                    ctx_window,
+                );
+                if recovery != RecoveryStage::None {
+                    messages = crate::session_repair::validate_and_repair(&messages);
+                }
+                apply_context_guard(&mut messages, &context_budget, available_tools);
+                recovery
             }
-            apply_context_guard(&mut messages, &context_budget, available_tools);
-            recovery
         };
         match &recovery {
             RecoveryStage::None => {}
@@ -3277,6 +4151,7 @@ pub async fn run_agent_loop_streaming(
             } else {
                 Some(manifest.model.extra_params.clone())
             },
+            agent_id: Some(agent_id_str.clone()),
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent
@@ -3328,11 +4203,13 @@ pub async fn run_agent_loop_streaming(
                          Any partial output was already sent to the user.]"
                     );
                     session.messages.push(Message::assistant(note));
-                    if let Err(save_err) = memory.save_session_async(session).await {
-                        warn!(
-                            "Failed to persist timeout note to session: {save_err}. \
-                             The timeout marker will not appear on next session load."
-                        );
+                    if !opts.is_fork {
+                        if let Err(save_err) = memory.save_session_async(session).await {
+                            warn!(
+                                "Failed to persist timeout note to session: {save_err}. \
+                                 The timeout marker will not appear on next session load."
+                            );
+                        }
                     }
                 }
                 return Err(e);
@@ -3340,6 +4217,20 @@ pub async fn run_agent_loop_streaming(
         };
 
         accumulate_token_usage(&mut total_usage, &response.usage);
+
+        // Snapshot prompt tokens for the next iteration's should_compress check.
+        // Some drivers (gemini_cli, codex_cli) return input_tokens = 0.  Fall
+        // back to a local estimate so should_compress is not permanently
+        // suppressed for those providers.
+        last_prompt_tokens = if response.usage.input_tokens > 0 {
+            response.usage.input_tokens as usize
+        } else {
+            crate::compactor::estimate_token_count(
+                &messages,
+                Some(&system_prompt),
+                Some(available_tools),
+            )
+        };
 
         // Strip image base64 from earlier messages (LLM already processed them)
         strip_processed_image_data(&mut messages);
@@ -3376,14 +4267,28 @@ pub async fn run_agent_loop_streaming(
 
                 // NO_REPLY: agent intentionally chose not to reply
                 if is_no_reply(&text) || parsed_directives_s.silent {
+                    let reason = if parsed_directives_s.silent {
+                        crate::silent_response::SilentReason::PolicyBlock
+                    } else {
+                        crate::silent_response::SilentReason::NoReply
+                    };
+                    info!(
+                        event = "silent_response_detected",
+                        agent = %manifest.name,
+                        reason = ?reason,
+                        source = "agent_loop.streaming",
+                        "Agent chose silent completion"
+                    );
                     debug!(agent = %manifest.name, "Agent chose NO_REPLY/silent (streaming) — silent completion");
                     session
                         .messages
                         .push(Message::assistant("[no reply needed]".to_string()));
-                    memory
-                        .save_session_async(session)
-                        .await
-                        .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+                    if !opts.is_fork {
+                        memory
+                            .save_session_async(session)
+                            .await
+                            .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+                    }
                     return Ok(build_silent_agent_loop_result(
                         total_usage,
                         iteration + 1,
@@ -3423,7 +4328,7 @@ pub async fn run_agent_loop_streaming(
                     }
                     Some(EndTurnRetry::HallucinatedAction) => {
                         hallucination_retried = true;
-                        warn!(
+                        info!(
                             agent = %manifest.name,
                             iteration,
                             "Detected hallucinated action (streaming) — agent claimed action without tool calls, retrying"
@@ -3437,7 +4342,7 @@ pub async fn run_agent_loop_streaming(
                     }
                     Some(EndTurnRetry::ActionIntent) => {
                         action_nudge_retried = true;
-                        warn!(
+                        info!(
                             agent = %manifest.name,
                             iteration,
                             "User requested action but LLM responded without tool calls (streaming) — nudging retry"
@@ -3463,6 +4368,8 @@ pub async fn run_agent_loop_streaming(
                 );
                 final_response = text.clone();
 
+                signal_response_complete(&stream_tx).await;
+
                 return finalize_successful_end_turn(
                     FinalizeEndTurnContext {
                         manifest,
@@ -3478,6 +4385,7 @@ pub async fn run_agent_loop_streaming(
                         messages: &messages,
                         sender_user_id: sender_user_id.as_deref(),
                         streaming: true,
+                        opts,
                     },
                     FinalizeEndTurnResultData {
                         final_response,
@@ -3517,6 +4425,7 @@ pub async fn run_agent_loop_streaming(
                         available_tool_names: &staged.allowed_tool_names,
                         caller_id_str: &staged.caller_id_str,
                         skill_registry,
+                        allowed_skills: &manifest.skills,
                         mcp_connections,
                         web_ctx,
                         browser_ctx,
@@ -3528,8 +4437,10 @@ pub async fn run_agent_loop_streaming(
                         docker_config,
                         hooks,
                         process_manager,
+                        process_registry,
                         sender_user_id: sender_user_id.as_deref(),
                         sender_channel: sender_channel.as_deref(),
+                        checkpoint_manager: checkpoint_manager.as_ref(),
                         context_budget: &context_budget,
                         context_engine,
                         context_window_tokens: ctx_window,
@@ -3540,11 +4451,20 @@ pub async fn run_agent_loop_streaming(
                         iteration,
                         streaming: true,
                         agent_id_str: agent_id_str.as_str(),
+                        opts,
+                        interrupt: opts.interrupt.clone(),
+                        dangerous_command_checker: Some(&session_checker),
                     };
                     let executed = execute_single_tool_call(&mut tool_exec_ctx, tool_call).await?;
 
+                    // Layer 2: per-result budget — persist oversized outputs to disk.
+                    let budgeted_content = ToolBudgetEnforcer::default().maybe_persist_result(
+                        &executed.final_content,
+                        &executed.result.tool_use_id,
+                    );
+
                     // Notify client of tool execution result (detect dead consumer)
-                    let preview: String = executed.final_content.chars().take(300).collect();
+                    let preview: String = budgeted_content.chars().take(300).collect();
                     if stream_tx
                         .send(StreamEvent::ToolExecutionResult {
                             name: tool_call.name.clone(),
@@ -3560,7 +4480,7 @@ pub async fn run_agent_loop_streaming(
                     staged.append_result(ContentBlock::ToolResult {
                         tool_use_id: executed.result.tool_use_id.clone(),
                         tool_name: tool_call.name.clone(),
-                        content: executed.final_content,
+                        content: budgeted_content,
                         is_error: executed.result.is_error,
                         status: executed.result.status,
                         approval_request_id: executed.result.approval_request_id.clone(),
@@ -3615,8 +4535,10 @@ pub async fn run_agent_loop_streaming(
                     iteration_outcomes.accumulate(staged.commit(session, &mut messages));
                 }
 
-                if let Err(e) = memory.save_session_async(session).await {
-                    warn!("Failed to interim-save session: {e}");
+                if !opts.is_fork {
+                    if let Err(e) = memory.save_session_async(session).await {
+                        warn!("Failed to interim-save session: {e}");
+                    }
                 }
                 // Track consecutive all-failed iterations to cap wasted retries.
                 // (soft errors — approval denials, sandbox rejections, truncation —
@@ -3645,6 +4567,7 @@ pub async fn run_agent_loop_streaming(
                             "reason": "tool_failure",
                             "error_count": hard_error_count,
                             "consecutive_all_failed": consecutive_all_failed,
+                            "is_fork": opts.is_fork,
                         }),
                     };
                     fire_hook_best_effort(hooks, &ctx);
@@ -3664,8 +4587,10 @@ pub async fn run_agent_loop_streaming(
                         crate::reply_directives::parse_directives(&text);
                     let text = cleaned_text;
                     session.messages.push(Message::assistant(&text));
-                    if let Err(e) = memory.save_session_async(session).await {
-                        warn!("Failed to save session on max continuations: {e}");
+                    if !opts.is_fork {
+                        if let Err(e) = memory.save_session_async(session).await {
+                            warn!("Failed to save session on max continuations: {e}");
+                        }
                     }
                     if pure_text_overflow {
                         warn!(
@@ -3689,9 +4614,11 @@ pub async fn run_agent_loop_streaming(
                         data: serde_json::json!({
                             "iterations": iteration + 1,
                             "reason": "max_continuations",
+                            "is_fork": opts.is_fork,
                         }),
                     };
                     fire_hook_best_effort(hooks, &ctx);
+                    signal_response_complete(&stream_tx).await;
                     return Ok(AgentLoopResult {
                         response: text,
                         total_usage,
@@ -3699,6 +4626,7 @@ pub async fn run_agent_loop_streaming(
                         cost_usd: None,
                         silent: false,
                         directives: reply_directives_from_parsed(parsed_directives),
+                        skill_evolution_suggested: decision_traces.len() >= 5,
                         decision_traces,
                         memories_saved,
                         memories_used,
@@ -3719,8 +4647,10 @@ pub async fn run_agent_loop_streaming(
         }
     }
 
-    if let Err(e) = memory.save_session_async(session).await {
-        warn!("Failed to save session on max iterations: {e}");
+    if !opts.is_fork {
+        if let Err(e) = memory.save_session_async(session).await {
+            warn!("Failed to save session on max iterations: {e}");
+        }
     }
 
     // Fire AgentLoopEnd hook on max iterations exceeded
@@ -3731,6 +4661,7 @@ pub async fn run_agent_loop_streaming(
         data: serde_json::json!({
             "reason": "max_iterations_exceeded",
             "iterations": max_iterations,
+            "is_fork": opts.is_fork,
         }),
     };
     fire_hook_best_effort(hooks, &ctx);
@@ -4501,6 +5432,85 @@ mod tests {
     fn test_retry_constants() {
         assert_eq!(MAX_RETRIES, 3);
         assert_eq!(BASE_RETRY_DELAY_MS, 1000);
+    }
+
+    /// Invariant: when the silent flag is set on an AgentLoopResult, the
+    /// response field MUST be empty. No sentinel string ever escapes the
+    /// runtime as visible text. The shared constructor enforces this.
+    #[test]
+    fn silent_result_has_empty_response() {
+        let result = build_silent_agent_loop_result(
+            TokenUsage::default(),
+            1,
+            crate::reply_directives::DirectiveSet::default(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            0,
+        );
+        assert!(result.silent);
+        assert_eq!(
+            result.response, "",
+            "silent=true must imply response==\"\" (no sentinel leaks as text)"
+        );
+    }
+
+    /// Grep-guard: enforce that `silent_response.rs` is the SOLE owner of
+    /// the literal `NO_REPLY` token in `crates/`. Any new occurrence outside
+    /// the allow-list must be either delegated to the canonical detector or
+    /// (if it is documentation / a prompt-injection sentinel comment) added
+    /// to the allow-list with rationale.
+    ///
+    /// Allow-list rationale:
+    /// - silent_response.rs — canonical detector + tests
+    /// - agent_loop.rs — kept for the heartbeat back-write
+    ///   ("[no reply needed]") and tests
+    /// - session_repair.rs — heartbeat-prune predicate (delegates)
+    /// - reply_directives.rs — back-compat parse-through test
+    /// - prompt_builder.rs — explanatory prompt text (post-rewrite
+    ///   references the token internally)
+    /// - drivers/claude_code.rs — driver-side suppression (delegates)
+    #[test]
+    fn silent_response_single_source_of_truth() {
+        use std::process::Command;
+        let crates_dir = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.parent().map(|q| q.to_path_buf()));
+        let Some(crates_dir) = crates_dir else {
+            eprintln!("skipping grep-guard: cannot locate crates/");
+            return;
+        };
+        let output = Command::new("grep")
+            .args(["-rln", "--include=*.rs", "NO_REPLY"])
+            .arg(&crates_dir)
+            .output();
+        let Ok(output) = output else {
+            eprintln!("skipping grep-guard: grep unavailable");
+            return;
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let allow = [
+            "silent_response.rs",      // canonical detector + tests
+            "agent_loop.rs",           // heartbeat back-write [no reply needed]
+            "session_repair.rs",       // delegates to canonical detector
+            "reply_directives.rs",     // back-compat parse-through test
+            "prompt_builder.rs",       // post-rewrite prompt mentions internal token
+            "claude_code.rs",          // driver-side stream suppression (cycle barrier)
+            "agent.rs",                // librefang-types: doc comment only
+            "channel_bridge.rs",       // librefang-api: doc comment, consumes silent flag
+            "agents.rs",               // librefang-api routes: doc comment only
+            "ws.rs",                   // librefang-api ws: doc comment only
+            "purge_sentinels.rs", // CLI binary that *removes* the literal — delegates to canonical detector
+            "purge_sentinels_test.rs", // fixtures for the CLI
+        ];
+        let offenders: Vec<&str> = stdout
+            .lines()
+            .filter(|line| !allow.iter().any(|a| line.ends_with(a)))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "NO_REPLY literal found outside allow-list — delegate to silent_response::is_silent_response: {offenders:?}"
+        );
     }
 
     // --- Group-chat sender prefix tests (#2262) ---
@@ -5791,10 +6801,13 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
             None, // pending_messages
+            &LoopOptions::default(),
         )
         .await
         .expect("Loop should complete without error");
@@ -5849,10 +6862,13 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
             None, // pending_messages
+            &LoopOptions::default(),
         )
         .await
         .expect("Loop should complete without error");
@@ -5906,10 +6922,13 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
             None, // pending_messages
+            &LoopOptions::default(),
         )
         .await
         .expect("Loop should complete without error");
@@ -5957,10 +6976,13 @@ mod tests {
             None,
             None,
             None,
+            None, // checkpoint_manager
+            None, // process_registry
             None,
             None,
             None,
             None,
+            &LoopOptions::default(),
         )
         .await
         .expect("Loop should complete without error");
@@ -6010,10 +7032,13 @@ mod tests {
             None,
             None,
             None,
+            None, // checkpoint_manager
+            None, // process_registry
             None,
             None,
             None,
             None,
+            &LoopOptions::default(),
         )
         .await
         .expect("Loop should complete without error");
@@ -6064,10 +7089,13 @@ mod tests {
             None,
             None,
             None,
+            None, // checkpoint_manager
+            None, // process_registry
             None,
             None,
             None,
             None,
+            &LoopOptions::default(),
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -6124,10 +7152,13 @@ mod tests {
             None,
             None,
             None,
+            None, // checkpoint_manager
+            None, // process_registry
             None,
             None,
             None,
             None,
+            &LoopOptions::default(),
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -6178,10 +7209,13 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
             None, // pending_messages
+            &LoopOptions::default(),
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -6310,10 +7344,13 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
             None, // pending_messages
+            &LoopOptions::default(),
         )
         .await
         .expect("Loop should recover via retry");
@@ -6361,10 +7398,13 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
             None, // pending_messages
+            &LoopOptions::default(),
         )
         .await
         .expect("Loop should complete with fallback");
@@ -6420,10 +7460,13 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
             None, // pending_messages
+            &LoopOptions::default(),
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -7201,10 +8244,13 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
             None, // pending_messages
+            &LoopOptions::default(),
         )
         .await
         .expect("Agent loop should complete");
@@ -7272,10 +8318,13 @@ mod tests {
             None,
             None,
             None,
+            None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
             None, // pending_messages
+            &LoopOptions::default(),
         )
         .await
         .expect("Normal loop should complete");
@@ -7339,10 +8388,13 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
             None, // pending_messages
+            &LoopOptions::default(),
         )
         .await
         .expect("Streaming loop should complete");
@@ -7636,10 +8688,13 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
             None, // pending_messages
+            &LoopOptions::default(),
         )
         .await
         .expect("Loop should complete after retry");
@@ -7692,10 +8747,13 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
             None, // pending_messages
+            &LoopOptions::default(),
         )
         .await
         .expect_err("Loop must exit with RepeatedToolFailures");
@@ -7749,10 +8807,13 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
             None, // pending_messages
+            &LoopOptions::default(),
         )
         .await
         .expect("Streaming loop should complete after retry");
@@ -7807,10 +8868,13 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // checkpoint_manager
+            None, // process_registry
             None, // user_content_blocks
             None, // proactive_memory
             None, // context_engine
             None, // pending_messages
+            &LoopOptions::default(),
         )
         .await
         .expect_err("Streaming loop must exit with RepeatedToolFailures");
@@ -8207,5 +9271,132 @@ mod tests {
             }
             other => panic!("expected blocks message, got {other:?}"),
         }
+    }
+
+    // ── Web search augmentation tests ───────────────────────────
+
+    #[test]
+    fn test_should_augment_web_search_off() {
+        let manifest = AgentManifest {
+            web_search_augmentation: librefang_types::agent::WebSearchAugmentationMode::Off,
+            ..Default::default()
+        };
+        assert!(!should_augment_web_search(&manifest));
+    }
+
+    #[test]
+    fn test_should_augment_web_search_always() {
+        let manifest = AgentManifest {
+            web_search_augmentation: librefang_types::agent::WebSearchAugmentationMode::Always,
+            ..Default::default()
+        };
+        assert!(should_augment_web_search(&manifest));
+    }
+
+    #[test]
+    fn test_should_augment_web_search_auto_with_tools() {
+        let mut manifest = AgentManifest {
+            web_search_augmentation: librefang_types::agent::WebSearchAugmentationMode::Auto,
+            ..Default::default()
+        };
+        // model_supports_tools = true → don't augment
+        manifest.metadata.insert(
+            "model_supports_tools".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        assert!(!should_augment_web_search(&manifest));
+    }
+
+    #[test]
+    fn test_should_augment_web_search_auto_without_tools() {
+        let mut manifest = AgentManifest {
+            web_search_augmentation: librefang_types::agent::WebSearchAugmentationMode::Auto,
+            ..Default::default()
+        };
+        // model_supports_tools = false → augment
+        manifest.metadata.insert(
+            "model_supports_tools".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        assert!(should_augment_web_search(&manifest));
+    }
+
+    #[test]
+    fn test_should_augment_web_search_auto_no_metadata() {
+        let manifest = AgentManifest {
+            web_search_augmentation: librefang_types::agent::WebSearchAugmentationMode::Auto,
+            ..Default::default()
+        };
+        // No metadata → assume tools supported → don't augment (conservative)
+        assert!(!should_augment_web_search(&manifest));
+    }
+
+    #[test]
+    fn test_search_query_gen_prompt_not_empty() {
+        assert!(!SEARCH_QUERY_GEN_PROMPT.is_empty());
+        assert!(SEARCH_QUERY_GEN_PROMPT.contains("queries"));
+    }
+
+    #[test]
+    fn test_web_search_augmentation_mode_serde_roundtrip() {
+        use librefang_types::agent::WebSearchAugmentationMode;
+
+        for mode in [
+            WebSearchAugmentationMode::Off,
+            WebSearchAugmentationMode::Auto,
+            WebSearchAugmentationMode::Always,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: WebSearchAugmentationMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(mode, back);
+        }
+    }
+
+    #[test]
+    fn test_web_search_augmentation_mode_toml_roundtrip() {
+        #[derive(serde::Deserialize)]
+        struct W {
+            mode: librefang_types::agent::WebSearchAugmentationMode,
+        }
+        for label in ["off", "auto", "always"] {
+            let toml_str = format!("mode = \"{label}\"");
+            let w: W = toml::from_str(&toml_str).unwrap();
+            let json = serde_json::to_string(&w.mode).unwrap();
+            assert_eq!(json, format!("\"{label}\""));
+        }
+    }
+
+    #[test]
+    fn test_manifest_default_web_search_augmentation_is_auto() {
+        let manifest = AgentManifest::default();
+        assert_eq!(
+            manifest.web_search_augmentation,
+            librefang_types::agent::WebSearchAugmentationMode::Auto,
+        );
+    }
+
+    #[test]
+    fn test_manifest_with_web_search_augmentation_toml() {
+        let toml_str = r#"
+            name = "search-bot"
+            web_search_augmentation = "always"
+        "#;
+        let manifest: AgentManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            manifest.web_search_augmentation,
+            librefang_types::agent::WebSearchAugmentationMode::Always,
+        );
+    }
+
+    #[test]
+    fn test_manifest_without_web_search_augmentation_toml() {
+        let toml_str = r#"
+            name = "plain-bot"
+        "#;
+        let manifest: AgentManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            manifest.web_search_augmentation,
+            librefang_types::agent::WebSearchAugmentationMode::Auto,
+        );
     }
 }

@@ -62,6 +62,151 @@ pub enum LlmError {
     },
 }
 
+impl LlmError {
+    /// Classify this error into a [`crate::llm_errors::FailoverReason`] that
+    /// drives provider-switching decisions in `FallbackChain`.
+    ///
+    /// Classification is purely structural (variant + embedded status/message)
+    /// and therefore allocation-free and infallible.
+    pub fn failover_reason(&self) -> crate::llm_errors::FailoverReason {
+        use crate::llm_errors::FailoverReason;
+        match self {
+            // Rate-limited: retry the same provider after a backoff.
+            LlmError::RateLimited { retry_after_ms, .. } => {
+                FailoverReason::RateLimit(if *retry_after_ms > 0 {
+                    Some(*retry_after_ms)
+                } else {
+                    None
+                })
+            }
+
+            // HTTP-level API error: inspect status + message.
+            LlmError::Api { status, message } => {
+                let msg = message.to_lowercase();
+                match status {
+                    429 => FailoverReason::RateLimit(None),
+                    // 401 Unauthorized is always an auth failure.
+                    401 => FailoverReason::AuthError,
+                    // 402 Payment Required is always a billing/credit issue.
+                    402 => FailoverReason::CreditExhausted,
+                    // 403: some providers (e.g. Anthropic) return 403 for rate-limits;
+                    // others use it for billing blocks.  Check rate-limit keywords first.
+                    403 => {
+                        if msg.contains("rate limit")
+                            || msg.contains("rate_limit")
+                            || msg.contains("too many requests")
+                        {
+                            FailoverReason::RateLimit(None)
+                        } else if msg.contains("credit")
+                            || msg.contains("balance")
+                            || msg.contains("billing")
+                            || msg.contains("payment")
+                            || (msg.contains("quota")
+                                && (msg.contains("exceeded") || msg.contains("limit")))
+                        {
+                            FailoverReason::CreditExhausted
+                        } else if msg.contains("model")
+                            || msg.contains("permission")
+                            || msg.contains("not found")
+                            || msg.contains("does not exist")
+                        {
+                            FailoverReason::ModelUnavailable
+                        } else {
+                            FailoverReason::HttpError
+                        }
+                    }
+                    413 => FailoverReason::ContextTooLong,
+                    503 => FailoverReason::ModelUnavailable,
+                    // 404 is only a model error when the message explicitly references
+                    // the model — generic endpoint/base-URL 404s also contain "not found"
+                    // but are not recoverable by switching models.
+                    404 => {
+                        if msg.contains("model not found")
+                            || msg.contains("model does not exist")
+                            || msg.contains("unknown model")
+                            || (msg.contains("model") && msg.contains("not found"))
+                            || (msg.contains("model") && msg.contains("does not exist"))
+                        {
+                            FailoverReason::ModelUnavailable
+                        } else {
+                            FailoverReason::HttpError
+                        }
+                    }
+                    400 => {
+                        // Some providers return context errors as 400.
+                        if msg.contains("context")
+                            || msg.contains("token limit")
+                            || msg.contains("too long")
+                            || msg.contains("context_length")
+                        {
+                            FailoverReason::ContextTooLong
+                        } else {
+                            FailoverReason::HttpError
+                        }
+                    }
+                    _ => {
+                        // Message-level disambiguation for other/unknown status codes.
+                        if msg.contains("rate limit")
+                            || msg.contains("rate_limit")
+                            || msg.contains("too many requests")
+                        {
+                            FailoverReason::RateLimit(None)
+                        } else if msg.contains("credit")
+                            || msg.contains("balance")
+                            || msg.contains("billing")
+                            || msg.contains("insufficient")
+                        {
+                            FailoverReason::CreditExhausted
+                        } else if msg.contains("context")
+                            || msg.contains("token limit")
+                            || msg.contains("context_length")
+                        {
+                            FailoverReason::ContextTooLong
+                        } else if msg.contains("unavailable")
+                            || msg.contains("not found")
+                            || msg.contains("overloaded")
+                        {
+                            FailoverReason::ModelUnavailable
+                        } else {
+                            FailoverReason::HttpError
+                        }
+                    }
+                }
+            }
+
+            // Inactivity / subprocess timeout maps to Timeout.
+            LlmError::TimedOut { .. } => FailoverReason::Timeout,
+
+            // Overloaded — transient capacity error, retry same provider with back-off.
+            LlmError::Overloaded { retry_after_ms } => {
+                FailoverReason::RateLimit(if *retry_after_ms > 0 {
+                    Some(*retry_after_ms)
+                } else {
+                    None
+                })
+            }
+
+            // ModelNotFound → ModelUnavailable (skip to next provider).
+            LlmError::ModelNotFound(_) => FailoverReason::ModelUnavailable,
+
+            // Auth failures and missing keys indicate a misconfigured provider
+            // slot.  Classify as AuthError so FallbackChain can skip to the
+            // next slot, which may have a valid key.
+            LlmError::AuthenticationFailed(_) | LlmError::MissingApiKey(_) => {
+                FailoverReason::AuthError
+            }
+
+            // Parse errors are opaque and not recoverable by switching providers.
+            LlmError::Parse(_) => FailoverReason::Unknown,
+
+            // HTTP transport errors (connection refused, TLS failure, etc.).
+            // Distinct from Timeout (inactivity/subprocess) — these are network
+            // layer failures before the API even responded.
+            LlmError::Http(_) => FailoverReason::HttpError,
+        }
+    }
+}
+
 /// A request to an LLM for completion.
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
@@ -101,6 +246,17 @@ pub struct CompletionRequest {
     /// When keys conflict with standard parameters (temperature, max_tokens, etc.),
     /// values from `extra_body` take precedence (last-wins in JSON serialization).
     pub extra_body: Option<HashMap<String, serde_json::Value>>,
+    /// Caller agent identity.
+    ///
+    /// When a CLI driver re-exposes LibreFang tools to the model through an
+    /// MCP bridge (e.g. `claude-code`'s `--mcp-config`), the bridge has no
+    /// implicit way to know which agent spawned the CLI. This field carries
+    /// the owning agent's ID so the driver can forward it (as an HTTP
+    /// header on the bridge connection) and the bridge can resolve the
+    /// agent's workspace, tool allowlist, and skill allowlist from the
+    /// registry. `None` for out-of-band callers (compaction, routing
+    /// probes, tests) that have no agent identity to propagate.
+    pub agent_id: Option<String>,
 }
 
 /// A response from an LLM completion.
@@ -130,6 +286,12 @@ impl CompletionResponse {
             .join("")
     }
 }
+
+/// Phase name emitted via `StreamEvent::PhaseChange` to signal that the final
+/// LLM text for the turn has been streamed and the agent loop is about to
+/// enter post-processing (session save, proactive memory). Consumers use
+/// this to unblock user input before the full response payload is ready.
+pub const PHASE_RESPONSE_COMPLETE: &str = "response_complete";
 
 /// Events emitted during streaming LLM completion.
 #[derive(Debug, Clone)]
@@ -238,6 +400,10 @@ pub struct DriverConfig {
     /// Not serialized: set only by the kernel when constructing drivers.
     #[serde(skip)]
     pub mcp_bridge: Option<McpBridgeConfig>,
+    /// Per-provider proxy URL override.
+    /// When set, the driver uses this proxy instead of the global proxy config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
 }
 
 /// Configuration for bridging LibreFang tools into a CLI-based driver via MCP.
@@ -266,6 +432,7 @@ impl Default for DriverConfig {
             skip_permissions: default_skip_permissions(),
             message_timeout_secs: default_message_timeout_secs(),
             mcp_bridge: None,
+            proxy_url: None,
         }
     }
 }
@@ -301,6 +468,7 @@ impl std::fmt::Debug for DriverConfig {
             .field("skip_permissions", &self.skip_permissions)
             .field("message_timeout_secs", &self.message_timeout_secs)
             .field("mcp_bridge", &self.mcp_bridge.as_ref().map(|b| &b.base_url))
+            .field("proxy_url", &self.proxy_url.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -410,6 +578,7 @@ mod tests {
             response_format: None,
             timeout_secs: None,
             extra_body: None,
+            agent_id: None,
         };
 
         let response = driver.stream(request, tx).await.unwrap();
@@ -431,3 +600,4 @@ mod tests {
 }
 
 pub mod llm_errors;
+pub use llm_errors::FailoverReason;

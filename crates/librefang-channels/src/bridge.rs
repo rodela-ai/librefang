@@ -195,6 +195,19 @@ pub trait ChannelBridgeHandle: Send + Sync {
         None
     }
 
+    /// Lightweight LLM classification: should the bot reply to this group message?
+    ///
+    /// Returns `true` if the bot should reply, `false` to stay silent.
+    /// Default implementation always returns `true` (fail-open).
+    async fn classify_reply_intent(
+        &self,
+        _message_text: &str,
+        _sender_name: &str,
+        _model: Option<&str>,
+    ) -> bool {
+        true
+    }
+
     /// Record a delivery result for tracking (optional — default no-op).
     ///
     /// `thread_id` preserves Telegram forum-topic context so cron/workflow
@@ -338,6 +351,42 @@ pub trait ChannelBridgeHandle: Send + Sync {
     ) -> Result<mpsc::Receiver<String>, String> {
         let _ = sender;
         self.send_message_streaming(agent_id, message).await
+    }
+
+    /// Streaming send that *also* reports the kernel's terminal success/error
+    /// once the stream completes. Callers that need accurate delivery metrics,
+    /// lifecycle reactions, and error suppression should use this variant —
+    /// the plain `send_message_streaming_with_sender` collapses everything
+    /// into the text channel, which makes it impossible to distinguish a
+    /// successful reply from a sanitized error message after the fact.
+    ///
+    /// The oneshot resolves to `Ok(())` on success and `Err(error_string)` on
+    /// failure (panic, kernel error, or LLM error). It is sent only once the
+    /// kernel join handle has resolved, so awaiting it after draining the
+    /// text receiver is safe.
+    ///
+    /// Default implementation preserves existing behavior by reporting
+    /// fake-success — implementers that can detect kernel failure (e.g. the
+    /// real `LibreFangKernel` impl) should override this to surface real
+    /// status.
+    async fn send_message_streaming_with_sender_status(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        sender: &SenderContext,
+    ) -> Result<
+        (
+            mpsc::Receiver<String>,
+            tokio::sync::oneshot::Receiver<Result<(), String>>,
+        ),
+        String,
+    > {
+        let rx = self
+            .send_message_streaming_with_sender(agent_id, message, sender)
+            .await?;
+        let (status_tx, status_rx) = tokio::sync::oneshot::channel();
+        let _ = status_tx.send(Ok(()));
+        Ok((rx, status_rx))
     }
 
     /// Push a proactive outbound message to a channel recipient.
@@ -1048,7 +1097,7 @@ impl BridgeManager {
                                         ref url, ref caption, ref mime_type
                                     } = message.content {
                                         match download_image_to_blocks(url, caption.as_deref(), mime_type.as_deref()).await {
-                                            blocks if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })) => Some(blocks),
+                                            blocks if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. } | ContentBlock::ImageFile { .. })) => Some(blocks),
                                             _ => None,
                                         }
                                     } else {
@@ -1708,11 +1757,13 @@ fn build_sender_context(
         // sock.groupMetadata). Empty for non-WhatsApp channels — addressee
         // guard then becomes a no-op (BC-01).
         group_participants: extract_group_participants(message),
-        // Additional fields for backward compatibility
-        bot_username: None,
-        sender_username: None,
-        group_members: Vec::new(),
-        chat_id_legacy: None,
+        // Channel bridges land in per-channel sessions (the default); only
+        // the dashboard WS opts into canonical storage.
+        use_canonical_session: false,
+        // Channel-originated traffic is never internal cron — [SILENT] markers
+        // coming from real users must be treated as literal message content.
+        is_internal_cron: false,
+
     }
 }
 
@@ -2068,31 +2119,15 @@ async fn dispatch_message(
             if ov.reply_precheck && matches!(ov.group_policy, GroupPolicy::All) {
                 let text = text_content(message).unwrap_or("");
                 let sender = &message.sender.display_name;
-                let was_mentioned = message
-                    .metadata
-                    .get("was_mentioned")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if let Some(aid) = resolve_or_fallback(message, handle, router).await {
-                    let aliases = handle.get_agent_aliases(aid).await;
-                    let result = handle
-                        .classify_reply_intent(
-                            aid,
-                            text,
-                            sender,
-                            true, // is_group
-                            was_mentioned,
-                            &aliases,
-                        )
-                        .await;
-                    if result == 0 {
-                        debug!(
-                            channel = ct_str,
-                            sender = %sender,
-                            "Reply precheck: NO_REPLY — staying silent"
-                        );
-                        return;
-                    }
+                let model = ov.reply_precheck_model.as_deref();
+                if !handle.classify_reply_intent(text, sender, model).await {
+                    debug!(
+                        channel = ct_str,
+                        sender = %sender,
+                        "Reply precheck declined — staying silent"
+                    );
+                    return;
+
                 }
             }
         } else {
@@ -2236,10 +2271,12 @@ async fn dispatch_message(
     } = message.content
     {
         let blocks = download_image_to_blocks(url, caption.as_deref(), mime_type.as_deref()).await;
-        if blocks
-            .iter()
-            .any(|b| matches!(b, ContentBlock::Image { .. }))
-        {
+        if blocks.iter().any(|b| {
+            matches!(
+                b,
+                ContentBlock::Image { .. } | ContentBlock::ImageFile { .. }
+            )
+        }) {
             // We have actual image data — send as structured blocks for vision
             dispatch_with_blocks(
                 blocks,
@@ -2802,12 +2839,26 @@ async fn dispatch_message(
 
     // Streaming path: if the adapter supports progressive output, pipe text
     // deltas directly to it instead of waiting for the full response.
+    //
+    // We use the `_status` variant of the streaming kernel call so we can
+    // distinguish four outcomes once both `send_streaming` and the kernel
+    // have settled:
+    //   1. send_streaming Ok + kernel Ok  → real success
+    //   2. send_streaming Ok + kernel Err → adapter delivered partial text
+    //      but the agent loop ultimately failed; emit Error reaction and
+    //      record_delivery(false) so metrics reflect reality
+    //   3. send_streaming Err + kernel Ok → adapter HTTP failed mid-stream
+    //      but the agent loop produced a clean response; fall back to
+    //      send_response(buffered_text) and emit Done
+    //   4. send_streaming Err + kernel Err → both failed; honor
+    //      suppress_error_responses when delivering the buffered error
+    //      text via the fallback path
     if adapter.supports_streaming() {
         match handle
-            .send_message_streaming_with_sender(agent_id, &text, &sender_ctx)
+            .send_message_streaming_with_sender_status(agent_id, &text, &sender_ctx)
             .await
         {
-            Ok(mut delta_rx) => {
+            Ok((mut delta_rx, status_rx)) => {
                 send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Streaming)
                     .await;
 
@@ -2838,25 +2889,42 @@ async fn dispatch_message(
                     buffered_text = text;
                 }
 
+                // Status is sent after the text channel fully drains, so
+                // awaiting here will not block longer than the stream itself.
+                let kernel_status = status_rx.await.unwrap_or(Ok(()));
+                let kernel_ok = kernel_status.is_ok();
+                let kernel_err_str = kernel_status.as_ref().err().cloned();
+
                 match &stream_result {
                     Ok(()) => {
-                        send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done)
-                            .await;
+                        // Adapter delivered. Final state depends on whether
+                        // the agent loop itself succeeded.
+                        let phase = if kernel_ok {
+                            AgentPhase::Done
+                        } else {
+                            AgentPhase::Error
+                        };
+                        send_lifecycle_reaction(adapter, &message.sender, msg_id, phase).await;
                         handle
                             .record_delivery(
                                 agent_id,
                                 ct_str,
                                 &message.sender.platform_id,
-                                true,
-                                None,
+                                kernel_ok,
+                                kernel_err_str.as_deref(),
                                 thread_id,
                             )
                             .await;
                         if let Some(j) = journal {
+                            let jstatus = if kernel_ok {
+                                crate::message_journal::JournalStatus::Completed
+                            } else {
+                                crate::message_journal::JournalStatus::Failed
+                            };
                             j.update_status(
                                 &message.platform_message_id,
-                                crate::message_journal::JournalStatus::Completed,
-                                None,
+                                jstatus,
+                                kernel_err_str.clone(),
                             )
                             .await;
                         }
@@ -2864,9 +2932,15 @@ async fn dispatch_message(
                     }
                     Err(e) => {
                         warn!("Streaming send failed, falling back to non-streaming: {e}");
-                        // Fall back: re-send the full accumulated text via the
-                        // non-streaming path so the user still gets a response.
-                        if !buffered_text.is_empty() {
+                        // Fall back: re-send the full accumulated text via
+                        // send_response so the user still gets a response.
+                        // Honor suppress_error_responses when the kernel
+                        // failed — the buffered text will contain a
+                        // sanitized error string we should not leak to
+                        // public-feed adapters.
+                        if !buffered_text.is_empty()
+                            && (kernel_ok || !adapter.suppress_error_responses())
+                        {
                             send_response(
                                 adapter,
                                 &message.sender,
@@ -2875,34 +2949,49 @@ async fn dispatch_message(
                                 output_format,
                             )
                             .await;
-                            send_lifecycle_reaction(
-                                adapter,
-                                &message.sender,
-                                msg_id,
-                                AgentPhase::Done,
-                            )
-                            .await;
+                            let phase = if kernel_ok {
+                                AgentPhase::Done
+                            } else {
+                                AgentPhase::Error
+                            };
+                            send_lifecycle_reaction(adapter, &message.sender, msg_id, phase).await;
+                            // Pair the err field with the success flag — when
+                            // kernel succeeded, the fallback send_response
+                            // delivered the real reply, so the transport-side
+                            // stream error is irrelevant to delivery accounting
+                            // (record_delivery=true with err=Some is a
+                            // contradictory signal). When kernel failed, keep
+                            // the kernel error string so metrics know why.
+                            // (`e`, the stream transport error, was already
+                            // logged via warn! above.)
+                            let err_str = if kernel_ok {
+                                None
+                            } else {
+                                kernel_err_str.clone()
+                            };
                             handle
                                 .record_delivery(
                                     agent_id,
                                     ct_str,
                                     &message.sender.platform_id,
-                                    true,
-                                    None,
+                                    kernel_ok,
+                                    err_str.as_deref(),
                                     thread_id,
                                 )
                                 .await;
                             if let Some(j) = journal {
-                                j.update_status(
-                                    &message.platform_message_id,
-                                    crate::message_journal::JournalStatus::Completed,
-                                    None,
-                                )
-                                .await;
+                                let jstatus = if kernel_ok {
+                                    crate::message_journal::JournalStatus::Completed
+                                } else {
+                                    crate::message_journal::JournalStatus::Failed
+                                };
+                                j.update_status(&message.platform_message_id, jstatus, err_str)
+                                    .await;
                             }
                             return;
                         }
-                        // Buffer was empty — fall through to non-streaming path.
+                        // Buffer was empty OR kernel errored on a
+                        // suppress_error_responses adapter — give up cleanly.
                         send_lifecycle_reaction(
                             adapter,
                             &message.sender,
@@ -2910,13 +2999,14 @@ async fn dispatch_message(
                             AgentPhase::Error,
                         )
                         .await;
+                        let err_str = kernel_err_str.unwrap_or_else(|| e.to_string());
                         handle
                             .record_delivery(
                                 agent_id,
                                 ct_str,
                                 &message.sender.platform_id,
                                 false,
-                                Some(&e.to_string()),
+                                Some(&err_str),
                                 thread_id,
                             )
                             .await;
@@ -2924,7 +3014,7 @@ async fn dispatch_message(
                             j.update_status(
                                 &message.platform_message_id,
                                 crate::message_journal::JournalStatus::Failed,
-                                Some(e.to_string()),
+                                Some(err_str),
                             )
                             .await;
                         }
@@ -2940,7 +3030,76 @@ async fn dispatch_message(
         }
     }
 
-    // Non-streaming path: send to agent and relay response (with sender identity).
+    // Non-streaming-adapter path. We route through the kernel's streaming
+    // API (via `_status` variant) so progress events (tool invocations,
+    // errors) get surfaced into the accumulated text — the channel bridge
+    // injects "🔧 tool_name" and "⚠️ tool failed" lines for streaming
+    // consumers, and we want non-streaming adapters (Discord/Slack/Matrix/...)
+    // to show those too. We accumulate deltas and send once via send_response
+    // so output_format and thread_id are still honored.
+    //
+    // The `_status` variant returns a oneshot that resolves to the kernel's
+    // terminal Result. We use it to drive the correct lifecycle reaction
+    // (Done vs Error), accurate `record_delivery` success metric, journal
+    // status, and to honor `suppress_error_responses` on public-feed adapters
+    // (Mastodon) — accumulated text contains a sanitized error string when
+    // the agent loop fails, which we must not leak to a public timeline.
+    //
+    // If the streaming kernel call is unavailable up-front we fall through
+    // to the non-streaming kernel call — preserves the pre-existing
+    // `handle_send_error` retry / re-resolution path.
+    if let Ok((mut delta_rx, status_rx)) = handle
+        .send_message_streaming_with_sender_status(agent_id, &text, &sender_ctx)
+        .await
+    {
+        let mut accumulated = String::new();
+        while let Some(delta) = delta_rx.recv().await {
+            accumulated.push_str(&delta);
+        }
+        // Status is sent after the text channel fully drains, so awaiting
+        // here will not block longer than the stream itself.
+        let kernel_status = status_rx.await.unwrap_or(Ok(()));
+        let success = kernel_status.is_ok();
+        let phase = if success {
+            AgentPhase::Done
+        } else {
+            AgentPhase::Error
+        };
+        send_lifecycle_reaction(adapter, &message.sender, msg_id, phase).await;
+        if !accumulated.is_empty() && (success || !adapter.suppress_error_responses()) {
+            send_response(
+                adapter,
+                &message.sender,
+                accumulated,
+                thread_id,
+                output_format,
+            )
+            .await;
+        }
+        let err_str = kernel_status.as_ref().err().cloned();
+        handle
+            .record_delivery(
+                agent_id,
+                ct_str,
+                &message.sender.platform_id,
+                success,
+                err_str.as_deref(),
+                thread_id,
+            )
+            .await;
+        if let Some(j) = journal {
+            let jstatus = if success {
+                crate::message_journal::JournalStatus::Completed
+            } else {
+                crate::message_journal::JournalStatus::Failed
+            };
+            j.update_status(&message.platform_message_id, jstatus, err_str)
+                .await;
+        }
+        return;
+    }
+
+    // Fallback: streaming kernel call unavailable for this request.
     match handle
         .send_message_with_sender(agent_id, &text, &sender_ctx)
         .await
@@ -3696,6 +3855,27 @@ mod tests {
     use crate::types::ChannelType;
     use std::sync::Mutex;
 
+    /// Serialize every test in this module that reads OR writes
+    /// `LIBREFANG_GROUP_ADDRESSEE_GUARD`. The nested
+    /// `should_process_group_message_v2` module has its own copy of this
+    /// pattern for its tests; without serialization at this level too,
+    /// `test_mention_only_*` tests that live in the outer module flake
+    /// under parallel execution — they read the env var through
+    /// `addressee_guard_enabled()` while v2 tests concurrently mutate
+    /// it, and occasionally see `guard=on` when they expect the default.
+    pub(super) static ADDRESSEE_GUARD_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire the env lock and clear the guard var for the duration of
+    /// the test so reads return `false` deterministically. Intended for
+    /// tests that assume the default (guard-off) behavior.
+    pub(super) fn with_guard_off_locked<F: FnOnce()>(f: F) {
+        let _g = ADDRESSEE_GUARD_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LIBREFANG_GROUP_ADDRESSEE_GUARD");
+        f();
+    }
+
     #[test]
     fn test_is_command_allowed_default_allows_everything() {
         // No overrides configured — all commands allowed (current behaviour).
@@ -3982,50 +4162,58 @@ mod tests {
 
     #[test]
     fn test_mention_only_allows_regex_trigger_pattern() {
-        let message = group_text_message("hello MyAgent");
-        let overrides = ChannelOverrides {
-            group_trigger_patterns: vec!["(?i)\\bmyagent\\b".to_string()],
-            ..Default::default()
-        };
-        assert!(should_process_group_message(
-            "whatsapp", &overrides, &message
-        ));
+        with_guard_off_locked(|| {
+            let message = group_text_message("hello MyAgent");
+            let overrides = ChannelOverrides {
+                group_trigger_patterns: vec!["(?i)\\bmyagent\\b".to_string()],
+                ..Default::default()
+            };
+            assert!(should_process_group_message(
+                "whatsapp", &overrides, &message
+            ));
+        });
     }
 
     #[test]
     fn test_mention_only_rejects_partial_regex_match() {
-        let message = group_text_message("hello myagenttt");
-        let overrides = ChannelOverrides {
-            group_trigger_patterns: vec!["(?i)\\bmyagent\\b".to_string()],
-            ..Default::default()
-        };
-        assert!(!should_process_group_message(
-            "whatsapp", &overrides, &message
-        ));
+        with_guard_off_locked(|| {
+            let message = group_text_message("hello myagenttt");
+            let overrides = ChannelOverrides {
+                group_trigger_patterns: vec!["(?i)\\bmyagent\\b".to_string()],
+                ..Default::default()
+            };
+            assert!(!should_process_group_message(
+                "whatsapp", &overrides, &message
+            ));
+        });
     }
 
     #[test]
     fn test_mention_only_skips_invalid_regex_patterns() {
-        let message = group_text_message("bot please reply");
-        let overrides = ChannelOverrides {
-            group_trigger_patterns: vec!["(".to_string(), "(?i)\\bbot\\b".to_string()],
-            ..Default::default()
-        };
-        assert!(should_process_group_message(
-            "telegram", &overrides, &message
-        ));
+        with_guard_off_locked(|| {
+            let message = group_text_message("bot please reply");
+            let overrides = ChannelOverrides {
+                group_trigger_patterns: vec!["(".to_string(), "(?i)\\bbot\\b".to_string()],
+                ..Default::default()
+            };
+            assert!(should_process_group_message(
+                "telegram", &overrides, &message
+            ));
+        });
     }
 
     #[test]
     fn test_mention_only_keeps_existing_mention_behavior() {
-        let mut message = group_text_message("hello there");
-        message
-            .metadata
-            .insert("was_mentioned".to_string(), serde_json::Value::Bool(true));
-        let overrides = ChannelOverrides::default();
-        assert!(should_process_group_message(
-            "telegram", &overrides, &message
-        ));
+        with_guard_off_locked(|| {
+            let mut message = group_text_message("hello there");
+            message
+                .metadata
+                .insert("was_mentioned".to_string(), serde_json::Value::Bool(true));
+            let overrides = ChannelOverrides::default();
+            assert!(should_process_group_message(
+                "telegram", &overrides, &message
+            ));
+        });
     }
 
     #[test]
@@ -4885,21 +5073,24 @@ mod tests {
         use super::group_text_message;
         use librefang_types::config::{ChannelOverrides, GroupPolicy};
         use serde_json::json;
-        use std::sync::Mutex;
 
-        // Serialize tests that mutate the LIBREFANG_GROUP_ADDRESSEE_GUARD env
-        // var — env mutation is process-global.
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        // Reuse the outer module's env lock so tests across BOTH modules
+        // serialize their reads/writes of LIBREFANG_GROUP_ADDRESSEE_GUARD.
+        // Two independent Mutexes meant v2 tests could mutate the env var
+        // while outer-module `test_mention_only_*` tests read it via
+        // `addressee_guard_enabled()`, causing flakes under `cargo test`
+        // parallel execution.
+        use super::ADDRESSEE_GUARD_ENV_LOCK as ENV_LOCK;
 
         fn with_guard_on<F: FnOnce()>(f: F) {
-            let _g = ENV_LOCK.lock().unwrap();
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             std::env::set_var("LIBREFANG_GROUP_ADDRESSEE_GUARD", "on");
             f();
             std::env::remove_var("LIBREFANG_GROUP_ADDRESSEE_GUARD");
         }
 
         fn with_guard_off<F: FnOnce()>(f: F) {
-            let _g = ENV_LOCK.lock().unwrap();
+            let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             std::env::remove_var("LIBREFANG_GROUP_ADDRESSEE_GUARD");
             f();
         }
