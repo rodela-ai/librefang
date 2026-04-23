@@ -531,6 +531,28 @@ pub struct BrowserConfig {
     pub max_sessions: usize,
     /// Path to Chromium/Chrome binary. Auto-detected if None.
     pub chromium_path: Option<String>,
+    /// Remote CDP endpoint to attach to instead of spawning a local Chromium.
+    ///
+    /// Accepted formats:
+    /// - `ws://host:port/devtools/browser/<id>` — page-level WebSocket (direct attach)
+    /// - `http://host:port` — HTTP discovery endpoint; librefang calls `GET /json/new`
+    ///   to create a fresh tab and connects to the returned WebSocket URL.
+    ///
+    /// When set, `headless`, `chromium_path`, and local-process discovery are
+    /// ignored. Browser lifecycle (start/stop) is the operator's responsibility.
+    ///
+    /// **Security**: CDP is unauthenticated. Never expose the debugging port on a
+    /// public interface. Use SSH tunnels, WireGuard, or a trusted-network path.
+    #[serde(default)]
+    pub cdp_endpoint: Option<String>,
+    /// Environment variable that holds a bearer token for the CDP endpoint.
+    ///
+    /// Some CDP proxies (e.g. Browserless) require `Authorization: Bearer <token>`
+    /// on the WebSocket upgrade request. Set this to the name of an env var that
+    /// contains the token (e.g. `"LIBREFANG_CDP_TOKEN"`); librefang reads the
+    /// value at connect time and never logs it.
+    #[serde(default)]
+    pub cdp_auth_token_env: Option<String>,
 }
 
 impl Default for BrowserConfig {
@@ -544,6 +566,8 @@ impl Default for BrowserConfig {
             idle_timeout_secs: 300,
             max_sessions: 5,
             chromium_path: None,
+            cdp_endpoint: None,
+            cdp_auth_token_env: None,
         }
     }
 }
@@ -1783,6 +1807,9 @@ pub struct TaskBoardConfig {
     pub claim_ttl_secs: u64,
     /// How often the sweeper scans for stuck tasks. Default: 30 s.
     pub sweep_interval_secs: u64,
+    /// Maximum number of auto-resets before a stuck task is marked `failed`.
+    /// Default: 0 = no limit (retry indefinitely).
+    pub max_retries: u32,
 }
 
 impl Default for TaskBoardConfig {
@@ -1790,6 +1817,7 @@ impl Default for TaskBoardConfig {
         Self {
             claim_ttl_secs: 600,
             sweep_interval_secs: 30,
+            max_retries: 0,
         }
     }
 }
@@ -2078,6 +2106,21 @@ pub struct KernelConfig {
     /// Cron scheduler max total jobs across all agents. Default: 500.
     #[serde(default = "default_max_cron_jobs")]
     pub max_cron_jobs: usize,
+    /// Maximum estimated token count for the cron session before automatic
+    /// pruning. Oldest messages are removed from the front of the session
+    /// until the estimated count falls below this threshold.
+    ///
+    /// `None` (default) disables pruning and preserves existing behaviour.
+    /// Set to e.g. `100000` for a rolling 100k-token window.
+    #[serde(default)]
+    pub cron_session_max_tokens: Option<u64>,
+    /// Maximum number of messages retained in a cron session. When the
+    /// session exceeds this count the oldest messages are pruned before
+    /// each cron fire. Applied in addition to `cron_session_max_tokens`.
+    ///
+    /// `None` (default) disables message-count pruning.
+    #[serde(default)]
+    pub cron_session_max_messages: Option<usize>,
     /// Config include files — loaded and deep-merged before the root config.
     /// Paths are relative to the root config file's directory.
     /// Security: absolute paths and `..` components are rejected.
@@ -2125,6 +2168,16 @@ pub struct KernelConfig {
     /// e.g. `openai = "http://proxy.corp:8080"`, `ollama = ""` (direct)
     #[serde(default)]
     pub provider_proxy_urls: HashMap<String, String>,
+    /// Per-provider HTTP request timeout overrides in seconds (provider ID → seconds).
+    ///
+    /// Overrides the HTTP client's default read timeout for LLM API requests to the
+    /// specified provider. Useful for slower providers or long-context workloads.
+    /// e.g. `ollama = 300`, `anthropic = 120`
+    ///
+    /// Only applies to HTTP API drivers (OpenAI-compatible, Anthropic, Gemini, etc.).
+    /// CLI-based providers (claude-code, qwen-code, etc.) use `message_timeout_secs`.
+    #[serde(default)]
+    pub provider_request_timeout_secs: HashMap<String, u64>,
     /// Provider region selection (provider ID → region name).
     /// Selects a regional endpoint from the provider's `[provider.regions]` map.
     /// e.g. `qwen = "us"` to use the US endpoint instead of China mainland.
@@ -2240,15 +2293,24 @@ pub struct KernelConfig {
     /// API and WebSocket rate limiting configuration.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
-    /// Maximum tokens allowed in a cron session before it's reset.
-    /// When a cron's accumulated session exceeds this limit, the session
-    /// is cleared to prevent token exhaustion. `None` disables the limit.
-    #[serde(default = "default_cron_session_max_tokens")]
-    pub cron_session_max_tokens: Option<usize>,
     /// Timeout for individual tool executions in seconds.
     /// Increase for browser automation or long-running builds.
     #[serde(default = "default_tool_timeout_secs")]
     pub tool_timeout_secs: u64,
+    /// Per-tool timeout overrides. Exact key matches take priority over glob
+    /// patterns; among globs, the longest matching pattern wins (most specific
+    /// first). Falls back to `tool_timeout_secs` when no entry matches.
+    ///
+    /// Example:
+    /// ```toml
+    /// [tool_timeouts]
+    /// agent_send    = 600
+    /// agent_spawn   = 600
+    /// "mcp_browser_*" = 900
+    /// shell_exec    = 300
+    /// ```
+    #[serde(default)]
+    pub tool_timeouts: std::collections::HashMap<String, u64>,
     /// Maximum upload size in bytes (default: 10 MB).
     /// Enterprise deployments may need larger file uploads.
     #[serde(default = "default_max_upload_size_bytes")]
@@ -3182,13 +3244,6 @@ fn default_max_cron_jobs() -> usize {
     500
 }
 
-/// Default maximum tokens in a cron session before reset (100k tokens).
-/// This prevents cron sessions from growing indefinitely and exhausting
-/// the token limit for long-running AgentTurn crons.
-fn default_cron_session_max_tokens() -> Option<usize> {
-    Some(100_000)
-}
-
 /// Default tool execution timeout in seconds (120s).
 fn default_tool_timeout_secs() -> u64 {
     120
@@ -3506,6 +3561,42 @@ fn default_prompt_caching() -> bool {
     true
 }
 
+/// Taint skip rules for a single argument path within a tool.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpTaintPathPolicy {
+    /// Rule IDs to skip when scanning this path.  An empty list means
+    /// all rules apply (no exemption).
+    #[serde(default)]
+    pub skip_rules: Vec<crate::taint::TaintRuleId>,
+}
+
+/// Per-tool taint policy for an MCP server.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpTaintToolPolicy {
+    /// Per-path exemptions.  The key is a minimal JSONPath expression
+    /// (e.g. `$.tabId`, `$.headers.*`, `$.items[*]`).  Paths not
+    /// listed here have all rules applied.
+    #[serde(default)]
+    pub paths: HashMap<String, McpTaintPathPolicy>,
+}
+
+/// Per-server taint policy that lets operators disable specific taint
+/// rules for known-safe fields rather than turning off all scanning.
+///
+/// Example config.toml:
+/// ```toml
+/// [mcp_servers.my_firefox.taint_policy.tools.navigate.paths]
+/// "$.tabId"     = { skip_rules = ["opaque_token"] }
+/// "$.sessionId" = { skip_rules = ["opaque_token"] }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpTaintPolicy {
+    /// Per-tool exemptions.  The key is the tool name as it appears in
+    /// the MCP server's tool list (without the `mcp_<server>_` prefix).
+    #[serde(default)]
+    pub tools: HashMap<String, McpTaintToolPolicy>,
+}
+
 /// Configuration entry for an MCP server.
 ///
 /// This is the config.toml representation. The runtime `McpServerConfig`
@@ -3552,6 +3643,13 @@ pub struct McpServerConfigEntry {
     /// trip the scanner. Key-name blocking remains active regardless.
     #[serde(default = "default_taint_scanning")]
     pub taint_scanning: bool,
+    /// Fine-grained taint exemptions per tool and per argument path.
+    ///
+    /// When `taint_scanning = true` (the default), specific rules can be
+    /// disabled for known-safe fields here rather than disabling all scanning.
+    /// When `taint_scanning = false`, this field is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taint_policy: Option<McpTaintPolicy>,
 }
 
 fn default_taint_scanning() -> bool {
@@ -3798,7 +3896,8 @@ impl Default for KernelConfig {
             approval: crate::approval::ApprovalPolicy::default(),
             notification: crate::approval::NotificationConfig::default(),
             max_cron_jobs: default_max_cron_jobs(),
-            cron_session_max_tokens: default_cron_session_max_tokens(),
+            cron_session_max_tokens: None,
+            cron_session_max_messages: None,
             include: Vec::new(),
             exec_policy: ExecPolicy::default(),
             bindings: Vec::new(),
@@ -3813,6 +3912,7 @@ impl Default for KernelConfig {
             budget: BudgetConfig::default(),
             provider_urls: HashMap::new(),
             provider_proxy_urls: HashMap::new(),
+            provider_request_timeout_secs: HashMap::new(),
             provider_regions: HashMap::new(),
             provider_api_keys: HashMap::new(),
             vertex_ai: VertexAiConfig::default(),
@@ -3847,6 +3947,7 @@ impl Default for KernelConfig {
             update_channel: UpdateChannel::default(),
             rate_limit: RateLimitConfig::default(),
             tool_timeout_secs: default_tool_timeout_secs(),
+            tool_timeouts: std::collections::HashMap::new(),
             max_upload_size_bytes: default_max_upload_size_bytes(),
             max_concurrent_bg_llm: default_max_concurrent_bg_llm(),
             max_agent_call_depth: default_max_agent_call_depth(),
@@ -4333,6 +4434,21 @@ pub struct ChannelsConfig {
     pub wechat: OneOrMany<WeChatConfig>,
     /// WeCom/WeChat Work configuration(s).
     pub wecom: OneOrMany<WeComConfig>,
+
+    // --- Global file-download settings ---
+    /// Maximum file size in bytes for channel file downloads (default: 50 MB).
+    #[serde(default = "default_file_download_max_bytes")]
+    pub file_download_max_bytes: u64,
+
+    /// Directory to store downloaded files.
+    /// When `None`, defaults to `std::env::temp_dir()/librefang_uploads`.
+    #[serde(default)]
+    pub file_download_dir: Option<String>,
+}
+
+/// Default max file download size: 50 MB.
+fn default_file_download_max_bytes() -> u64 {
+    50 * 1024 * 1024
 }
 
 /// Telegram channel adapter configuration.
@@ -5999,6 +6115,15 @@ pub struct WebhookConfig {
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
+    /// When true, incoming POST bodies are forwarded directly to the delivery
+    /// target channel without invoking the LLM or any agent. Requires
+    /// `deliver` to be set to a valid channel name (not "log").
+    #[serde(default)]
+    pub deliver_only: bool,
+    /// Target channel name for direct delivery (e.g. "telegram", "discord").
+    /// Required when `deliver_only` is true.
+    #[serde(default)]
+    pub deliver: Option<String>,
 }
 
 impl Default for WebhookConfig {
@@ -6010,6 +6135,8 @@ impl Default for WebhookConfig {
             account_id: None,
             default_agent: None,
             overrides: ChannelOverrides::default(),
+            deliver_only: false,
+            deliver: None,
         }
     }
 }

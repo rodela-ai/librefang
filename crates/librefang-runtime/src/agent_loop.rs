@@ -808,10 +808,9 @@ async fn execute_single_tool_call(
     }
 
     let effective_exec_policy = ctx.manifest.exec_policy.as_ref();
-    let tool_timeout = ctx
-        .kernel
-        .as_ref()
-        .map_or(TOOL_TIMEOUT_SECS, |k| k.tool_timeout_secs());
+    let tool_timeout = ctx.kernel.as_ref().map_or(TOOL_TIMEOUT_SECS, |k| {
+        k.tool_timeout_secs_for(&tool_call.name)
+    });
     let trace_start = Instant::now();
     let trace_timestamp = chrono::Utc::now();
     let result = match tokio::time::timeout(
@@ -899,8 +898,28 @@ async fn execute_single_tool_call(
     };
     fire_hook_best_effort(ctx.hooks, &hook_ctx);
 
+    // Allow plugins to rewrite the tool result before it enters the conversation context.
+    let result_content = if let Some(hook_reg) = ctx.hooks {
+        let transform_ctx = crate::hooks::HookContext {
+            agent_name: &ctx.manifest.name,
+            agent_id: ctx.caller_id_str,
+            event: librefang_types::agent::HookEvent::TransformToolResult,
+            data: serde_json::json!({
+                "tool_name": &tool_call.name,
+                "args": &tool_call.input,
+                "result": &result.content,
+                "is_error": result.is_error,
+            }),
+        };
+        hook_reg
+            .fire_transform(&transform_ctx)
+            .unwrap_or_else(|| result.content.clone())
+    } else {
+        result.content.clone()
+    };
+
     let content = sanitize_tool_result_content(
-        &result.content,
+        &result_content,
         ctx.context_budget,
         ctx.context_engine,
         ctx.context_window_tokens,
@@ -1381,6 +1400,12 @@ pub struct AgentLoopResult {
     /// is recommended. The kernel checks this to trigger background skill
     /// creation/improvement suggestions. Threshold: 5+ tool calls.
     pub skill_evolution_suggested: bool,
+    /// Optional private message destined for the agent's owner (operator DM),
+    /// produced when the LLM invokes the `notify_owner` tool during the turn.
+    /// `None` means the model did not request an owner-side notification.
+    /// Multiple notify_owner calls in the same turn are concatenated with
+    /// "\n\n" by the tool handler before being placed here.
+    pub owner_notice: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1767,6 +1792,9 @@ struct FinalizeEndTurnResultData {
     experiment_context: Option<ExperimentContext>,
     directives: librefang_types::message::ReplyDirectives,
     new_messages_start: usize,
+    /// Accumulated owner notices captured during this turn via the
+    /// `notify_owner` tool. Multiple invocations join with "\n\n".
+    owner_notice: Option<String>,
 }
 
 struct EndTurnRetryContext<'a> {
@@ -2358,6 +2386,7 @@ fn build_silent_agent_loop_result(
         latency_ms: 0,
         new_messages_start,
         skill_evolution_suggested: false,
+        owner_notice: None,
     }
 }
 
@@ -2570,9 +2599,8 @@ async fn finalize_successful_end_turn(
         experiment_context: end_turn.experiment_context,
         latency_ms: 0,
         new_messages_start: end_turn.new_messages_start,
-        // Suggest skill evolution when the agent used 5+ tool calls,
-        // indicating a non-trivial task that might be worth saving as a skill.
         skill_evolution_suggested: tool_call_count >= 5,
+        owner_notice: end_turn.owner_notice.clone(),
     })
 }
 
@@ -2875,6 +2903,9 @@ pub async fn run_agent_loop(
     let context_compressor = crate::context_compressor::ContextCompressor::with_defaults();
     let mut any_tools_executed = false;
     let mut decision_traces: Vec<DecisionTrace> = Vec::new();
+    // §A — accumulated owner_notice payloads from notify_owner tool calls.
+    // Multiple invocations in the same turn are joined with "\n\n".
+    let mut pending_owner_notice: Option<String> = None;
     let mut hallucination_retried = false;
     let mut action_nudge_retried = false;
     let mut consecutive_all_failed: u32 = 0;
@@ -3337,6 +3368,7 @@ pub async fn run_agent_loop(
                         experiment_context: experiment_context.clone(),
                         directives: reply_directives_from_parsed(parsed_directives),
                         new_messages_start,
+                        owner_notice: pending_owner_notice.take(),
                     },
                 )
                 .await;
@@ -3400,6 +3432,14 @@ pub async fn run_agent_loop(
                         dangerous_command_checker: Some(&session_checker),
                     };
                     let executed = execute_single_tool_call(&mut tool_exec_ctx, tool_call).await?;
+
+                    // §A — capture owner_notice side-channel from notify_owner tool.
+                    if let Some(ref notice) = executed.result.owner_notice {
+                        pending_owner_notice = Some(match pending_owner_notice.take() {
+                            Some(prev) => format!("{prev}\n\n{notice}"),
+                            None => notice.clone(),
+                        });
+                    }
 
                     // Layer 2: per-result budget — persist oversized outputs to disk.
                     let budgeted_content = ToolBudgetEnforcer::default().maybe_persist_result(
@@ -3582,6 +3622,7 @@ pub async fn run_agent_loop(
                         experiment_context: experiment_context.clone(),
                         latency_ms: 0,
                         new_messages_start,
+                        owner_notice: None,
                     });
                 }
                 // Model hit token limit — add partial response and continue
@@ -3866,6 +3907,20 @@ async fn stream_with_retry(
                 )));
             }
             Err(e) => {
+                let err_str = e.to_string();
+                if llm_errors::is_transient(&err_str) && attempt < MAX_RETRIES {
+                    warn!(
+                        attempt,
+                        error = %err_str,
+                        "LLM stream died with transient error, retrying"
+                    );
+                    last_error = Some("Transient stream error".to_string());
+                    tokio::time::sleep(Duration::from_millis(
+                        BASE_RETRY_DELAY_MS * 2u64.pow(attempt),
+                    ))
+                    .await;
+                    continue;
+                }
                 let (is_billing, err) =
                     build_user_facing_llm_error(&e, "LLM stream error classified");
                 record_retry_failure(provider, cooldown, is_billing);
@@ -4177,6 +4232,9 @@ pub async fn run_agent_loop_streaming(
     let context_compressor = crate::context_compressor::ContextCompressor::with_defaults();
     let mut any_tools_executed = false;
     let mut decision_traces: Vec<DecisionTrace> = Vec::new();
+    // §A — accumulated owner_notice payloads from notify_owner tool calls.
+    // Multiple invocations in the same turn are joined with "\n\n".
+    let mut pending_owner_notice: Option<String> = None;
     let mut hallucination_retried = false;
     let mut action_nudge_retried = false;
     let mut consecutive_all_failed: u32 = 0;
@@ -4695,6 +4753,7 @@ pub async fn run_agent_loop_streaming(
                         experiment_context,
                         directives: reply_directives_from_parsed(parsed_directives_s),
                         new_messages_start,
+                        owner_notice: pending_owner_notice.take(),
                     },
                 )
                 .await;
@@ -4754,6 +4813,25 @@ pub async fn run_agent_loop_streaming(
                         dangerous_command_checker: Some(&session_checker),
                     };
                     let executed = execute_single_tool_call(&mut tool_exec_ctx, tool_call).await?;
+
+                    // §A — capture owner_notice from notify_owner tool and
+                    // surface it on the live SSE stream so the gateway can
+                    // route it to OWNER_JID without waiting for turn end.
+                    if let Some(ref notice) = executed.result.owner_notice {
+                        pending_owner_notice = Some(match pending_owner_notice.take() {
+                            Some(prev) => format!("{prev}\n\n{notice}"),
+                            None => notice.clone(),
+                        });
+                        if stream_tx
+                            .send(StreamEvent::OwnerNotice {
+                                text: notice.clone(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            warn!(agent = %manifest.name, "Stream consumer disconnected during owner_notice emit");
+                        }
+                    }
 
                     // Layer 2: per-result budget — persist oversized outputs to disk.
                     let budgeted_content = ToolBudgetEnforcer::default().maybe_persist_result(
@@ -4933,6 +5011,7 @@ pub async fn run_agent_loop_streaming(
                         experiment_context: experiment_context.clone(),
                         latency_ms: 0,
                         new_messages_start,
+                        owner_notice: None,
                     });
                 }
                 let text = response.text();
@@ -5837,8 +5916,8 @@ mod tests {
             "purge_sentinels.rs", // CLI binary that *removes* the literal — delegates to canonical detector
             "purge_sentinels_test.rs", // fixtures for the CLI
             "bridge.rs",          // librefang-channels: log message in reply-intent precheck
-            "lib.rs",             // librefang-types: legacy is_no_reply helper
-            "mod.rs",             // librefang-kernel: comment in cron delivery guard
+            "lib.rs",             // librefang-types: legacy is_no_reply_sentinel compat shim
+            "mod.rs",             // librefang-kernel: inline comment only
         ];
         let offenders: Vec<&str> = stdout
             .lines()
@@ -10085,6 +10164,28 @@ mod tests {
         assert_eq!(
             manifest.web_search_augmentation,
             librefang_types::agent::WebSearchAugmentationMode::Auto,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AgentLoopResult.owner_notice (§A — owner-notify channel)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn agent_loop_result_owner_notice_defaults_none() {
+        let r = AgentLoopResult::default();
+        assert!(r.owner_notice.is_none());
+    }
+
+    #[test]
+    fn agent_loop_result_owner_notice_can_be_set() {
+        let r = AgentLoopResult {
+            owner_notice: Some("Sir, the appointment is at 3pm.".into()),
+            ..AgentLoopResult::default()
+        };
+        assert_eq!(
+            r.owner_notice.as_deref(),
+            Some("Sir, the appointment is at 3pm.")
         );
     }
 }
