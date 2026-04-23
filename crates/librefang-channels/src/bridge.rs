@@ -9,7 +9,7 @@ use crate::router::AgentRouter;
 use crate::sanitizer::{InputSanitizer, SanitizeResult};
 use crate::types::{
     default_phase_emoji, truncate_utf8, AgentPhase, ChannelAdapter, ChannelContent, ChannelMessage,
-    ChannelUser, InteractiveButton, LifecycleReaction, ParticipantRef, SenderContext,
+    ChannelUser, GroupMember, InteractiveButton, LifecycleReaction, ParticipantRef, SenderContext,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -231,6 +231,36 @@ pub trait ChannelBridgeHandle: Send + Sync {
         _channel_type: &str,
         _account_id: Option<&str>,
     ) -> Option<ChannelOverrides> {
+        None
+    }
+
+    /// Get per-agent channel overrides from the agent's manifest.
+    ///
+    /// When an agent declares `[channel_overrides]` in its `agent.toml`,
+    /// those values take priority over the channel-level overrides.
+    /// Returns `None` if the agent has no per-agent overrides configured.
+    async fn agent_channel_overrides(&self, _agent_id: AgentId) -> Option<ChannelOverrides> {
+        None
+    }
+
+    /// Get routing aliases for an agent (fork-exclusive).
+    async fn get_agent_aliases(&self, _agent_id: AgentId) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Upsert a group roster entry (fork-exclusive).
+    async fn roster_upsert(
+        &self,
+        _channel: &str,
+        _chat_id: &str,
+        _user_id: &str,
+        _display_name: &str,
+        _username: Option<&str>,
+    ) {
+    }
+
+    /// Get the workspace upload directory for an agent (fork-exclusive).
+    async fn agent_upload_dir(&self, _agent_id: AgentId) -> Option<std::path::PathBuf> {
         None
     }
 
@@ -1707,6 +1737,14 @@ fn should_process_group_message(
 /// (populated gateway-side by `sock.groupMetadata`). Returns empty when the
 /// channel doesn't supply a roster — the addressee guard then becomes a no-op
 /// (cannot fire false positives).
+fn extract_group_members(message: &ChannelMessage) -> Vec<GroupMember> {
+    message
+        .metadata
+        .get("group_members")
+        .and_then(|v| serde_json::from_value::<Vec<GroupMember>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
 fn extract_group_participants(message: &ChannelMessage) -> Vec<ParticipantRef> {
     message
         .metadata
@@ -1780,6 +1818,20 @@ fn build_sender_context(
         auto_route_confidence_threshold,
         auto_route_sticky_bonus,
         auto_route_divergence_count,
+        // Bot's own @username (e.g. "@rodelo_bot"), if available from metadata.
+        bot_username: message
+            .metadata
+            .get("bot_username")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        // Sender's @handle on the platform, when available.
+        sender_username: message
+            .metadata
+            .get("sender_username")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        // Known group members from the inbound payload (empty for DMs).
+        group_members: extract_group_members(message),
         // §C: forward roster from inbound payload (gateway populates via
         // sock.groupMetadata). Empty for non-WhatsApp channels — addressee
         // guard then becomes a no-op (BC-01).
@@ -2155,13 +2207,25 @@ async fn dispatch_message(
         }
     }
 
-    // Fetch per-channel overrides (if configured)
-    let overrides = handle
+    // Resolve target agent early so per-agent overrides can take priority
+    // over channel-level overrides (Option 2: agent controls its own behavior).
+    let early_agent_id = resolve_or_fallback(message, handle, router).await;
+
+    // Fetch overrides: agent-level (from agent.toml) wins, channel-level is fallback.
+    let channel_overrides = handle
         .channel_overrides(
             ct_str,
             message.metadata.get("account_id").and_then(|v| v.as_str()),
         )
         .await;
+    let overrides = if let Some(aid) = early_agent_id {
+        handle
+            .agent_channel_overrides(aid)
+            .await
+            .or(channel_overrides)
+    } else {
+        channel_overrides
+    };
     let channel_default_format = default_output_format_for_channel(ct_str);
     let output_format = overrides
         .as_ref()
