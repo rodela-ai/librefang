@@ -1444,6 +1444,22 @@ fn text_content(message: &ChannelMessage) -> Option<&str> {
     }
 }
 
+/// Convert plain alias strings into case-insensitive word-boundary regex patterns
+/// suitable for use in `group_trigger_patterns`.
+///
+/// This lets operators avoid manually translating agent aliases into regex syntax:
+/// `aliases_to_trigger_patterns(&["fandango", "oye fandango"])` produces
+/// `["(?i)\\bfandango\\b", "(?i)\\boye fandango\\b"]`.
+pub fn aliases_to_trigger_patterns(aliases: &[String]) -> Vec<String> {
+    aliases
+        .iter()
+        .map(|alias| {
+            let escaped = regex::escape(alias);
+            format!("(?i)\\b{escaped}\\b")
+        })
+        .collect()
+}
+
 fn matches_group_trigger_pattern(
     ct_str: &str,
     message: &ChannelMessage,
@@ -3017,6 +3033,21 @@ async fn dispatch_message(
     // Build sender context to propagate identity to the agent
     let sender_ctx = build_sender_context(message, overrides.as_ref());
 
+    // Persist roster member to SQLite (fork-exclusive)
+    if message.is_group {
+        if let Some(ref cid) = sender_ctx.chat_id {
+            handle
+                .roster_upsert(
+                    ct_str,
+                    cid,
+                    &sender_ctx.user_id,
+                    &sender_ctx.display_name,
+                    sender_ctx.sender_username.as_deref(),
+                )
+                .await;
+        }
+    }
+
     // Streaming path: if the adapter supports progressive output, pipe text
     // deltas directly to it instead of waiting for the full response.
     //
@@ -3945,6 +3976,21 @@ async fn dispatch_with_blocks(
     // Build sender context to propagate identity to the agent
     let sender_ctx = build_sender_context(message, overrides);
 
+    // Persist roster member to SQLite (fork-exclusive)
+    if message.is_group {
+        if let Some(ref cid) = sender_ctx.chat_id {
+            handle
+                .roster_upsert(
+                    ct_str,
+                    cid,
+                    &sender_ctx.user_id,
+                    &sender_ctx.display_name,
+                    sender_ctx.sender_username.as_deref(),
+                )
+                .await;
+        }
+    }
+
     match handle
         .send_message_with_blocks_and_sender(agent_id, blocks.clone(), &sender_ctx)
         .await
@@ -4689,6 +4735,28 @@ mod tests {
                 "telegram", &overrides, &message
             ));
         });
+    }
+
+    #[test]
+    fn test_aliases_to_trigger_patterns_produces_word_boundary_regex() {
+        let aliases = vec!["fandango".to_string(), "oye fandango".to_string()];
+        let patterns = aliases_to_trigger_patterns(&aliases);
+        assert_eq!(patterns.len(), 2);
+        assert_eq!(patterns[0], r"(?i)\bfandango\b");
+        assert_eq!(patterns[1], r"(?i)\boye fandango\b");
+    }
+
+    #[test]
+    fn test_aliases_to_trigger_patterns_escapes_special_chars() {
+        let aliases = vec!["bot.v2".to_string()];
+        let patterns = aliases_to_trigger_patterns(&aliases);
+        assert_eq!(patterns[0], r"(?i)\bbot\.v2\b");
+    }
+
+    #[test]
+    fn test_aliases_to_trigger_patterns_empty() {
+        let patterns = aliases_to_trigger_patterns(&[]);
+        assert!(patterns.is_empty());
     }
 
     #[test]
