@@ -1,5 +1,6 @@
 #!/bin/sh
-# Pre-commit hook: ensure Rust code is formatted.
+# Pre-commit hook: ensure Rust code is formatted, openapi.json is current, and
+# SDKs are regenerated whenever the spec changes.
 # Install: git config core.hooksPath scripts/hooks
 
 cargo fmt --check 2>/dev/null
@@ -8,4 +9,28 @@ if [ $? -ne 0 ]; then
     cargo fmt
     echo "Formatted. Please re-stage and commit again."
     exit 1
+fi
+
+# Regenerate openapi.json if API routes changed. Fail the commit if
+# codegen fails — swallowing the error would let a stale spec land,
+# which defeats the purpose of the hook.
+if git diff --cached --name-only | grep -q "crates/librefang-api/src/routes/"; then
+    echo "Regenerating openapi.json..."
+    if ! cargo xtask codegen --openapi; then
+        echo "Error: openapi.json regeneration failed — fix build/codegen before committing."
+        exit 1
+    fi
+    git add openapi.json
+    echo "openapi.json updated and staged."
+fi
+
+# Regenerate SDKs whenever openapi.json is part of the commit.
+if git diff --cached --name-only | grep -qx "openapi.json"; then
+    echo "Regenerating SDKs from openapi.json..."
+    if ! python3 scripts/codegen-sdks.py; then
+        echo "Error: SDK regeneration failed — fix scripts/codegen-sdks.py before committing."
+        exit 1
+    fi
+    git add sdk/python sdk/javascript sdk/go sdk/rust
+    echo "SDKs updated and staged."
 fi

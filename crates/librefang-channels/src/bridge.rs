@@ -2951,7 +2951,7 @@ async fn dispatch_message(
         }
     }
 
-    let agent_id = match resolve_or_fallback(message, handle, router).await {
+    let agent_id = match early_agent_id {
         Some(id) => id,
         None => {
             send_response(
