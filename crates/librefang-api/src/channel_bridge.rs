@@ -65,8 +65,8 @@ fn looks_like_tool_call(text: &str) -> bool {
     // natural language that may reference tools; filtering them silently
     // drops legitimate answers.
     const MAX_HEURISTIC_LEN: usize = 2000;
-    if t.len() <= MAX_HEURISTIC_LEN {
-        if contains_bare_json_tool_call(t)
+    t.len() <= MAX_HEURISTIC_LEN
+        && (contains_bare_json_tool_call(t)
             // Tag-based patterns — use contains() because tool call tags may
             // appear after natural language preamble
             || t.contains("<function=")
@@ -78,13 +78,7 @@ fn looks_like_tool_call(text: &str) -> bool {
             // Pattern 4: markdown code block containing a tool call
             || contains_markdown_tool_call(t)
             // Pattern 5: backtick-wrapped tool call
-            || contains_backtick_tool_call(t)
-        {
-            return true;
-        }
-    }
-
-    false
+            || contains_backtick_tool_call(t))
 }
 
 fn contains_markdown_tool_call(text: &str) -> bool {
