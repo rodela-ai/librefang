@@ -3686,6 +3686,11 @@ pub async fn patch_agent(
         if let Err(e) = state.kernel.memory_substrate().save_agent(&entry) {
             tracing::warn!("Failed to persist agent state: {e}");
         }
+
+        // Write updated manifest to agent.toml on disk so disk doesn't override
+        // dashboard changes on next boot (#996, #1018).
+        state.kernel.persist_manifest_to_disk(agent_id);
+
         (
             StatusCode::OK,
             Json(
@@ -4135,6 +4140,10 @@ pub async fn patch_agent_config(
             tracing::warn!("Failed to persist agent config update: {e}");
         }
     }
+
+    // Write updated manifest to agent.toml on disk so disk doesn't override
+    // dashboard changes on next boot (#996, #1018).
+    state.kernel.persist_manifest_to_disk(agent_id);
 
     (
         StatusCode::OK,

@@ -8000,6 +8000,55 @@ system_prompt = "You are a helpful assistant."
     /// Agents with a custom `base_url` keep their current provider unless
     /// overridden explicitly — this prevents custom setups (e.g. Tencent,
     /// Azure, or other third-party endpoints) from being misidentified.
+    /// Persist an agent's manifest to its `agent.toml` on disk so that
+    /// dashboard-driven config changes (model, provider, fallback, etc.)
+    /// survive a restart. The on-disk file lives at the entry's recorded
+    /// `source_toml_path`, falling back to the canonical
+    /// `<agent_workspaces_dir>/<safe_name>/agent.toml` when no source path
+    /// is set.
+    ///
+    /// This is best-effort: a failure to write is logged but does not
+    /// propagate as an error — the authoritative copy lives in SQLite.
+    pub fn persist_manifest_to_disk(&self, agent_id: AgentId) {
+        let Some(entry) = self.registry.get(agent_id) else {
+            return;
+        };
+        let toml_path = match entry.source_toml_path.clone() {
+            Some(p) => p,
+            None => {
+                let safe_name = safe_path_component(&entry.name, "agent");
+                self.config
+                    .load()
+                    .effective_agent_workspaces_dir()
+                    .join(safe_name)
+                    .join("agent.toml")
+            }
+        };
+        let dir = match toml_path.parent() {
+            Some(d) => d.to_path_buf(),
+            None => {
+                warn!(agent = %entry.name, "Failed to derive parent dir for manifest persist");
+                return;
+            }
+        };
+        match toml::to_string_pretty(&entry.manifest) {
+            Ok(toml_str) => {
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    warn!(agent = %entry.name, "Failed to create agent dir for manifest persist: {e}");
+                    return;
+                }
+                if let Err(e) = atomic_write_toml(&toml_path, &toml_str) {
+                    warn!(agent = %entry.name, "Failed to persist manifest to disk: {e}");
+                } else {
+                    debug!(agent = %entry.name, path = %toml_path.display(), "Persisted manifest to disk");
+                }
+            }
+            Err(e) => {
+                warn!(agent = %entry.name, "Failed to serialize manifest to TOML: {e}");
+            }
+        }
+    }
+
     pub fn set_agent_model(
         &self,
         agent_id: AgentId,
@@ -8083,6 +8132,9 @@ system_prompt = "You are a helpful assistant."
         if let Some(entry) = self.registry.get(agent_id) {
             let _ = self.memory.save_agent(&entry);
         }
+
+        // Write updated manifest to agent.toml so changes survive restart (#996, #1018)
+        self.persist_manifest_to_disk(agent_id);
 
         // Clear canonical session to prevent memory poisoning from old model's responses
         let _ = self.memory.delete_canonical_session(agent_id);
@@ -13425,6 +13477,67 @@ async fn cron_script_wake_gate(job_name: &str, script_path: &str) -> bool {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_wake_gate(&stdout)
+}
+
+/// Atomically write a TOML file by staging the new content in a sibling
+/// `.tmp` file and renaming it over the destination.
+///
+/// SECURITY / CORRECTNESS: a plain `fs::write` is non-atomic. Two
+/// concurrent persisters (e.g. `patch_agent` + `set_agent_model`) can
+/// truncate each other's output mid-flight, and a process crash at the
+/// wrong moment leaves a half-written file that fails to parse on next
+/// boot. `rename` is atomic on POSIX filesystems and effectively atomic
+/// on Windows for files on the same volume; if the rename fails we
+/// clean up the staging file.
+///
+/// We also `sync_all` the temp file before rename so the bytes hit the
+/// disk before the directory entry is swapped — without that, a power
+/// loss could leave the renamed file pointing at empty/stale data even
+/// though the rename succeeded.
+fn atomic_write_toml(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Per-call counter so two threads in the same process never share
+    // a tmp filename — otherwise concurrent writers can clobber each
+    // other's staging file before rename, defeating the atomicity.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    // Same-directory tmp path keeps rename on the same filesystem so
+    // it's a true atomic in-place swap rather than a cross-volume copy.
+    let mut tmp = path.to_path_buf();
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing filename"))?
+        .to_os_string();
+    let mut tmp_name = file_name;
+    tmp_name.push(format!(".{}.{seq}.tmp", std::process::id()));
+    tmp.set_file_name(tmp_name);
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        // fsync so the bytes hit disk before we publish via rename;
+        // without this a power loss between rename and flush would
+        // leave the renamed file pointing at empty/garbage data.
+        f.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // POSIX `rename` is atomic. Windows `MoveFileEx` with
+    // REPLACE_EXISTING (which Rust's std uses) is effectively atomic
+    // for files on the same volume, though there is a brief window
+    // where readers may see ERROR_SHARING_VIOLATION on contention.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Parse the wake gate from script stdout.
