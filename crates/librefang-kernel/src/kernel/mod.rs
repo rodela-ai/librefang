@@ -16091,7 +16091,8 @@ impl KernelHandle for LibreFangKernel {
 
         let policy = self.approval_manager.policy();
         let risk_level = crate::approval::ApprovalManager::classify_risk(tool_name);
-        let description = format!("Agent {} requests to execute {}", agent_id, tool_name);
+        let agent_display = self.approval_agent_display(agent_id);
+        let description = format!("Agent {} requests to execute {}", agent_display, tool_name);
         let request_id = uuid::Uuid::new_v4();
         let req = TypedRequest {
             id: request_id,
@@ -16174,9 +16175,9 @@ impl KernelHandle for LibreFangKernel {
                 };
 
             let msg = format!(
-                "{} Approval needed: agent \"{}\" wants to run `{}` — {}",
+                "{} Approval needed: agent {} wants to run `{}` — {}",
                 risk_level.emoji(),
-                agent_id,
+                agent_display,
                 tool_name,
                 description,
             );
@@ -16245,7 +16246,8 @@ impl KernelHandle for LibreFangKernel {
 
         let policy = self.approval_manager.policy();
         let risk_level = crate::approval::ApprovalManager::classify_risk(tool_name);
-        let description = format!("Agent {} requests to execute {}", agent_id, tool_name);
+        let agent_display = self.approval_agent_display(agent_id);
+        let description = format!("Agent {} requests to execute {}", agent_display, tool_name);
         let request_id = uuid::Uuid::new_v4();
         let req = TypedRequest {
             id: request_id,
@@ -16319,9 +16321,9 @@ impl KernelHandle for LibreFangKernel {
                 }
             };
             let msg = format!(
-                "{} Approval needed: agent \"{}\" wants to run `{}` — {}",
+                "{} Approval needed: agent {} wants to run `{}` — {}",
                 risk_level.emoji(),
-                agent_id,
+                agent_display,
                 tool_name,
                 description,
             );
@@ -17146,6 +17148,30 @@ impl KernelHandle for LibreFangKernel {
 // ---------------------------------------------------------------------------
 
 impl LibreFangKernel {
+    /// Render an agent identifier for human-facing messages: `"name" (short-id)`
+    /// when the agent is in the registry, otherwise the raw id verbatim.
+    ///
+    /// Do not use this for audit detail strings or any field that downstream
+    /// queries filter on — those need the canonical UUID so that
+    /// `/api/audit/query?agent=<uuid>` keeps working. This helper is for
+    /// operator-facing copy (push notifications, channel messages,
+    /// human-readable descriptions) only.
+    fn approval_agent_display(&self, agent_id: &str) -> String {
+        if let Ok(aid) = agent_id.parse::<AgentId>() {
+            if let Some(entry) = self.registry.get(aid) {
+                let short = agent_id.get(..8).unwrap_or(agent_id);
+                // Names are user-configured free text. Escape embedded `"` so
+                // adapters that interpret the surrounding context (Telegram
+                // MarkdownV2, Discord, etc.) don't see a malformed message
+                // that fails to render — operators can't approve what they
+                // can't see.
+                let safe_name = entry.name.replace('"', "\\\"");
+                return format!("\"{}\" ({})", safe_name, short);
+            }
+        }
+        format!("\"{}\"", agent_id)
+    }
+
     async fn notify_escalated_approval(
         &self,
         req: &librefang_types::approval::ApprovalRequest,
@@ -17187,10 +17213,10 @@ impl LibreFangKernel {
             };
 
         let msg = format!(
-            "{} ESCALATION #{}: Approval still needed: agent \"{}\" wants to run `{}` - {}",
+            "{} ESCALATION #{}: Approval still needed: agent {} wants to run `{}` - {}",
             req.risk_level.emoji(),
             req.escalation_count,
-            req.agent_id,
+            self.approval_agent_display(&req.agent_id),
             req.tool_name,
             req.description,
         );
