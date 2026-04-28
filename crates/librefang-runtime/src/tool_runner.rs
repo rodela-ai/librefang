@@ -6823,6 +6823,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
 
@@ -6876,6 +6877,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
 
@@ -7319,6 +7321,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
         assert!(!result.is_error, "got error: {}", result.content);
@@ -7365,6 +7368,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
         assert!(!result.is_error, "got error: {}", result.content);
@@ -7414,6 +7418,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
         assert!(!result.is_error, "got error: {}", result.content);
@@ -7463,6 +7468,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
         assert!(result.is_error);
@@ -7515,6 +7521,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
         assert!(result.is_error);
@@ -7569,6 +7576,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
         assert!(!result.is_error, "got error: {}", result.content);
@@ -7620,6 +7628,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
         assert!(result.is_error, "expected denial, got: {}", result.content);
@@ -7676,6 +7685,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
         assert!(
@@ -7736,6 +7746,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
         // Must NOT be blocked by read-only check. It may be blocked by exec policy
@@ -8201,6 +8212,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
 
@@ -8263,6 +8275,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
 
@@ -8325,6 +8338,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
 
@@ -8382,6 +8396,7 @@ mod tests {
             None,
             None,
             None,
+            None, // available_tools
         )
         .await;
 

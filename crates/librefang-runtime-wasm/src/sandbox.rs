@@ -69,8 +69,8 @@ impl Default for SandboxConfig {
 /// `ResourceLimiter` implementation that caps WASM linear-memory growth at a
 /// configured byte ceiling. Attached to every `Store` so that WASM plugins
 /// cannot allocate unbounded host memory regardless of their fuel budget.
-struct MemoryLimiter {
-    max_bytes: usize,
+pub(crate) struct MemoryLimiter {
+    pub(crate) max_bytes: usize,
 }
 
 impl wasmtime::ResourceLimiter for MemoryLimiter {
@@ -105,7 +105,7 @@ pub struct GuestState {
     /// Tokio runtime handle for async operations in sync host functions.
     pub tokio_handle: tokio::runtime::Handle,
     /// Memory limiter enforcing `SandboxConfig::max_memory_bytes`.
-    limiter: MemoryLimiter,
+    pub(crate) limiter: MemoryLimiter,
 }
 
 /// Result of executing a WASM module.
@@ -668,19 +668,17 @@ mod tests {
             max_bytes: 1024 * 1024,
         };
         // Within limit → allowed
-        assert_eq!(
+        assert!(
             limiter
                 .memory_growing(0, 64 * 1024, None)
                 .expect("should not error"),
-            true,
             "growth within cap must be permitted"
         );
         // Exceeds limit → denied
-        assert_eq!(
-            limiter
+        assert!(
+            !limiter
                 .memory_growing(0, 2 * 1024 * 1024, None)
                 .expect("should not error"),
-            false,
             "growth beyond cap must be denied"
         );
     }

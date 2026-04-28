@@ -743,7 +743,7 @@ fn machine_fingerprint() -> Vec<u8> {
     if let Some(parent) = fingerprint_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::write(&fingerprint_path, &random_id) {
+    match std::fs::write(&fingerprint_path, random_id) {
         Ok(()) => {
             // Restrict to owner-read/write only on Unix.
             #[cfg(unix)]

@@ -921,6 +921,7 @@ impl ApprovalManager {
     /// treat `Err(())` as a rejection — if we cannot persist the counter we
     /// cannot enforce the brute-force cap across restarts, so the safest
     /// course is to deny the request (fail-secure, fix for #3372 / #3584).
+    #[allow(clippy::result_unit_err)]
     pub fn record_totp_failure(&self, sender_id: &str) -> Result<(), ()> {
         let mut failures = self.totp_failures.lock().unwrap_or_else(|e| e.into_inner());
         let entry = failures.entry(sender_id.to_string()).or_insert((0, None));

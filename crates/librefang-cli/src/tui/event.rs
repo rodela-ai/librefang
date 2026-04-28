@@ -2036,8 +2036,8 @@ pub fn spawn_save_provider_key(
     tx: mpsc::Sender<AppEvent>,
 ) {
     std::thread::spawn(move || match backend {
-        BackendRef::Daemon { base_url, api_key } => {
-            let client = make_daemon_client(api_key.as_deref());
+        BackendRef::Daemon { base_url, api_key: daemon_key } => {
+            let client = make_daemon_client(daemon_key.as_deref());
             match client
                 .post(format!("{base_url}/api/providers/{name}/key"))
                 .json(&serde_json::json!({"key": api_key}))

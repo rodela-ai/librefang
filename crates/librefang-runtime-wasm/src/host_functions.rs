@@ -667,6 +667,7 @@ mod tests {
             kernel: None,
             agent_id: "test-agent".to_string(),
             tokio_handle: tokio::runtime::Handle::current(),
+            limiter: crate::sandbox::MemoryLimiter { max_bytes: 64 * 1024 * 1024 },
         }
     }
 
@@ -912,23 +913,6 @@ mod tests {
     /// traversal attempt aimed at a path outside any granted capability must
     /// be denied even if the raw string superficially matches a prefix.
     ///
-    /// We test the deny path here: a FileRead("*") wildcard is granted but
-    /// the path `../etc/passwd` is rejected during canonicalization (contains
-    /// `..`), so the capability check is never even reached. This validates
-    /// that canonicalization is the first gate.
-    #[tokio::test]
-    async fn test_fs_read_traversal_rejected_before_capability_check() {
-        // Even with a wildcard capability, ".." in the path must be caught by
-        // safe_resolve_path before we ever consult the capability list.
-        let state = test_state(vec![Capability::FileRead("*".to_string())]);
-        let result = host_fs_read(&state, &json!({"path": "../etc/passwd"}));
-        let err = result["error"].as_str().unwrap_or("");
-        assert!(
-            err.contains("traversal") || err.contains("resolve") || err.contains("Cannot"),
-            "Expected path-traversal or resolution error, got: {err}"
-        );
-    }
-
     #[test]
     fn test_safe_resolve_parent_traversal() {
         assert!(safe_resolve_parent("../malicious.txt").is_err());

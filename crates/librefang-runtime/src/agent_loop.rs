@@ -10320,7 +10320,7 @@ mod tests {
         let PreparedMessages {
             persistent_repair_stats,
             ..
-        } = prepare_llm_messages(&manifest, &mut session, "follow-up question", None);
+        } = prepare_llm_messages(&manifest, &mut session, "follow-up question", None, DEFAULT_MAX_HISTORY_MESSAGES);
 
         // Contract 1: stats are non-default — caller MUST persist.
         assert_ne!(
@@ -10387,7 +10387,7 @@ mod tests {
         let PreparedMessages {
             persistent_repair_stats: first_stats,
             ..
-        } = prepare_llm_messages(&manifest, &mut session, "follow-up question", None);
+        } = prepare_llm_messages(&manifest, &mut session, "follow-up question", None, DEFAULT_MAX_HISTORY_MESSAGES);
         assert_ne!(
             first_stats,
             crate::session_repair::RepairStats::default(),
@@ -10398,7 +10398,7 @@ mod tests {
         let PreparedMessages {
             persistent_repair_stats: second_stats,
             ..
-        } = prepare_llm_messages(&manifest, &mut session, "follow-up question", None);
+        } = prepare_llm_messages(&manifest, &mut session, "follow-up question", None, DEFAULT_MAX_HISTORY_MESSAGES);
         assert_eq!(
             second_stats,
             crate::session_repair::RepairStats::default(),
