@@ -53,6 +53,10 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
             axum::routing::post(send_message_stream),
         )
         .route(
+            "/agents/{id}/sessions/{session_id}/stream",
+            axum::routing::get(attach_session_stream),
+        )
+        .route(
             "/agents/{id}/session",
             axum::routing::get(get_agent_session),
         )
@@ -67,6 +71,10 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
         .route(
             "/agents/{id}/sessions/{session_id}/export",
             axum::routing::get(export_session),
+        )
+        .route(
+            "/agents/{id}/sessions/{session_id}/trajectory",
+            axum::routing::get(export_session_trajectory),
         )
         .route(
             "/agents/{id}/sessions/import",
@@ -89,6 +97,14 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
             axum::routing::post(compact_session),
         )
         .route("/agents/{id}/stop", axum::routing::post(stop_agent))
+        .route(
+            "/agents/{id}/runtime",
+            axum::routing::get(list_agent_runtime),
+        )
+        .route(
+            "/agents/{id}/sessions/{session_id}/stop",
+            axum::routing::post(stop_session),
+        )
         .route("/agents/{id}/model", axum::routing::put(set_model))
         .route(
             "/agents/{id}/traces",
@@ -113,6 +129,11 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
         .route(
             "/agents/{id}/config",
             axum::routing::patch(patch_agent_config),
+        )
+        .route(
+            "/agents/{id}/hand-runtime-config",
+            axum::routing::patch(patch_hand_agent_runtime_config)
+                .delete(delete_hand_agent_runtime_config),
         )
         .route(
             "/agents/{id}/clone",
@@ -279,7 +300,7 @@ async fn resolve_manifest(
     let mut manifest: AgentManifest = match toml::from_str(&manifest_toml) {
         Ok(m) => m,
         Err(e) => {
-            let _ = e;
+            tracing::warn!("Failed to parse agent manifest TOML: {e}");
             let t = ErrorTranslator::new(lang);
             return Err(ManifestError {
                 message: t.t("api-error-manifest-invalid-format"),
@@ -321,16 +342,23 @@ pub async fn spawn_agent(
         Ok(r) => r,
         Err(e) => {
             // Map specific errors to appropriate HTTP status codes
-            let status = if e.message.contains("too large") {
-                StatusCode::PAYLOAD_TOO_LARGE
+            let (status, code) = if e.message.contains("too large") {
+                (StatusCode::PAYLOAD_TOO_LARGE, "manifest_too_large")
             } else if e.message.contains("not found") && e.message.contains("Template") {
-                StatusCode::NOT_FOUND
+                (StatusCode::NOT_FOUND, "template_not_found")
             } else if e.message.contains("signature verification failed") {
-                StatusCode::FORBIDDEN
+                (StatusCode::FORBIDDEN, "signature_invalid")
             } else {
-                StatusCode::BAD_REQUEST
+                (StatusCode::BAD_REQUEST, "invalid_manifest")
             };
-            return (status, Json(serde_json::json!({"error": e.message})));
+            return ApiErrorResponse {
+                error: e.message,
+                code: Some(code.to_string()),
+                r#type: Some(code.to_string()),
+                details: None,
+                status,
+            }
+            .into_response();
         }
     };
 
@@ -341,22 +369,25 @@ pub async fn spawn_agent(
                 agent_id: id.to_string(),
                 name: resolved.name,
             })),
-        ),
+        )
+            .into_response(),
         Err(e) => {
             tracing::warn!("Spawn failed: {e}");
             let t = ErrorTranslator::new(l);
-            let status = match &e {
+            let (status, code) = match &e {
                 librefang_kernel::error::KernelError::LibreFang(
                     librefang_types::error::LibreFangError::AgentAlreadyExists(_),
-                ) => StatusCode::CONFLICT,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
+                ) => (StatusCode::CONFLICT, "agent_already_exists"),
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "spawn_failed"),
             };
-            (
+            ApiErrorResponse {
+                error: t.t_args("api-error-agent-error", &[("error", &e.to_string())]),
+                code: Some(code.to_string()),
+                r#type: Some(code.to_string()),
+                details: None,
                 status,
-                Json(
-                    serde_json::json!({"error": t.t_args("api-error-agent-error", &[("error", &e.to_string())])}),
-                ),
-            )
+            }
+            .into_response()
         }
     }
 }
@@ -764,6 +795,10 @@ pub(crate) fn enrich_agent_json(
             "color": e.identity.color,
         },
         "web_search_augmentation": e.manifest.web_search_augmentation,
+        "parent_agent_id": e.parent.as_ref().map(|p| p.to_string()),
+        "children": e.children.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+        "session_id": e.session_id.0.to_string(),
+        "tags": e.tags,
     })
 }
 
@@ -801,8 +836,21 @@ pub(crate) fn effective_default_model(
 pub async fn list_agents(
     State(state): State<Arc<AppState>>,
     lang: Option<axum::Extension<RequestLanguage>>,
-    Query(params): Query<AgentListQuery>,
+    api_user: Option<axum::Extension<crate::middleware::AuthenticatedApiUser>>,
+    Query(mut params): Query<AgentListQuery>,
 ) -> impl IntoResponse {
+    // Scope agents by authenticated user: non-admin/owner callers can only
+    // list agents they authored.  If the caller already supplied an explicit
+    // ?owner= filter we respect it as-is; otherwise we inject the caller's
+    // username automatically.
+    if params.owner.is_none() {
+        if let Some(ref user) = api_user {
+            use librefang_kernel::auth::UserRole;
+            if user.0.role < UserRole::Admin {
+                params.owner = Some(user.0.name.clone());
+            }
+        }
+    }
     let catalog = state.kernel.model_catalog_ref().read().ok();
     let dm = {
         let dm_override = state
@@ -835,6 +883,13 @@ pub async fn list_agents(
     if let Some(ref status) = params.status {
         let status_lower = status.to_lowercase();
         agents.retain(|e| format!("{:?}", e.state).to_lowercase() == status_lower);
+    }
+
+    // Filter by owner (matches manifest.author). For non-admin callers this
+    // is injected automatically above so they only see their own agents.
+    if let Some(ref owner) = params.owner {
+        let owner_lower = owner.to_lowercase();
+        agents.retain(|e| e.manifest.author.to_lowercase() == owner_lower);
     }
 
     let total = agents.len();
@@ -881,7 +936,7 @@ pub async fn list_agents(
 
     // -- Pagination --
     let offset = params.offset.unwrap_or(0);
-    let limit = params.limit.map(|l| l.min(100));
+    let limit = params.limit.map(|l| l.min(500));
     let agents: Vec<librefang_types::agent::AgentEntry> = if let Some(lim) = limit {
         agents.into_iter().skip(offset).take(lim).collect()
     } else {
@@ -902,10 +957,82 @@ pub async fn list_agents(
     .into_response()
 }
 
-/// Resolve uploaded file attachments into ContentBlock::Image blocks.
+/// Hard cap on inlined text-attachment length (chars). Mirrors the PDF
+/// truncation cap so a 5 MB `.log` paste doesn't blow the LLM context.
+const MAX_TEXT_ATTACHMENT_CHARS: usize = 200_000;
+const TEXT_TRUNCATION_MARKER: &str =
+    "\n\n[…file truncated at 200K chars; content continues beyond this point…]";
+
+/// Decide whether an attachment looks like a UTF-8 text/code/data file
+/// the LLM can read directly. Browsers don't set `content_type` reliably
+/// for code files (`.rs`, `.py` typically come through as empty or
+/// `application/octet-stream`), so we fall back to extension matching.
+fn is_text_like_attachment(content_type: &str, filename: &str) -> bool {
+    if content_type.starts_with("text/") {
+        return true;
+    }
+    let known_mime = matches!(
+        content_type,
+        "application/json"
+            | "application/xml"
+            | "application/yaml"
+            | "application/x-yaml"
+            | "application/toml"
+            | "application/x-toml"
+            | "application/x-ipynb+json"
+            | "application/javascript"
+            | "application/x-javascript"
+            | "application/typescript"
+            | "application/sql"
+            | "application/graphql"
+    );
+    if known_mime {
+        return true;
+    }
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        // Plain text & docs
+        "txt" | "md" | "markdown" | "rst" | "csv" | "tsv" | "log"
+        // Config & data
+        | "json" | "yaml" | "yml" | "toml" | "xml" | "ini" | "conf" | "cfg" | "env" | "properties"
+        // Web
+        | "html" | "htm" | "css" | "scss" | "sass" | "less"
+        // JS/TS family
+        | "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "vue" | "svelte"
+        // Other languages
+        | "py" | "rs" | "go" | "java" | "kt" | "kts" | "swift" | "scala" | "clj" | "ex" | "exs"
+        | "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" | "hh" | "m" | "mm"
+        | "rb" | "php" | "pl" | "lua" | "r" | "jl" | "dart" | "zig" | "nim"
+        // Shell
+        | "sh" | "bash" | "zsh" | "fish" | "ps1"
+        // Query / schema
+        | "sql" | "graphql" | "gql" | "proto"
+        // Notebooks
+        | "ipynb"
+        // Build files (no extension is rare; keep names like Dockerfile out — accept attribute can't match those)
+        | "dockerfile" | "makefile"
+    )
+}
+
+/// Resolve uploaded file attachments into content blocks.
 ///
-/// Reads each file from the upload directory, base64-encodes it, and
-/// returns image content blocks ready to insert into a session message.
+/// Reads each file from the upload directory and produces blocks the
+/// agent loop can consume:
+///   - `image/*` → `ContentBlock::Image` (base64-encoded inline)
+///   - `application/pdf` → `ContentBlock::Text` with a `[Attached PDF: <filename>]`
+///     header followed by extracted plain text (truncated at 200K chars).
+///     Scanned/image-only PDFs surface as a text note explaining no text
+///     was extractable, so the LLM at least sees the attachment exists.
+///   - text-like files (any `text/*`, `application/json|xml|yaml|toml|…`,
+///     plus common code/data extensions) → `ContentBlock::Text` with a
+///     `[Attached file: <filename>]` header. Read as UTF-8 lossy and
+///     truncated at 200K chars.
+///   - everything else → skipped with a warn log.
 pub fn resolve_attachments(
     attachments: &[AttachmentRef],
 ) -> Vec<librefang_types::message::ContentBlock> {
@@ -917,18 +1044,19 @@ pub fn resolve_attachments(
     for att in attachments {
         // Look up metadata from the upload registry
         let meta = UPLOAD_REGISTRY.get(&att.file_id);
-        let content_type = if let Some(ref m) = meta {
-            m.content_type.clone()
+        let (raw_content_type, filename) = if let Some(ref m) = meta {
+            (m.content_type.clone(), m.filename.clone())
         } else if !att.content_type.is_empty() {
-            att.content_type.clone()
+            (att.content_type.clone(), att.file_id.clone())
         } else {
             continue; // Skip unknown attachments
         };
 
-        // Only process image types
-        if !content_type.starts_with("image/") {
-            continue;
-        }
+        // Normalize MIME for downstream branching: drop parameters
+        // (`application/pdf; charset=binary`) and lowercase. Without this,
+        // a `Content-Type: Application/PDF` header would skip the PDF branch
+        // and silently drop the attachment.
+        let content_type = librefang_types::media::mime_base(&raw_content_type);
 
         // Validate file_id is a UUID to prevent path traversal
         if uuid::Uuid::parse_str(&att.file_id).is_err() {
@@ -936,37 +1064,129 @@ pub fn resolve_attachments(
         }
 
         let file_path = upload_dir.join(&att.file_id);
-        match std::fs::read(&file_path) {
-            Ok(data) => {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-                blocks.push(librefang_types::message::ContentBlock::Image {
-                    media_type: content_type,
-                    data: b64,
-                });
+
+        if content_type.starts_with("image/") {
+            match std::fs::read(&file_path) {
+                Ok(data) => {
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                    tracing::info!(
+                        file_id = %att.file_id,
+                        filename = %filename,
+                        content_type = %content_type,
+                        size_bytes = data.len(),
+                        "Resolved image attachment into Image block"
+                    );
+                    blocks.push(librefang_types::message::ContentBlock::Image {
+                        media_type: content_type,
+                        data: b64,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(file_id = %att.file_id, error = %e, "Failed to read image upload");
+                }
             }
-            Err(e) => {
-                tracing::warn!(file_id = %att.file_id, error = %e, "Failed to read upload for attachment");
+        } else if content_type == "application/pdf" {
+            match std::fs::read(&file_path) {
+                Ok(data) => {
+                    let header = format!("[Attached PDF: {} ({} bytes)]", filename, data.len());
+                    let body = match librefang_runtime::pdf_text::extract_text_from_pdf(&data) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            tracing::warn!(
+                                file_id = %att.file_id,
+                                filename = %filename,
+                                error = %e,
+                                "PDF text extraction failed; surfacing as note to LLM"
+                            );
+                            format!("[Could not extract text: {e}]")
+                        }
+                    };
+                    tracing::info!(
+                        file_id = %att.file_id,
+                        filename = %filename,
+                        size_bytes = data.len(),
+                        extracted_chars = body.chars().count(),
+                        "Resolved PDF attachment into Text block"
+                    );
+                    blocks.push(librefang_types::message::ContentBlock::Text {
+                        text: format!("{header}\n\n{body}"),
+                        provider_metadata: None,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(file_id = %att.file_id, error = %e, "Failed to read PDF upload");
+                }
             }
+        } else if is_text_like_attachment(&content_type, &filename) {
+            match std::fs::read(&file_path) {
+                Ok(data) => {
+                    let raw = String::from_utf8_lossy(&data);
+                    let total_chars = raw.chars().count();
+                    let (body, truncated) = if total_chars > MAX_TEXT_ATTACHMENT_CHARS {
+                        let mut s: String = raw.chars().take(MAX_TEXT_ATTACHMENT_CHARS).collect();
+                        s.push_str(TEXT_TRUNCATION_MARKER);
+                        (s, true)
+                    } else {
+                        (raw.into_owned(), false)
+                    };
+                    let suffix = if truncated { ", truncated" } else { "" };
+                    let header = format!(
+                        "[Attached file: {} ({} bytes{})]",
+                        filename,
+                        data.len(),
+                        suffix
+                    );
+                    tracing::info!(
+                        file_id = %att.file_id,
+                        filename = %filename,
+                        content_type = %content_type,
+                        size_bytes = data.len(),
+                        kept_chars = body.chars().count(),
+                        truncated,
+                        "Resolved text attachment into Text block"
+                    );
+                    blocks.push(librefang_types::message::ContentBlock::Text {
+                        text: format!("{header}\n\n{body}"),
+                        provider_metadata: None,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(file_id = %att.file_id, error = %e, "Failed to read text upload");
+                }
+            }
+        } else {
+            tracing::warn!(
+                file_id = %att.file_id,
+                content_type = %content_type,
+                filename = %filename,
+                "Attachment type not yet wired into the agent loop; skipping"
+            );
         }
     }
 
     blocks
 }
 
-/// Pre-insert image attachments into an agent's session so the LLM can see them.
+/// Pre-insert attachment content blocks (image / extracted-text-from-PDF /
+/// text files) into an agent's session so the LLM can see them.
 ///
-/// This injects image content blocks into the session BEFORE the kernel
-/// adds the text user message, so the LLM receives: [..., User(images), User(text)].
+/// Injects a single user-role message containing all blocks BEFORE the
+/// kernel adds the user's text message, so the LLM receives:
+/// `[..., User(attach_blocks), User(text)]`. session_repair will merge
+/// those two consecutive user-role messages into one for the wire format.
 pub fn inject_attachments_into_session(
     kernel: &LibreFangKernel,
     agent_id: AgentId,
-    image_blocks: Vec<librefang_types::message::ContentBlock>,
+    attachment_blocks: Vec<librefang_types::message::ContentBlock>,
 ) {
     use librefang_types::message::{Message, MessageContent, Role};
 
     let entry = match kernel.agent_registry().get(agent_id) {
         Some(e) => e,
-        None => return,
+        None => {
+            tracing::warn!(agent_id = ?agent_id, "Cannot inject attachments: agent not found in registry");
+            return;
+        }
     };
 
     let mut session = match kernel.memory_substrate().get_session(entry.session_id) {
@@ -980,15 +1200,46 @@ pub fn inject_attachments_into_session(
         },
     };
 
+    let block_count = attachment_blocks.len();
+    let block_kinds: Vec<&'static str> = attachment_blocks
+        .iter()
+        .map(|b| match b {
+            librefang_types::message::ContentBlock::Image { .. } => "image",
+            librefang_types::message::ContentBlock::Text { .. } => "text",
+            librefang_types::message::ContentBlock::ImageFile { .. } => "image_file",
+            librefang_types::message::ContentBlock::ToolUse { .. } => "tool_use",
+            librefang_types::message::ContentBlock::ToolResult { .. } => "tool_result",
+            librefang_types::message::ContentBlock::Thinking { .. } => "thinking",
+            librefang_types::message::ContentBlock::Unknown => "unknown",
+        })
+        .collect();
+
     session.messages.push(Message {
         role: Role::User,
-        content: MessageContent::Blocks(image_blocks),
+        content: MessageContent::Blocks(attachment_blocks),
         pinned: false,
         timestamp: Some(chrono::Utc::now()),
     });
 
+    let total_messages_after = session.messages.len();
+
     if let Err(e) = kernel.memory_substrate().save_session(&session) {
-        tracing::warn!(error = %e, "Failed to save session with image attachments");
+        tracing::warn!(
+            agent_id = ?agent_id,
+            session_id = ?entry.session_id,
+            block_count,
+            error = %e,
+            "Failed to save session with attachment blocks"
+        );
+    } else {
+        tracing::info!(
+            agent_id = ?agent_id,
+            session_id = ?entry.session_id,
+            block_count,
+            block_kinds = ?block_kinds,
+            total_messages_after,
+            "Injected attachment blocks into session"
+        );
     }
 }
 
@@ -1103,28 +1354,26 @@ pub async fn send_message(
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": err_invalid_id})),
-            );
+            return ApiErrorResponse::bad_request(err_invalid_id)
+                .with_code("invalid_agent_id")
+                .into_response();
         }
     };
 
     // SECURITY: Reject oversized messages to prevent OOM / LLM token abuse.
     const MAX_MESSAGE_SIZE: usize = 64 * 1024; // 64KB
     if req.message.len() > MAX_MESSAGE_SIZE {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({"error": err_too_large})),
-        );
+        return ApiErrorResponse::bad_request(err_too_large)
+            .with_code("message_too_large")
+            .with_status(StatusCode::PAYLOAD_TOO_LARGE)
+            .into_response();
     }
 
     // Check agent exists before processing
     if state.kernel.agent_registry().get(agent_id).is_none() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": err_not_found})),
-        );
+        return ApiErrorResponse::not_found(err_not_found)
+            .with_code("agent_not_found")
+            .into_response();
     }
 
     // Reject messages when the agent's provider has no API key configured
@@ -1152,12 +1401,14 @@ pub async fn send_message(
             if let Some(catalog) = state.kernel.model_catalog_ref().read().ok().as_ref() {
                 if let Some(p) = catalog.get_provider(provider) {
                     if !p.auth_status.is_available() {
-                        return (
-                            StatusCode::PRECONDITION_FAILED,
-                            Json(
-                                serde_json::json!({"error": format!("{} (provider: {})", err_auth_missing, provider)}),
-                            ),
-                        );
+                        return ApiErrorResponse {
+                            error: format!("{} (provider: {})", err_auth_missing, provider),
+                            code: Some("provider_auth_missing".to_string()),
+                            r#type: Some("provider_auth_missing".to_string()),
+                            details: None,
+                            status: StatusCode::PRECONDITION_FAILED,
+                        }
+                        .into_response();
                     }
                 }
             }
@@ -1190,10 +1441,9 @@ pub async fn send_message(
         Some(s) => match s.parse::<uuid::Uuid>() {
             Ok(id) => Some(librefang_types::agent::SessionId(id)),
             Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "invalid session_id: must be a UUID"})),
-                );
+                return ApiErrorResponse::bad_request("invalid session_id: must be a UUID")
+                    .with_code("invalid_session_id")
+                    .into_response();
             }
         },
     };
@@ -1236,7 +1486,8 @@ pub async fn send_message(
                         "iterations": result.iterations,
                         "cost_usd": result.cost_usd,
                     })),
-                );
+                )
+                    .into_response();
             }
 
             // Extract reasoning trace (optional) and strip <think>...</think>
@@ -1275,24 +1526,31 @@ pub async fn send_message(
                     owner_notice: result.owner_notice,
                 })),
             )
+                .into_response()
         }
         Err(e) => {
             tracing::warn!("send_message failed for agent {id}: {e}");
-            let status = if format!("{e}").contains("Agent not found") {
-                StatusCode::NOT_FOUND
+            let (status, code) = if format!("{e}").contains("Agent not found") {
+                (StatusCode::NOT_FOUND, "agent_not_found")
             } else if format!("{e}").contains("quota") || format!("{e}").contains("Quota") {
-                StatusCode::TOO_MANY_REQUESTS
+                (StatusCode::TOO_MANY_REQUESTS, "budget_exceeded")
             } else if format!("{e}").contains("belongs to a different agent") {
-                StatusCode::BAD_REQUEST
+                (StatusCode::BAD_REQUEST, "session_agent_mismatch")
             } else {
-                StatusCode::INTERNAL_SERVER_ERROR
+                (StatusCode::INTERNAL_SERVER_ERROR, "message_delivery_failed")
             };
-            (status, {
-                let t = ErrorTranslator::new(l);
-                Json(
-                    serde_json::json!({"error": t.t_args("api-error-message-delivery-failed", &[("reason", &e.to_string())])}),
-                )
-            })
+            let t = ErrorTranslator::new(l);
+            ApiErrorResponse {
+                error: t.t_args(
+                    "api-error-message-delivery-failed",
+                    &[("reason", &e.to_string())],
+                ),
+                code: Some(code.to_string()),
+                r#type: Some(code.to_string()),
+                details: None,
+                status,
+            }
+            .into_response()
         }
     }
 }
@@ -1319,12 +1577,25 @@ fn request_sender_context(req: &MessageRequest) -> Option<SenderContext> {
     })
 }
 
+/// Query params for `GET /api/agents/{id}/session`.
+///
+/// Using a typed struct (rather than `HashMap<String,String>`) gives us
+/// automatic UUID validation: a malformed `session_id` is rejected by serde
+/// before the handler runs, returning a clean 400.
+#[derive(serde::Deserialize)]
+pub struct GetAgentSessionQuery {
+    pub session_id: Option<uuid::Uuid>,
+}
+
 /// GET /api/agents/:id/session — Get agent session (conversation history).
 #[utoipa::path(
     get,
     path = "/api/agents/{id}/session",
     tag = "agents",
-    params(("id" = String, Path, description = "Agent ID")),
+    params(
+        ("id" = String, Path, description = "Agent ID"),
+        ("session_id" = Option<String>, Query, description = "Optional session id to load instead of the canonical active session"),
+    ),
     responses(
         (status = 200, description = "Get agent conversation session history", body = serde_json::Value)
     )
@@ -1332,35 +1603,59 @@ fn request_sender_context(req: &MessageRequest) -> Option<SenderContext> {
 pub async fn get_agent_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    query: Result<Query<GetAgentSessionQuery>, axum::extract::rejection::QueryRejection>,
     lang: Option<axum::Extension<RequestLanguage>>,
 ) -> impl IntoResponse {
     let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+    let Query(params) = match query {
+        Ok(q) => q,
+        Err(_) => {
+            return ApiErrorResponse::bad_request("invalid session_id")
+                .with_code("invalid_session_id")
+                .into_response();
+        }
+    };
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": t.t("api-error-agent-invalid-id")})),
-            );
+            return ApiErrorResponse::bad_request(t.t("api-error-agent-invalid-id"))
+                .with_code("invalid_agent_id")
+                .into_response();
         }
     };
 
     let entry = match state.kernel.agent_registry().get(agent_id) {
         Some(e) => e,
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": t.t("api-error-agent-not-found")})),
-            );
+            return ApiErrorResponse::not_found(t.t("api-error-agent-not-found"))
+                .with_code("agent_not_found")
+                .into_response();
         }
+    };
+
+    // Callers (e.g. the dashboard tab with `?sessionId=` pinned) can override
+    // the canonical-active session for this request. The returned messages
+    // must belong to that exact session; otherwise tabs pinned to different
+    // sessions all render whichever session the kernel thinks is active.
+    let target_session_id = match params.session_id {
+        Some(uuid) => librefang_types::agent::SessionId(uuid),
+        None => entry.session_id,
     };
 
     match state
         .kernel
         .memory_substrate()
-        .get_session(entry.session_id)
+        .get_session(target_session_id)
     {
         Ok(Some(session)) => {
+            // Reject cross-agent reads when the caller passed an explicit
+            // session_id — prevents leaking one agent's history via another's
+            // id.
+            if session.agent_id != agent_id {
+                return ApiErrorResponse::not_found("session not found for this agent")
+                    .with_code("session_agent_mismatch")
+                    .into_response();
+            }
             // Two-pass approach: ToolUse blocks live in Assistant messages while
             // ToolResult blocks arrive in subsequent User messages.  Pass 1
             // collects all tool_use entries keyed by id; pass 2 attaches results.
@@ -1519,23 +1814,41 @@ pub async fn get_agent_session(
                     "messages": messages,
                 })),
             )
+                .into_response()
         }
-        Ok(None) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "session_id": entry.session_id.0.to_string(),
-                "agent_id": agent_id.to_string(),
-                "message_count": 0,
-                "context_window_tokens": 0,
-                "messages": [],
-            })),
-        ),
+        Ok(None) => {
+            // The session row is not materialized in the memory substrate
+            // (e.g. agent just spawned, no messages yet). If the caller pinned
+            // an explicit session_id that does NOT match this agent's
+            // canonical-active id, refuse — otherwise the response would
+            // silently fall back to the agent's own canonical-empty session
+            // under the requested id, hiding the cross-agent guard. The
+            // canonical id is owned by this agent by construction (registry
+            // entry), so matching it is safe to treat as the no-query path.
+            if let Some(requested) = params.session_id {
+                if requested != entry.session_id.0 {
+                    return ApiErrorResponse::not_found("session not found for this agent")
+                        .with_code("session_agent_mismatch")
+                        .into_response();
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "session_id": entry.session_id.0.to_string(),
+                    "agent_id": agent_id.to_string(),
+                    "message_count": 0,
+                    "context_window_tokens": 0,
+                    "messages": [],
+                })),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::warn!("Session load failed for agent {id}: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": t.t("api-error-session-load-failed")})),
-            )
+            ApiErrorResponse::internal(t.t("api-error-session-load-failed"))
+                .with_code("session_load_failed")
+                .into_response()
         }
     }
 }
@@ -1560,10 +1873,9 @@ pub async fn kill_agent(
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": t.t("api-error-agent-invalid-id")})),
-            );
+            return ApiErrorResponse::bad_request(t.t("api-error-agent-invalid-id"))
+                .with_code("invalid_agent_id")
+                .into_response();
         }
     };
 
@@ -1574,12 +1886,11 @@ pub async fn kill_agent(
     // Delete for hand agents already; this closes the direct-API loophole.
     if let Some(entry) = state.kernel.agent_registry().get(agent_id) {
         if entry.is_hand {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "Cannot delete a hand-spawned agent directly; deactivate or uninstall the owning hand instead."
-                })),
-            );
+            return ApiErrorResponse::conflict(
+                "Cannot delete a hand-spawned agent directly; deactivate or uninstall the owning hand instead.",
+            )
+            .with_code("hand_agent_delete_denied")
+            .into_response();
         }
     }
 
@@ -1587,13 +1898,13 @@ pub async fn kill_agent(
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "killed", "agent_id": id})),
-        ),
+        )
+            .into_response(),
         Err(e) => {
             tracing::warn!("kill_agent failed for {id}: {e}");
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": t.t("api-error-agent-not-found-or-terminated")})),
-            )
+            ApiErrorResponse::not_found(t.t("api-error-agent-not-found-or-terminated"))
+                .with_code("agent_not_found")
+                .into_response()
         }
     }
 }
@@ -1607,21 +1918,20 @@ pub async fn suspend_agent(
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
+            return ApiErrorResponse::bad_request("Invalid agent ID")
+                .with_code("invalid_agent_id")
+                .into_response();
         }
     };
     match state.kernel.suspend_agent(agent_id) {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "suspended", "agent_id": id})),
-        ),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
+        )
+            .into_response(),
+        Err(e) => ApiErrorResponse::not_found(e.to_string())
+            .with_code("agent_not_found")
+            .into_response(),
     }
 }
 
@@ -1634,21 +1944,20 @@ pub async fn resume_agent(
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
+            return ApiErrorResponse::bad_request("Invalid agent ID")
+                .with_code("invalid_agent_id")
+                .into_response();
         }
     };
     match state.kernel.resume_agent(agent_id) {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "running", "agent_id": id})),
-        ),
-        Err(e) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": e.to_string()})),
-        ),
+        )
+            .into_response(),
+        Err(e) => ApiErrorResponse::not_found(e.to_string())
+            .with_code("agent_not_found")
+            .into_response(),
     }
 }
 
@@ -1673,10 +1982,9 @@ pub async fn set_agent_mode(
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": t.t("api-error-agent-invalid-id")})),
-            );
+            return ApiErrorResponse::bad_request(t.t("api-error-agent-invalid-id"))
+                .with_code("invalid_agent_id")
+                .into_response();
         }
     };
 
@@ -1688,11 +1996,11 @@ pub async fn set_agent_mode(
                 "agent_id": id,
                 "mode": body.mode,
             })),
-        ),
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": t.t("api-error-agent-not-found")})),
-        ),
+        )
+            .into_response(),
+        Err(_) => ApiErrorResponse::not_found(t.t("api-error-agent-not-found"))
+            .with_code("agent_not_found")
+            .into_response(),
     }
 }
 
@@ -1720,20 +2028,18 @@ pub async fn get_agent(
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": t.t("api-error-agent-invalid-id")})),
-            );
+            return ApiErrorResponse::bad_request(t.t("api-error-agent-invalid-id"))
+                .with_code("invalid_agent_id")
+                .into_response();
         }
     };
 
     let entry = match state.kernel.agent_registry().get(agent_id) {
         Some(e) => e,
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": t.t("api-error-agent-not-found")})),
-            );
+            return ApiErrorResponse::not_found(t.t("api-error-agent-not-found"))
+                .with_code("agent_not_found")
+                .into_response();
         }
     };
 
@@ -1801,6 +2107,7 @@ pub async fn get_agent(
             "web_search_augmentation": entry.manifest.web_search_augmentation,
         })),
     )
+        .into_response()
 }
 
 /// POST /api/agents/:id/message/stream — SSE streaming response.
@@ -1837,29 +2144,24 @@ pub async fn send_message_stream(
     // SECURITY: Reject oversized messages to prevent OOM / LLM token abuse.
     const MAX_MESSAGE_SIZE: usize = 64 * 1024; // 64KB
     if req.message.len() > MAX_MESSAGE_SIZE {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({"error": err_too_large})),
-        )
+        return ApiErrorResponse::bad_request(err_too_large)
+            .with_code("message_too_large")
+            .with_status(StatusCode::PAYLOAD_TOO_LARGE)
             .into_response();
     }
 
     let agent_id: AgentId = match id.parse() {
         Ok(id) => id,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": err_invalid_id})),
-            )
+            return ApiErrorResponse::bad_request(err_invalid_id)
+                .with_code("invalid_agent_id")
                 .into_response();
         }
     };
 
     if state.kernel.agent_registry().get(agent_id).is_none() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": err_not_found})),
-        )
+        return ApiErrorResponse::not_found(err_not_found)
+            .with_code("agent_not_found")
             .into_response();
     }
 
@@ -1877,10 +2179,8 @@ pub async fn send_message_stream(
         Some(s) => match s.parse::<uuid::Uuid>() {
             Ok(id) => Some(librefang_types::agent::SessionId(id)),
             Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": "invalid session_id: must be a UUID"})),
-                )
+                return ApiErrorResponse::bad_request("invalid session_id: must be a UUID")
+                    .with_code("invalid_session_id")
                     .into_response();
             }
         },
@@ -1900,10 +2200,8 @@ pub async fn send_message_stream(
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!("Streaming message failed for agent {id}: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": err_streaming_failed})),
-            )
+            return ApiErrorResponse::internal(err_streaming_failed)
+                .with_code("streaming_failed")
                 .into_response();
         }
     };
@@ -1966,7 +2264,174 @@ pub async fn send_message_stream(
         }
     });
 
-    Sse::new(sse_stream).into_response()
+    Sse::new(sse_stream)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+/// GET /api/agents/{id}/sessions/{session_id}/stream — attach to a session's
+/// in-flight stream events (SSE).
+///
+/// Any client can subscribe to the events emitted by an active turn on this
+/// session: the originating client (CLI, Tauri desktop, web) plus any number
+/// of additional clients. Late attachers begin receiving events from the
+/// moment they subscribe — partial-turn snapshots are not replayed.
+///
+/// Returns 404 if the session does not exist or belongs to a different agent.
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/sessions/{session_id}/stream",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent ID"),
+        ("session_id" = String, Path, description = "Session ID to attach to"),
+    ),
+    responses(
+        (status = 200, description = "Server-sent events stream of session events"),
+        (status = 400, description = "Invalid agent or session ID"),
+        (status = 404, description = "Agent or session not found")
+    )
+)]
+pub async fn attach_session_stream(
+    State(state): State<Arc<AppState>>,
+    Path((id, session_id_str)): Path<(String, String)>,
+    lang: Option<axum::Extension<RequestLanguage>>,
+) -> axum::response::Response {
+    use axum::response::sse::{Event, Sse};
+    use futures::stream;
+    use librefang_runtime::llm_driver::StreamEvent;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": t.t("api-error-agent-invalid-id")})),
+            )
+                .into_response();
+        }
+    };
+
+    let session_id = match session_id_str.parse::<uuid::Uuid>() {
+        Ok(uuid) => librefang_types::agent::SessionId(uuid),
+        Err(_) => {
+            return ApiErrorResponse::bad_request(t.t("api-error-session-invalid-id"))
+                .with_code("invalid_session_id")
+                .into_response();
+        }
+    };
+
+    let agent_entry = match state.kernel.agent_registry().get(agent_id) {
+        Some(e) => e,
+        None => {
+            return ApiErrorResponse::not_found(t.t("api-error-agent-not-found"))
+                .with_code("agent_not_found")
+                .into_response();
+        }
+    };
+
+    // Validate the session belongs to this agent. Two acceptable shapes:
+    //   1. The session has been persisted (one or more turns ran) and its
+    //      `agent_id` matches the path agent.
+    //   2. The session has not been persisted yet (fresh agent, no turn yet)
+    //      but the id matches the agent's canonical `session_id` from the
+    //      registry. Sessions are written lazily on first turn, so requiring
+    //      a memory row would forbid attach-before-first-turn.
+    // Anything else is rejected — a caller cannot attach to an arbitrary
+    // session UUID without first proving the agent–session binding.
+    let session_lookup = state.kernel.memory_substrate().get_session(session_id);
+    let session_valid = match &session_lookup {
+        Ok(Some(s)) => s.agent_id == agent_id,
+        Ok(None) => agent_entry.session_id == session_id,
+        Err(_) => false,
+    };
+    if !session_valid {
+        if let Err(e) = session_lookup {
+            return ApiErrorResponse::internal(
+                t.t_args("api-error-generic", &[("error", &e.to_string())]),
+            )
+            .with_code("session_load_failed")
+            .into_response();
+        }
+        return ApiErrorResponse::not_found("session not found for this agent")
+            .with_code("session_agent_mismatch")
+            .into_response();
+    }
+
+    let receiver = state.kernel.session_stream_hub().subscribe(session_id);
+
+    // Bridge broadcast::Receiver into an SSE stream. Skip Lagged events with
+    // a debug log (intentionally lossy semantics — see SessionStreamHub
+    // docs) and end the stream when the channel closes.
+    let sse_stream = stream::unfold(
+        (receiver, StreamDedup::new()),
+        |(mut rx, mut dedup)| async move {
+            loop {
+                let event = match rx.recv().await {
+                    Ok(ev) => ev,
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::debug!(skipped = n, "session attach stream lagged, skipping");
+                        continue;
+                    }
+                    Err(RecvError::Closed) => return None,
+                };
+                let sse_event: Result<Event, std::convert::Infallible> = Ok(match event {
+                    StreamEvent::TextDelta { text } => {
+                        if dedup.is_duplicate(&text) {
+                            continue;
+                        }
+                        dedup.record_sent(&text);
+                        Event::default()
+                            .event("chunk")
+                            .json_data(serde_json::json!({"content": text, "done": false}))
+                            .unwrap_or_else(|_| Event::default().data("error"))
+                    }
+                    StreamEvent::ToolUseStart { name, .. } => Event::default()
+                        .event("tool_use")
+                        .json_data(serde_json::json!({"tool": name}))
+                        .unwrap_or_else(|_| Event::default().data("error")),
+                    StreamEvent::ToolUseEnd { name, input, .. } => Event::default()
+                        .event("tool_result")
+                        .json_data(serde_json::json!({"tool": name, "input": input}))
+                        .unwrap_or_else(|_| Event::default().data("error")),
+                    StreamEvent::ContentComplete { usage, .. } => Event::default()
+                        .event("done")
+                        .json_data(serde_json::json!({
+                            "done": true,
+                            "usage": {
+                                "input_tokens": usage.input_tokens,
+                                "output_tokens": usage.output_tokens,
+                            }
+                        }))
+                        .unwrap_or_else(|_| Event::default().data("error")),
+                    StreamEvent::PhaseChange { phase, detail } => Event::default()
+                        .event("phase")
+                        .json_data(serde_json::json!({
+                            "phase": phase,
+                            "detail": detail,
+                        }))
+                        .unwrap_or_else(|_| Event::default().data("error")),
+                    StreamEvent::OwnerNotice { text } => Event::default()
+                        .event("owner_notice")
+                        .json_data(serde_json::json!({ "text": text }))
+                        .unwrap_or_else(|_| Event::default().data("error")),
+                    _ => Event::default().comment("skip"),
+                });
+                return Some((sse_event, (rx, dedup)));
+            }
+        },
+    );
+
+    Sse::new(sse_stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 #[utoipa::path(
@@ -2148,6 +2613,187 @@ pub async fn export_session(
             ),
         ),
     }
+}
+
+/// GET /api/agents/{id}/sessions/{session_id}/trajectory — Export a redacted
+/// trajectory (audit trail) for the given session.
+///
+/// Returns a privacy-redacted bundle of the session messages plus metadata
+/// (agent name, model, system prompt fingerprint, librefang version). Intended
+/// for support, audit, and compliance flows.
+///
+/// Query parameters:
+/// - `format=json` (default): single JSON object response.
+/// - `format=jsonl`: NDJSON, first line is metadata header, subsequent lines
+///   are messages one-per-line. `Content-Type: application/x-ndjson`.
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/sessions/{session_id}/trajectory",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent ID"),
+        ("session_id" = String, Path, description = "Session ID to export"),
+        ("format" = Option<String>, Query, description = "Response format: 'json' (default) or 'jsonl'"),
+    ),
+    responses(
+        (status = 200, description = "Redacted trajectory bundle", body = serde_json::Value),
+        (status = 400, description = "Invalid agent or session ID"),
+        (status = 404, description = "Agent or session not found"),
+    )
+)]
+pub async fn export_session_trajectory(
+    State(state): State<Arc<AppState>>,
+    Path((id, session_id_str)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    lang: Option<axum::Extension<RequestLanguage>>,
+) -> axum::response::Response {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    use librefang_kernel::trajectory::{AgentContext, RedactionPolicy, TrajectoryExporter};
+
+    let (
+        err_invalid_id,
+        err_session_invalid,
+        err_not_found,
+        err_session_not_found,
+        err_generic_key,
+    ) = {
+        let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+        (
+            t.t("api-error-agent-invalid-id"),
+            t.t("api-error-session-invalid-id"),
+            t.t("api-error-agent-not-found"),
+            "Session not found".to_string(),
+            "api-error-generic".to_string(),
+        )
+    };
+
+    // Parse agent ID.
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": err_invalid_id})),
+            )
+                .into_response();
+        }
+    };
+
+    // Parse session ID.
+    let session_id = match session_id_str.parse::<uuid::Uuid>() {
+        Ok(uuid) => librefang_types::agent::SessionId(uuid),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": err_session_invalid})),
+            )
+                .into_response();
+        }
+    };
+
+    // Lookup agent → 404 if missing.
+    let agent_entry = match state.kernel.agent_registry().get(agent_id) {
+        Some(e) => e,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": err_not_found})),
+            )
+                .into_response();
+        }
+    };
+
+    // Build redaction policy. Use the agent's workspace as the path-collapse
+    // root when present.
+    let mut policy = RedactionPolicy::default();
+    if let Some(ws) = agent_entry.manifest.workspace.clone() {
+        policy = policy.with_workspace_root(ws);
+    }
+
+    let exporter = TrajectoryExporter::new(state.kernel.memory_substrate().clone(), policy);
+    let agent_ctx = AgentContext {
+        name: agent_entry.name.clone(),
+        model: agent_entry.manifest.model.model.clone(),
+        provider: agent_entry.manifest.model.provider.clone(),
+        system_prompt: agent_entry.manifest.model.system_prompt.clone(),
+    };
+
+    // Sessions are persisted lazily on first message. If the row is missing
+    // but the requested session_id matches the agent's currently-registered
+    // session (authoritative ownership signal from the registry), treat it
+    // as an empty session rather than 404.
+    let bundle = match state.kernel.memory_substrate().get_session(session_id) {
+        Ok(None) if session_id == agent_entry.session_id => {
+            exporter.empty_bundle(agent_id, session_id, agent_ctx)
+        }
+        Ok(_) => match exporter.export_session(agent_id, session_id, agent_ctx) {
+            Ok(b) => b,
+            Err(librefang_types::error::LibreFangError::Memory(msg))
+                if msg.contains("not found") =>
+            {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": err_session_not_found})),
+                )
+                    .into_response();
+            }
+            Err(librefang_types::error::LibreFangError::Memory(msg))
+                if msg.contains("does not belong") =>
+            {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": err_session_not_found})),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+                let msg = t.t_args(&err_generic_key, &[("error", &e.to_string())]);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": msg})),
+                )
+                    .into_response();
+            }
+        },
+        Err(e) => {
+            let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+            let msg = t.t_args(&err_generic_key, &[("error", &e.to_string())]);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": msg})),
+            )
+                .into_response();
+        }
+    };
+
+    let format = params
+        .get("format")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "json".to_string());
+
+    let (body, content_type, ext): (String, &'static str, &'static str) = if format == "jsonl" {
+        (bundle.to_jsonl(), "application/x-ndjson", "jsonl")
+    } else {
+        (bundle.to_json().to_string(), "application/json", "json")
+    };
+
+    let filename = format!("trajectory-{}.{}", session_id.0, ext);
+    let disposition = format!("attachment; filename=\"{}\"", filename);
+
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to build response"})),
+            )
+                .into_response()
+        })
 }
 
 /// POST /api/agents/{id}/sessions/import — Import a previously exported session.
@@ -2420,6 +3066,95 @@ pub async fn stop_agent(
     }
 }
 
+/// GET /api/agents/{id}/runtime — Snapshot of in-flight loops for the agent.
+///
+/// Returns one entry per `(agent, session)` pair that's currently executing.
+/// Empty array when the agent is idle.
+#[utoipa::path(
+    get,
+    path = "/api/agents/{id}/runtime",
+    tag = "agents",
+    params(("id" = String, Path, description = "Agent ID")),
+    responses(
+        (status = 200, description = "List of in-flight sessions for the agent", body = serde_json::Value)
+    )
+)]
+pub async fn list_agent_runtime(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    lang: Option<axum::Extension<RequestLanguage>>,
+) -> impl IntoResponse {
+    let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": t.t("api-error-agent-invalid-id")})),
+            )
+        }
+    };
+    let snapshots = state.kernel.list_running_sessions(agent_id);
+    (StatusCode::OK, Json(serde_json::json!(snapshots)))
+}
+
+/// POST /api/agents/{id}/sessions/{session_id}/stop — Cancel a single
+/// in-flight `(agent, session)` loop without affecting the agent's other
+/// concurrent sessions.
+///
+/// Returns `{"status":"ok","stopped":true}` when a loop was running for that
+/// pair, `{"status":"ok","stopped":false}` when nothing was running (already
+/// finished, never started, or the session belongs to a different agent).
+#[utoipa::path(
+    post,
+    path = "/api/agents/{id}/sessions/{session_id}/stop",
+    tag = "agents",
+    params(
+        ("id" = String, Path, description = "Agent ID"),
+        ("session_id" = String, Path, description = "Session ID"),
+    ),
+    responses(
+        (status = 200, description = "Cancel a single (agent, session) loop", body = serde_json::Value)
+    )
+)]
+pub async fn stop_session(
+    State(state): State<Arc<AppState>>,
+    Path((id, session_id_str)): Path<(String, String)>,
+    lang: Option<axum::Extension<RequestLanguage>>,
+) -> impl IntoResponse {
+    let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": t.t("api-error-agent-invalid-id")})),
+            )
+        }
+    };
+    let session_id: librefang_types::agent::SessionId = match session_id_str.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": t.t("api-error-session-invalid-id")})),
+            )
+        }
+    };
+    match state.kernel.stop_session_run(agent_id, session_id) {
+        Ok(stopped) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "stopped": stopped})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({"error": t.t_args("api-error-generic", &[("error", &e.to_string())])}),
+            ),
+        ),
+    }
+}
+
 #[utoipa::path(
     put,
     path = "/api/agents/{id}/model",
@@ -2587,11 +3322,25 @@ pub async fn get_agent_tools(
     (
         StatusCode::OK,
         Json(serde_json::json!({
+            "capabilities_tools": entry.manifest.capabilities.tools,
             "tool_allowlist": entry.manifest.tool_allowlist,
             "tool_blocklist": entry.manifest.tool_blocklist,
             "disabled": entry.manifest.tools_disabled,
         })),
     )
+}
+
+/// Request body for updating an agent's tool configuration.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct SetAgentToolsRequest {
+    /// Declared tools (capabilities.tools). `None` = no change, `Some([])` = unrestricted.
+    pub capabilities_tools: Option<Vec<String>>,
+    /// Tool allowlist — additional filter. `None` = no change, `Some([])` = clear.
+    #[serde(default)]
+    pub tool_allowlist: Option<Vec<String>>,
+    /// Tool blocklist — exclusion filter. `None` = no change, `Some([])` = clear.
+    #[serde(default)]
+    pub tool_blocklist: Option<Vec<String>>,
 }
 
 /// PUT /api/agents/{id}/tools — Update an agent's tool allowlist/blocklist.
@@ -2600,7 +3349,7 @@ pub async fn get_agent_tools(
     path = "/api/agents/{id}/tools",
     tag = "agents",
     params(("id" = String, Path, description = "Agent ID")),
-    request_body(content = serde_json::Value, description = "Tool allowlist and/or blocklist arrays"),
+    request_body(content = SetAgentToolsRequest, description = "Tool configuration fields"),
     responses(
         (status = 200, description = "Update an agent's tool allowlist and blocklist", body = serde_json::Value)
     )
@@ -2609,7 +3358,7 @@ pub async fn set_agent_tools(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     lang: Option<axum::Extension<RequestLanguage>>,
-    Json(body): Json<serde_json::Value>,
+    Json(body): Json<SetAgentToolsRequest>,
 ) -> impl IntoResponse {
     let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
     let agent_id: AgentId = match id.parse() {
@@ -2621,24 +3370,11 @@ pub async fn set_agent_tools(
             )
         }
     };
-    let allowlist = body
-        .get("tool_allowlist")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect::<Vec<_>>()
-        });
-    let blocklist = body
-        .get("tool_blocklist")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect::<Vec<_>>()
-        });
 
-    if allowlist.is_none() && blocklist.is_none() {
+    if body.capabilities_tools.is_none()
+        && body.tool_allowlist.is_none()
+        && body.tool_blocklist.is_none()
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": t.t("api-error-agent-missing-tools")})),
@@ -2655,10 +3391,12 @@ pub async fn set_agent_tools(
         );
     }
 
-    match state
-        .kernel
-        .set_agent_tool_filters(agent_id, allowlist, blocklist)
-    {
+    match state.kernel.set_agent_tool_filters(
+        agent_id,
+        body.capabilities_tools,
+        body.tool_allowlist,
+        body.tool_blocklist,
+    ) {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2933,7 +3671,7 @@ pub async fn update_agent(
     }
 
     // Parse the new manifest
-    let _manifest: AgentManifest = match toml::from_str(&req.manifest_toml) {
+    let manifest: AgentManifest = match toml::from_str(&req.manifest_toml) {
         Ok(m) => m,
         Err(e) => {
             return (
@@ -2945,15 +3683,21 @@ pub async fn update_agent(
         }
     };
 
-    // Note: Full manifest update requires kill + respawn. For now, acknowledge receipt.
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "acknowledged",
-            "agent_id": id,
-            "note": "Full manifest update requires agent restart. Use DELETE + POST to apply.",
-        })),
-    )
+    drop(t);
+
+    match state.kernel.update_manifest(agent_id, manifest) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "agent_id": id,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
 }
 
 #[utoipa::path(
@@ -3071,6 +3815,11 @@ pub async fn patch_agent(
         if let Err(e) = state.kernel.memory_substrate().save_agent(&entry) {
             tracing::warn!("Failed to persist agent state: {e}");
         }
+
+        // Write updated manifest to agent.toml on disk so disk doesn't override
+        // dashboard changes on next boot (#996, #1018).
+        state.kernel.persist_manifest_to_disk(agent_id);
+
         (
             StatusCode::OK,
             Json(
@@ -3116,7 +3865,7 @@ fn patch_agent_mcp_servers(body: &serde_json::Value) -> Result<Option<Vec<String
 
 /// Request body for updating agent visual identity.
 #[derive(serde::Deserialize, utoipa::ToSchema)]
-pub struct UpdateIdentityRequest {
+pub(crate) struct UpdateIdentityRequest {
     pub emoji: Option<String>,
     pub avatar_url: Option<String>,
     pub color: Option<String>,
@@ -3139,6 +3888,7 @@ pub struct UpdateIdentityRequest {
         (status = 200, description = "Update an agent's visual identity", body = serde_json::Value)
     )
 )]
+#[allow(private_interfaces)]
 pub async fn update_agent_identity(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -3219,6 +3969,7 @@ pub async fn update_agent_identity(
 
 /// Request body for patching agent config (name, description, prompt, identity, model).
 #[derive(serde::Deserialize, utoipa::ToSchema)]
+#[allow(dead_code)]
 pub struct PatchAgentConfigRequest {
     pub name: Option<String>,
     pub description: Option<String>,
@@ -3255,6 +4006,7 @@ pub struct PatchAgentConfigRequest {
         (status = 200, description = "Hot-update agent name, description, system prompt, identity, and model", body = serde_json::Value)
     )
 )]
+#[allow(private_interfaces)]
 pub async fn patch_agent_config(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -3521,10 +4273,214 @@ pub async fn patch_agent_config(
         }
     }
 
+    // Write updated manifest to agent.toml on disk so disk doesn't override
+    // dashboard changes on next boot (#996, #1018).
+    state.kernel.persist_manifest_to_disk(agent_id);
+
     (
         StatusCode::OK,
         Json(serde_json::json!({"status": "ok", "agent_id": id})),
     )
+}
+
+/// Map a DTO `Option<String>` into the `Option<Option<String>>` semantics
+/// required by [`librefang_hands::HandAgentRuntimeOverride`] for nullable
+/// secret-like fields (`api_key_env`, `base_url`).
+///
+/// - `None`            (field absent in JSON)        → `None`            (leave unchanged)
+/// - `Some("")`        (empty string sent in JSON)   → `Some(None)`      (clear the override)
+/// - `Some(non_empty)` (string value sent)           → `Some(Some(_))`   (set the override)
+///
+/// Whitespace is trimmed before the empty-string check so values like `"   "`
+/// are treated as a clear, matching the `/config` endpoint's existing
+/// length-bounded semantics for these fields.
+fn hand_override_nullable_string(raw: Option<String>) -> Option<Option<String>> {
+    raw.map(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+/// Translate a kernel error from `update_hand_agent_runtime_override` or
+/// `clear_hand_agent_runtime_override` into a `(StatusCode, message)` pair.
+///
+/// - [`LibreFangError::AgentNotFound`] → 404
+/// - [`LibreFangError::Internal`] whose message starts with `"Hand role not
+///   found"` → 409 Conflict (the hand instance exists but no role maps to
+///   the requested agent id — kernel has no dedicated variant, so we match
+///   on the single well-known prefix emitted by the kernel)
+/// - everything else → 500
+fn map_hand_runtime_override_err(
+    err: &librefang_kernel::error::KernelError,
+) -> (StatusCode, String) {
+    use librefang_kernel::error::KernelError;
+    use librefang_types::error::LibreFangError;
+    match err {
+        KernelError::LibreFang(LibreFangError::AgentNotFound(_)) => {
+            (StatusCode::NOT_FOUND, err.to_string())
+        }
+        KernelError::LibreFang(LibreFangError::Internal(msg))
+            if msg.starts_with("Hand role not found") =>
+        {
+            (StatusCode::CONFLICT, err.to_string())
+        }
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+/// PATCH /api/agents/{id}/hand-runtime-config — Runtime-only config override for hand agents.
+#[utoipa::path(
+    patch,
+    path = "/api/agents/{id}/hand-runtime-config",
+    tag = "agents",
+    params(("id" = String, Path, description = "Hand agent ID")),
+    request_body(
+        content = PatchAgentConfigRequest,
+        description = "Runtime override fields. Whitespace is trimmed on all string fields. For `model` and `provider` an empty (or whitespace-only) string is ignored ('leave unchanged'); for the nullable secrets `api_key_env` and `base_url` an empty (or whitespace-only) string clears the override."
+    ),
+    responses(
+        (status = 200, description = "Runtime override applied to the live manifest and persisted to hand_state.json", body = serde_json::Value),
+        (status = 400, description = "Invalid agent id or target agent is not managed by a hand", body = serde_json::Value),
+        (status = 404, description = "Agent not found", body = serde_json::Value),
+        (status = 409, description = "Hand role not found for the agent (hand registry inconsistency)", body = serde_json::Value),
+        (status = 500, description = "Internal kernel error", body = serde_json::Value),
+    )
+)]
+pub async fn patch_hand_agent_runtime_config(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<PatchAgentConfigRequest>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid agent id"})),
+            );
+        }
+    };
+
+    let entry = match state.kernel.agent_registry().get(agent_id) {
+        Some(entry) => entry,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "agent not found"})),
+            );
+        }
+    };
+    if !entry.is_hand {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "agent is not managed by a hand"})),
+        );
+    }
+
+    // Field semantics:
+    // - `model` / `provider`: plain `Option<String>`. Empty string is
+    //   ignored (dashboard sends empty strings for "leave unchanged" on
+    //   free-text inputs); the kernel merges any `Some(value)` onto the
+    //   existing override.
+    // - `api_key_env` / `base_url`: tri-state via `Option<Option<String>>`.
+    //   See `hand_override_nullable_string` for the empty-string = clear
+    //   convention.
+    // - `max_tokens` / `temperature` / `web_search_augmentation`: pass
+    //   through as-is; `None` means "do not change".
+    let override_config = librefang_hands::HandAgentRuntimeOverride {
+        model: req
+            .model
+            .map(|s| s.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        provider: req
+            .provider
+            .map(|s| s.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        api_key_env: hand_override_nullable_string(req.api_key_env),
+        base_url: hand_override_nullable_string(req.base_url),
+        max_tokens: req.max_tokens,
+        temperature: req.temperature,
+        web_search_augmentation: req.web_search_augmentation,
+    };
+
+    match state
+        .kernel
+        .update_hand_agent_runtime_override(agent_id, override_config)
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "agent_id": id})),
+        ),
+        Err(e) => {
+            let (status, msg) = map_hand_runtime_override_err(&e);
+            (status, Json(serde_json::json!({"error": msg})))
+        }
+    }
+}
+
+/// DELETE /api/agents/{id}/hand-runtime-config — Drop all runtime overrides
+/// for the hand agent's role, restoring the live manifest to the HAND.toml
+/// defaults and persisting the cleared state to `hand_state.json`.
+///
+/// Returns 204 No Content on success (idempotent — a second call against an
+/// already-clean role is also 204).
+#[utoipa::path(
+    delete,
+    path = "/api/agents/{id}/hand-runtime-config",
+    tag = "agents",
+    params(("id" = String, Path, description = "Hand agent ID")),
+    responses(
+        (status = 204, description = "Runtime overrides cleared; manifest restored to HAND.toml defaults"),
+        (status = 400, description = "Invalid agent id or target agent is not managed by a hand", body = serde_json::Value),
+        (status = 404, description = "Agent not found", body = serde_json::Value),
+        (status = 409, description = "Hand role not found for the agent (hand registry inconsistency)", body = serde_json::Value),
+        (status = 500, description = "Internal kernel error", body = serde_json::Value),
+    )
+)]
+pub async fn delete_hand_agent_runtime_config(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid agent id"})),
+            )
+                .into_response();
+        }
+    };
+
+    let entry = match state.kernel.agent_registry().get(agent_id) {
+        Some(entry) => entry,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "agent not found"})),
+            )
+                .into_response();
+        }
+    };
+    if !entry.is_hand {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "agent is not managed by a hand"})),
+        )
+            .into_response();
+    }
+
+    match state.kernel.clear_hand_agent_runtime_override(agent_id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            let (status, msg) = map_hand_runtime_override_err(&e);
+            (status, Json(serde_json::json!({"error": msg}))).into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3533,7 +4489,7 @@ pub async fn patch_agent_config(
 
 /// Request body for cloning an agent.
 #[derive(serde::Deserialize, utoipa::ToSchema)]
-pub struct CloneAgentRequest {
+pub(crate) struct CloneAgentRequest {
     pub new_name: String,
     /// Whether to copy skills from the source agent (default: true).
     #[serde(default = "default_clone_true")]
@@ -3584,6 +4540,7 @@ fn skill_assignment_mode(manifest: &librefang_types::agent::AgentManifest) -> &'
         (status = 200, description = "Clone an agent with its workspace files", body = serde_json::Value)
     )
 )]
+#[allow(private_interfaces)]
 pub async fn clone_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -3656,7 +4613,9 @@ pub async fn clone_agent(
             if let (Ok(src_can), Ok(dst_can)) = (src_ws.canonicalize(), dst_ws.canonicalize()) {
                 let src_identity = src_can.join(".identity");
                 let dst_identity = dst_can.join(".identity");
-                let _ = std::fs::create_dir_all(&dst_identity);
+                if let Err(e) = std::fs::create_dir_all(&dst_identity) {
+                    tracing::warn!("Failed to create identity directory for cloned agent: {e}");
+                }
                 for &fname in KNOWN_IDENTITY_FILES {
                     // Source: prefer .identity/ (post-migration), fall back to workspace root
                     let src_file = if src_identity.join(fname).exists() {
@@ -3938,7 +4897,7 @@ pub async fn get_agent_file(
 
 /// Request body for writing a workspace identity file.
 #[derive(serde::Deserialize, utoipa::ToSchema)]
-pub struct SetAgentFileRequest {
+pub(crate) struct SetAgentFileRequest {
     pub content: String,
 }
 
@@ -3956,6 +4915,7 @@ pub struct SetAgentFileRequest {
         (status = 200, description = "Write a workspace identity file", body = serde_json::Value)
     )
 )]
+#[allow(private_interfaces)]
 pub async fn set_agent_file(
     State(state): State<Arc<AppState>>,
     Path((id, filename)): Path<(String, String)>,
@@ -4222,30 +5182,72 @@ const MAX_UPLOAD_SIZE: usize = 10 * 1024 * 1024;
 /// sourced from `librefang_types::media::{ALLOWED_IMAGE_TYPES,
 /// ALLOWED_AUDIO_TYPES}` so the upload endpoint, the channel bridge, and
 /// `MediaAttachment::validate()` can never drift.
-const EXTRA_ALLOWED_UPLOAD_TYPES: &[&str] =
-    &["text/plain", "text/markdown", "text/csv", "application/pdf"];
-
-/// Exact-match MIME allowlist for `/api/agents/{id}/upload`.
 ///
-/// Historically this was the prefix list `["image/", "text/",
-/// "application/pdf", "audio/"]`, which accepted any `image/*` subtype —
-/// including `image/svg+xml` (scriptable → XSS / SSRF via `<use
-/// xlink:href>`), `image/x-icon`, `image/tiff`, `image/heic` — and every
-/// `text/*` subtype including `text/html` and `text/xml`. That
+/// Browsers send a wide variety of `Content-Type` values for the same file
+/// kind (`.json` → `application/json`; `.yaml` → `application/x-yaml` /
+/// `application/yaml`; `.ipynb` → `application/x-ipynb+json` / sometimes
+/// `application/json`), so this list is intentionally exhaustive on the
+/// safe subset.
+const EXTRA_ALLOWED_UPLOAD_TYPES: &[&str] = &[
+    "application/pdf",
+    // Plain text + tables
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+    "text/tab-separated-values",
+    // Structured data
+    "application/json",
+    "application/x-ipynb+json",
+    "application/xml",
+    "application/yaml",
+    "application/x-yaml",
+    "application/toml",
+    "application/x-toml",
+    "application/sql",
+    "application/graphql",
+    // Code (often delivered with these MIMEs)
+    "application/javascript",
+    "application/x-javascript",
+    "application/typescript",
+];
+
+/// MIME allowlist for `/api/agents/{id}/upload`.
+///
+/// Historically this was a permissive prefix list (`image/`, `text/`,
+/// `application/pdf`, `audio/`) which accepted dangerous subtypes like
+/// `image/svg+xml` (scriptable → XSS / SSRF), `text/html` (stored XSS
+/// via downstream renderers), and `text/xml` (XXE / SSRF). That
 /// contradicted the SECURITY.md promise of *"Media type whitelist
 /// (png/jpeg/gif/webp)"*.
 ///
-/// The new check is exact-match against the canonical
-/// `librefang_types::media::ALLOWED_IMAGE_TYPES` +
-/// `ALLOWED_AUDIO_TYPES` constants, so the upload endpoint and
-/// `MediaAttachment::validate()` share a single source of truth and
-/// cannot drift.
+/// The check now combines:
+///   1. Exact match against the canonical media constants
+///      (`ALLOWED_IMAGE_TYPES`, `ALLOWED_AUDIO_TYPES`).
+///   2. Exact match against `EXTRA_ALLOWED_UPLOAD_TYPES` (PDF + curated
+///      text/data/code MIMEs).
+///   3. **Any other `text/*` subtype** EXCEPT `text/html` and `text/xml`.
+///      Browsers tag many code files (`.rs`, `.py`, `.go`, `.sh`, …) as
+///      `text/x-rust`, `text/x-python`, `text/x-shellscript` etc. — those
+///      are safe to inline because the agent loop reads them as plain
+///      UTF-8 and never executes/renders them. HTML/XML stay blocked
+///      because downstream consumers (markdown renderer, XML parsers)
+///      could be tricked into XSS / XXE.
 fn is_allowed_content_type(ct: &str) -> bool {
     use librefang_types::media::{mime_base, ALLOWED_AUDIO_TYPES, ALLOWED_IMAGE_TYPES};
     let base = mime_base(ct);
-    ALLOWED_IMAGE_TYPES.contains(&base.as_str())
+    if ALLOWED_IMAGE_TYPES.contains(&base.as_str())
         || ALLOWED_AUDIO_TYPES.contains(&base.as_str())
         || EXTRA_ALLOWED_UPLOAD_TYPES.contains(&base.as_str())
+    {
+        return true;
+    }
+    if let Some(subtype) = base.strip_prefix("text/") {
+        // Anything text-like is fine to ingest as a plain-text attachment,
+        // except formats that get rendered/parsed by downstream tooling
+        // and could carry an exploit payload.
+        return !matches!(subtype, "html" | "xml");
+    }
+    false
 }
 
 /// POST /api/agents/{id}/upload — Upload a file attachment.
@@ -4692,7 +5694,6 @@ mod tests {
             "text/xml",
             "audio/vnd.rn-realaudio",
             "application/octet-stream",
-            "application/javascript",
         ] {
             assert!(
                 !is_allowed_content_type(bad),
@@ -4733,6 +5734,23 @@ mod tests {
         assert_eq!(req.new_name, "clone-1");
         assert!(req.include_skills);
         assert!(req.include_tools);
+    }
+
+    #[test]
+    fn test_map_hand_runtime_override_err_maps_not_found_and_conflict() {
+        use librefang_kernel::error::KernelError;
+        use librefang_types::error::LibreFangError;
+
+        let not_found =
+            KernelError::LibreFang(LibreFangError::AgentNotFound("missing-agent".to_string()));
+        let (status, _) = map_hand_runtime_override_err(&not_found);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let conflict = KernelError::LibreFang(LibreFangError::Internal(
+            "Hand role not found for agent 123".to_string(),
+        ));
+        let (status, _) = map_hand_runtime_override_err(&conflict);
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[test]
@@ -5284,7 +6302,9 @@ mod monitoring_tests {
             media_drivers: librefang_runtime::media::MediaDriverCache::new(),
             webhook_router: Arc::new(tokio::sync::RwLock::new(Arc::new(axum::Router::new()))),
             api_key_lock: Arc::new(tokio::sync::RwLock::new(String::new())),
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             config_write_lock: tokio::sync::Mutex::new(()),
+            pending_a2a_agents: dashmap::DashMap::new(),
         });
         (state, tmp)
     }

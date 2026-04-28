@@ -81,6 +81,16 @@ let server = axum::serve(listener, app.into_make_service_with_connect_info::<Soc
 
 ## 功能
 
+### 连接屏
+
+桌面 app 无法连到 daemon 时（首次启动、或捆绑的 daemon 起不来），现在会渲染一个**专门的连接屏**，而不是白屏错误。屏幕提供：
+
+- "重试" — 重新尝试连接。
+- "在浏览器打开" — 嵌入 WebView 是问题时回退到 daemon 自带的 web UI。
+- "卸载" — 在 app 内完整移除，daemon 坏到从菜单栏都点不到时有用。
+
+连接屏作为嵌入资源打包，用自定义 URI scheme（`librefang://connection`）渲染而不是经 daemon HTTP — 所以 daemon 停止或 IPC 桥断开时也能跑。Windows / Linux / macOS 走同一路径。
+
 ### 系统托盘
 
 系统托盘（定义在 `src/tray.rs` 中）提供快捷操作，无需打开主窗口：
@@ -427,3 +437,9 @@ crates/librefang-desktop/
 | `RUST_LOG` | 控制日志追踪的详细程度。未设置时默认为 `librefang=info,tauri=info`。 |
 
 其他所有 LibreFang 环境变量（API 密钥、配置等）照常生效，因为桌面应用启动的内核与无头守护进程完全相同。
+
+---
+
+## 移动端（iOS & Android）
+
+桌面应用是移动配对流程的服务端。如需了解远程连接此守护进程的 iOS / Android 轻客户端仪表板，请参阅[移动端](/zh/integrations/mobile)文档。

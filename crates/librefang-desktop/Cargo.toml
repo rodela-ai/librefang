@@ -14,24 +14,35 @@ librefang-api = { path = "../librefang-api", default-features = false }
 librefang-types = { path = "../librefang-types" }
 librefang-extensions = { path = "../librefang-extensions" }
 clap = { workspace = true }
-dirs = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# Shared: works on desktop and mobile.
+# `tauri` appears again in the desktop target block below with extra features —
+# Cargo merges features from both entries; mobile gets the base crate only.
+tauri = { version = "2" }
 tauri-plugin-notification = "2"
-tauri-plugin-shell = "2"
-tauri-plugin-single-instance = "2"
 tauri-plugin-dialog = "2"
-tauri-plugin-global-shortcut = "2"
-tauri-plugin-autostart = "2"
-tauri-plugin-updater = "2"
 serde = { workspace = true }
 toml = { workspace = true }
 open = "5"
+
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+# Desktop-only: adds tray-icon + image-png features on top of the shared `tauri` entry above.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-shell = "2"
+
+[target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
+# Mobile-only plugins
+tauri-plugin-barcode-scanner = "2"
+keyring = "3"
 
 [features]
 default = ["librefang-api/default"]
@@ -39,7 +50,25 @@ all-channels = ["librefang-api/all-channels"]
 mini = ["librefang-api/mini"]
 # Tauri uses custom-protocol in production builds
 custom-protocol = ["tauri/custom-protocol"]
+# Documents the mobile build path (no-op flag, mobile targets are cfg-gated)
+mobile = []
 
 [[bin]]
 name = "librefang-desktop"
 path = "src/main.rs"
+
+# iOS / Android need the crate exposed as a `staticlib` (linked into the
+# native shell by Xcode / Gradle) and a `cdylib` (loaded by the Tauri
+# mobile runtime). `lib` (rlib) is kept so the desktop binary in
+# src/main.rs can still depend on the library normally. Without these
+# extra crate-types, `cargo tauri ios build` fails with
+#   "Library not found at .../liblibrefang_desktop.a"
+#
+# Side effect: desktop builds now also produce the `staticlib` and
+# `cdylib` outputs. That adds a non-trivial link step (~10-20% extra
+# build time on a clean target/) — worth it for a unified workspace,
+# but if the desktop build ever feels slow this is one place to look.
+# Cargo doesn't let us conditionalize crate-type on `cfg(mobile)` at
+# the manifest layer, so we accept the cost.
+[lib]
+crate-type = ["staticlib", "cdylib", "lib"]

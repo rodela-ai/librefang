@@ -48,6 +48,7 @@ class LibreFang {
     this.skills = new SkillsResource(this);
     this.system = new SystemResource(this);
     this.tools = new ToolsResource(this);
+    this.users = new UsersResource(this);
     this.webhooks = new WebhooksResource(this);
     this.workflows = new WorkflowsResource(this);
   }
@@ -200,6 +201,14 @@ class AgentsResource {
     return this._c._request("DELETE", `/api/agents/${id}/files/${filename}`);
   }
 
+  async deleteHandAgentRuntimeConfig(id) {
+    return this._c._request("DELETE", `/api/agents/${id}/hand-runtime-config`);
+  }
+
+  async patchHandAgentRuntimeConfig(id, data) {
+    return this._c._request("PATCH", `/api/agents/${id}/hand-runtime-config`, data, undefined);
+  }
+
   async clearAgentHistory(id) {
     return this._c._request("DELETE", `/api/agents/${id}/history`);
   }
@@ -232,8 +241,12 @@ class AgentsResource {
     return this._c._request("PUT", `/api/agents/${id}/model`, data, undefined);
   }
 
-  async getAgentSession(id) {
-    return this._c._request("GET", `/api/agents/${id}/session`);
+  async listAgentRuntime(id) {
+    return this._c._request("GET", `/api/agents/${id}/runtime`);
+  }
+
+  async getAgentSession(id, query) {
+    return this._c._request("GET", `/api/agents/${id}/session`, undefined, query);
   }
 
   async compactSession(id) {
@@ -264,8 +277,20 @@ class AgentsResource {
     return this._c._request("GET", `/api/agents/${id}/sessions/${session_id}/export`);
   }
 
+  async stopSession(id, session_id) {
+    return this._c._request("POST", `/api/agents/${id}/sessions/${session_id}/stop`);
+  }
+
+  async *attachSessionStream(id, session_id) {
+    yield* this._c._stream("GET", `/api/agents/${id}/sessions/${session_id}/stream`);
+  }
+
   async switchAgentSession(id, session_id) {
     return this._c._request("POST", `/api/agents/${id}/sessions/${session_id}/switch`);
+  }
+
+  async exportSessionTrajectory(id, session_id, query) {
+    return this._c._request("GET", `/api/agents/${id}/sessions/${session_id}/trajectory`, undefined, query);
   }
 
   async getAgentSkills(id) {
@@ -410,6 +435,14 @@ class BudgetResource {
 
   async updateAgentBudget(id, data) {
     return this._c._request("PUT", `/api/budget/agents/${id}`, data, undefined);
+  }
+
+  async userBudgetRanking(query) {
+    return this._c._request("GET", "/api/budget/users", undefined, query);
+  }
+
+  async userBudgetDetail(user_id) {
+    return this._c._request("GET", `/api/budget/users/${user_id}`);
   }
 
   async usageStats() {
@@ -602,6 +635,10 @@ class McpResource {
 
   async reconnectMcpServerHandler(name) {
     return this._c._request("POST", `/api/mcp/servers/${name}/reconnect`);
+  }
+
+  async listMcpTaintRules() {
+    return this._c._request("GET", "/api/mcp/taint-rules");
   }
 }
 
@@ -944,6 +981,14 @@ class SkillsResource {
 class SystemResource {
   constructor(client) { this._c = client; }
 
+  async auditExport(query) {
+    return this._c._request("GET", "/api/audit/export", undefined, query);
+  }
+
+  async auditQuery(query) {
+    return this._c._request("GET", "/api/audit/query", undefined, query);
+  }
+
   async auditRecent() {
     return this._c._request("GET", "/api/audit/recent");
   }
@@ -1084,6 +1129,40 @@ class ToolsResource {
 
   async invokeTool(name, data, query) {
     return this._c._request("POST", `/api/tools/${name}/invoke`, data, query);
+  }
+}
+
+// ── Users Resource
+
+class UsersResource {
+  constructor(client) { this._c = client; }
+
+  async listUsers() {
+    return this._c._request("GET", "/api/users");
+  }
+
+  async createUser(data) {
+    return this._c._request("POST", "/api/users", data, undefined);
+  }
+
+  async importUsers(data) {
+    return this._c._request("POST", "/api/users/import", data, undefined);
+  }
+
+  async getUser(name) {
+    return this._c._request("GET", `/api/users/${name}`);
+  }
+
+  async updateUser(name, data) {
+    return this._c._request("PUT", `/api/users/${name}`, data, undefined);
+  }
+
+  async deleteUser(name) {
+    return this._c._request("DELETE", `/api/users/${name}`);
+  }
+
+  async rotateUserKey(name) {
+    return this._c._request("POST", `/api/users/${name}/rotate-key`);
   }
 }
 

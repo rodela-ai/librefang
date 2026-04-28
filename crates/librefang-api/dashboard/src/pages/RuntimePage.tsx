@@ -37,6 +37,7 @@ import {
   useCleanupSessions,
 } from "../lib/mutations/runtime";
 import { useReloadConfig } from "../lib/mutations/config";
+import { StaggerList } from "../components/ui/StaggerList";
 
 const OK_STATUSES = new Set(["ok", "pass", "healthy"]);
 
@@ -212,9 +213,9 @@ export function RuntimePage() {
       />
 
       {snapshotQuery.isLoading ? (
-        <div className="grid gap-4 grid-cols-2 md:grid-cols-4 stagger-children">
+        <StaggerList className="grid gap-4 grid-cols-2 md:grid-cols-4">
           {[1, 2, 3, 4].map(i => <CardSkeleton key={i} />)}
-        </div>
+        </StaggerList>
       ) : snapshotQuery.isError || healthDetailQuery.isError || securityQuery.isError ? (
         // Only gate whole page on primary overview/security sources; audit, backups, and task queues can fail independently.
         <Card padding="lg">
@@ -232,7 +233,7 @@ export function RuntimePage() {
       ) : (
         <>
           {/* ── KPI Cards ── */}
-          <div className="grid grid-cols-2 gap-2 sm:gap-4 md:grid-cols-4 stagger-children">
+          <StaggerList className="grid grid-cols-2 gap-2 sm:gap-4 md:grid-cols-4">
             {kpiCards.map((kpi, i) => (
               <Card key={i} hover padding="md">
                 <div className="flex items-center justify-between">
@@ -244,10 +245,10 @@ export function RuntimePage() {
                 <p className={`text-2xl sm:text-3xl font-black tracking-tight mt-1 sm:mt-2 ${kpi.color}`}>{kpi.value}</p>
               </Card>
             ))}
-          </div>
+          </StaggerList>
 
           {/* ── Engine Info + Runtime Config ── */}
-          <div className="grid gap-3 sm:gap-6 md:grid-cols-2 stagger-children">
+          <StaggerList className="grid gap-3 sm:gap-6 md:grid-cols-2">
             <Card padding="lg">
               <div className="flex items-center gap-2 mb-5">
                 <div className="w-8 h-8 rounded-lg bg-brand/10 flex items-center justify-center"><Cpu className="h-4 w-4 text-brand" /></div>
@@ -283,10 +284,10 @@ export function RuntimePage() {
                 } />
               </div>
             </Card>
-          </div>
+          </StaggerList>
 
           {/* ── Health Detail + Security Posture ── */}
-          <div className="grid gap-3 sm:gap-6 md:grid-cols-2 stagger-children">
+          <StaggerList className="grid gap-3 sm:gap-6 md:grid-cols-2">
             {/* Health Detail */}
             <Card padding="lg">
               <div className="flex items-center gap-2 mb-5">
@@ -427,10 +428,10 @@ export function RuntimePage() {
                 <p className="text-xs text-text-dim">{t("common.loading")}</p>
               )}
             </Card>
-          </div>
+          </StaggerList>
 
           {/* ── Task Queue + Audit Trail ── */}
-          <div className="grid gap-3 sm:gap-6 md:grid-cols-2 stagger-children">
+          <StaggerList className="grid gap-3 sm:gap-6 md:grid-cols-2">
             {/* Task Queue */}
             <Card padding="lg">
               <div className="flex items-center gap-2 mb-5">
@@ -512,6 +513,35 @@ export function RuntimePage() {
                       <p className="text-[9px] text-text-dim uppercase">{t("runtime.task_ttl")}</p>
                     </div>
                   </div>
+                  {queueConfig.concurrency ? (
+                    <div className="mt-3 pt-3 border-t border-border-subtle/60">
+                      <p className="text-[10px] font-bold uppercase tracking-wider text-text-dim/50 mb-2">
+                        {t("runtime.queue_concurrency", { defaultValue: "Lane Caps & Per-Agent Default" })}
+                      </p>
+                      <div className="grid grid-cols-5 gap-2 text-center">
+                        <div title={t("runtime.main_lane_help", { defaultValue: "User messages bridged from channels" })}>
+                          <p className="text-base font-black text-brand">{queueConfig.concurrency.main_lane ?? "-"}</p>
+                          <p className="text-[8px] text-text-dim uppercase leading-tight">main</p>
+                        </div>
+                        <div title={t("runtime.cron_lane_help", { defaultValue: "Scheduled cron job dispatch" })}>
+                          <p className="text-base font-black text-brand">{queueConfig.concurrency.cron_lane ?? "-"}</p>
+                          <p className="text-[8px] text-text-dim uppercase leading-tight">cron</p>
+                        </div>
+                        <div title={t("runtime.subagent_lane_help", { defaultValue: "Spawned child agents (agent_send)" })}>
+                          <p className="text-base font-black text-brand">{queueConfig.concurrency.subagent_lane ?? "-"}</p>
+                          <p className="text-[8px] text-text-dim uppercase leading-tight">subagent</p>
+                        </div>
+                        <div title={t("runtime.trigger_lane_help", { defaultValue: "Event-trigger dispatches (TaskPosted, MessageReceived, …)" })}>
+                          <p className="text-base font-black text-brand">{queueConfig.concurrency.trigger_lane ?? "-"}</p>
+                          <p className="text-[8px] text-text-dim uppercase leading-tight">trigger</p>
+                        </div>
+                        <div title={t("runtime.default_per_agent_help", { defaultValue: "Per-agent fallback when manifest omits max_concurrent_invocations" })}>
+                          <p className="text-base font-black text-warning">{queueConfig.concurrency.default_per_agent ?? "-"}</p>
+                          <p className="text-[8px] text-text-dim uppercase leading-tight">per-agent</p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
             </Card>
@@ -625,10 +655,10 @@ export function RuntimePage() {
                 </Button>
               </div>
             </Card>
-          </div>
+          </StaggerList>
 
           {/* ── Backups + Resource Summary ── */}
-          <div className="grid gap-3 sm:gap-6 md:grid-cols-2 stagger-children">
+          <StaggerList className="grid gap-3 sm:gap-6 md:grid-cols-2">
             {/* Backup Management */}
             <Card padding="lg">
               <div className="flex items-center gap-2 mb-5">
@@ -714,7 +744,7 @@ export function RuntimePage() {
                 <Badge variant="success">{t("status.nominal")}</Badge>
               </div>
             </Card>
-          </div>
+          </StaggerList>
 
           {/* ── Server Control ── */}
           <Card padding="lg">

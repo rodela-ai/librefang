@@ -52,6 +52,7 @@ Complete reference for `config.toml`, covering every configurable field in the L
   - [\[oauth\]](#oauth)
   - [\[auth\_profiles\]](#auth_profiles)
   - [\[tool\_policy\]](#tool_policy)
+  - [\[tool\_timeouts\]](#tool_timeouts)
   - [\[proactive\_memory\]](#proactive_memory)
   - [\[context\_engine\]](#context_engine)
   - [\[audit\]](#audit)
@@ -154,6 +155,7 @@ usage_footer = "full"                 # off | tokens | cost | full
 prompt_caching = true                 # Enable LLM prompt caching
 stable_prefix_mode = false            # Reduce prompt cache invalidation
 max_cron_jobs = 500                   # Global max cron jobs
+tool_timeout_secs = 300               # Global timeout for all tools (seconds)
 cors_origin = []                      # CORS allowed origins
 include = []                          # Config file includes
 
@@ -166,6 +168,13 @@ include = []                          # Config file includes
 [provider_regions]
 # qwen = "intl"        # Use Qwen international endpoint (dashscope-intl)
 # minimax = "china"    # Use MiniMax China endpoint (MINIMAX_CN_API_KEY)
+
+# --- Tool Timeouts ---
+[tool_timeouts]
+agent_send = 600                       # Override for agent_send tool
+agent_spawn = 600                      # Override for agent_spawn tool
+"mcp_browser_*" = 900                  # Glob pattern for browser MCP tools
+shell_exec = 300                       # Override for shell_exec tool
 
 # --- Default LLM Provider ---
 [default_model]
@@ -501,6 +510,8 @@ These fields sit at the root of `config.toml` (not inside any `[section]`).
 | `provider_urls` | map of string→string | `{}` | Provider base URL overrides. Maps provider ID to custom base URL (e.g., `ollama = "http://192.168.1.100:11434/v1"`). Useful for self-hosted or proxied endpoints. |
 | `provider_api_keys` | map of string→string | `{}` | Provider API key env var overrides. Maps provider ID to the name of an environment variable holding the key (e.g., `nvidia = "NVIDIA_API_KEY"`). When not set for a provider, the convention `{PROVIDER_UPPER}_API_KEY` is used. |
 | `provider_regions` | map of string→string | `{}` | Provider region selection. Maps provider ID to a region name defined in the provider's registry TOML (e.g., `qwen = "intl"`). Overrides the provider's base URL and optionally its API key env var. Applied before `provider_urls` (lower priority). |
+| `tool_timeout_secs` | u64 | `300` | Global timeout in seconds for all tool executions. Can be overridden per-tool via `[tool_timeouts]` section. |
+| `tool_timeouts` | map of string→u64 | `{}` | Per-tool timeout overrides. Keys are exact tool names or glob patterns. See `[tool_timeouts]` section for details. |
 
 **`mode` values:**
 
@@ -953,6 +964,7 @@ allowed_senders = []
 [channels.teams]
 app_id = ""
 app_password_env = "TEAMS_APP_PASSWORD"
+security_token_env = "TEAMS_SECURITY_TOKEN"
 webhook_port = 3978
 allowed_tenants = []
 ```
@@ -961,6 +973,7 @@ allowed_tenants = []
 |-------|------|---------|-------------|
 | `app_id` | string | `""` | Azure Bot App ID. |
 | `app_password_env` | string | `"TEAMS_APP_PASSWORD"` | Env var holding the Azure Bot Framework app password. |
+| `security_token_env` | string | `"TEAMS_SECURITY_TOKEN"` | Env var holding the **outgoing webhook security token** (base64-encoded, copied from the Teams portal). Used for HMAC-SHA256 verification of every inbound `Authorization: HMAC <…>` header. If unset or non-base64, signature verification is skipped and a warning is logged once at startup — production should always set this. |
 | `webhook_port` | u16 | `3978` | Port for the Bot Framework incoming webhook. |
 | `allowed_tenants` | list of strings | `[]` | Azure AD tenant IDs allowed. Empty = allow all. |
 | `default_agent` | string or null | `null` | Agent name to route messages to. |
@@ -1102,7 +1115,7 @@ webhook_port = 8450
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `channel_secret_env` | string | `"LINE_CHANNEL_SECRET"` | Env var holding the LINE channel secret. |
+| `channel_secret_env` | string | `"LINE_CHANNEL_SECRET"` | Env var holding the LINE channel secret. **Required** — every inbound webhook must carry a matching `X-Line-Signature`; missing → 400, mismatched → 401. |
 | `access_token_env` | string | `"LINE_CHANNEL_ACCESS_TOKEN"` | Env var holding the LINE channel access token. |
 | `webhook_port` | u16 | `8450` | Port for the incoming webhook. |
 | `default_agent` | string or null | `null` | Agent name to route messages to. |
@@ -1118,7 +1131,7 @@ webhook_port = 8451
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `auth_token_env` | string | `"VIBER_AUTH_TOKEN"` | Env var holding the Viber Bot auth token. |
+| `auth_token_env` | string | `"VIBER_AUTH_TOKEN"` | Env var holding the Viber Bot auth token. **Required** — also used as the HMAC-SHA256 key to verify every inbound `X-Viber-Content-Signature`; missing → 400, mismatched → 401. |
 | `webhook_url` | string | `""` | Public URL for the Viber webhook endpoint. |
 | `webhook_port` | u16 | `8451` | Port for the incoming webhook. |
 | `default_agent` | string or null | `null` | Agent name to route messages to. |
@@ -1129,6 +1142,7 @@ webhook_port = 8451
 [channels.messenger]
 page_token_env = "MESSENGER_PAGE_TOKEN"
 verify_token_env = "MESSENGER_VERIFY_TOKEN"
+app_secret_env = "MESSENGER_APP_SECRET"
 webhook_port = 8452
 ```
 
@@ -1136,6 +1150,7 @@ webhook_port = 8452
 |-------|------|---------|-------------|
 | `page_token_env` | string | `"MESSENGER_PAGE_TOKEN"` | Env var holding the Facebook page access token. |
 | `verify_token_env` | string | `"MESSENGER_VERIFY_TOKEN"` | Env var holding the webhook verify token. |
+| `app_secret_env` | string | `"MESSENGER_APP_SECRET"` | Env var holding the **Facebook App Secret**. Used for HMAC-SHA1 verification of every inbound `X-Hub-Signature` header. If unset, signature verification is skipped and a warning is logged once at startup — production should always set this. |
 | `webhook_port` | u16 | `8452` | Port for the incoming webhook. |
 | `default_agent` | string or null | `null` | Agent name to route messages to. |
 
@@ -1398,7 +1413,7 @@ webhook_port = 8457
 | `app_key_env` | string | `"DINGTALK_APP_KEY"` | Env var holding the DingTalk App Key (stream mode). |
 | `app_secret_env` | string | `"DINGTALK_APP_SECRET"` | Env var holding the DingTalk App Secret (stream mode). |
 | `access_token_env` | string | `"DINGTALK_ACCESS_TOKEN"` | Env var holding the DingTalk webhook access token (webhook mode). |
-| `secret_env` | string | `"DINGTALK_SECRET"` | Env var holding the DingTalk signing secret (webhook mode). |
+| `secret_env` | string | `"DINGTALK_SECRET"` | Env var holding the DingTalk signing secret (webhook mode). **Required** — webhook mode rejects requests without a numeric `timestamp` header (400), with a stale or mismatched signature (401). |
 | `webhook_port` | u16 | `8457` | Port for the incoming webhook (webhook mode only). |
 | `robot_code` | string or null | `null` | Robot code for stream mode replies (defaults to app_key). |
 | `default_agent` | string or null | `null` | Agent name to route messages to. |
@@ -1480,7 +1495,7 @@ listen_port = 8460
 |-------|------|---------|-------------|
 | `secret_env` | string | `"WEBHOOK_SECRET"` | Env var holding the HMAC signing secret for verifying incoming webhooks. |
 | `listen_port` | u16 | `8460` | Port to listen for incoming webhook requests. |
-| `callback_url` | string or null | `null` | URL to POST outgoing messages to. |
+| `callback_url` | string or null | `null` | URL to POST outgoing messages to. **SSRF-guarded:** the daemon refuses to start the adapter if this resolves to a private, loopback, link-local, multicast, or cloud-metadata range (e.g. `127.0.0.1`, `10.0.0.1`, `169.254.169.254`, `[::1]`, `[::ffff:127.0.0.1]`). Public hostnames only. |
 | `default_agent` | string or null | `null` | Agent name to route messages to. |
 
 #### `[channels.linkedin]`
@@ -2603,6 +2618,35 @@ tools = ["web_search", "web_fetch"]
 |-------|------|-------------|
 | `name` | string | Group name (e.g., `"web_tools"`, `"code_tools"`). |
 | `tools` | list of strings | Tool name patterns included in this group. |
+
+---
+
+### `[tool_timeouts]`
+
+Configures per-tool execution timeouts. The global default timeout applies to all tools unless overridden by exact name or glob pattern.
+
+```toml
+# Global default timeout for all tools (seconds)
+tool_timeout_secs = 300
+
+# Per-tool timeout overrides (exact match or glob pattern)
+[tool_timeouts]
+agent_send = 600
+agent_spawn = 600
+"mcp_browser_*" = 900
+shell_exec = 300
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tool_timeout_secs` | u64 | `300` | Global timeout in seconds for all tool executions. Increase for browser automation or long-running builds. |
+| `tool_timeouts` | map of string→u64 | `{}` | Per-tool timeout overrides. Keys are exact tool names or glob patterns (e.g., `"mcp_browser_*"`). Exact matches take priority over glob patterns; among globs, the longest matching pattern wins (most specific first). Falls back to `tool_timeout_secs` when no entry matches. |
+
+**Resolution order:**
+
+1. Exact tool name match in `tool_timeouts`
+2. Longest matching glob pattern in `tool_timeouts`
+3. Global `tool_timeout_secs`
 
 ---
 

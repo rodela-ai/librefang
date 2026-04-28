@@ -1,12 +1,16 @@
 import { formatTime } from "../lib/datetime";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { AnimatePresence, motion } from "motion/react";
+import { fadeInScale } from "../lib/motion";
+import { StaggerList } from "../components/ui/StaggerList";
 import { sendA2ATask, getA2ATaskStatus } from "../lib/http/client";
 import type { A2AAgentItem, A2ATaskStatus } from "../lib/http/client";
 import { useA2AAgents } from "../lib/queries/network";
 import { useDiscoverA2AAgent } from "../lib/mutations/network";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Card } from "../components/ui/Card";
+import { DrawerPanel } from "../components/ui/DrawerPanel";
 import { Badge } from "../components/ui/Badge";
 import { EmptyState } from "../components/ui/EmptyState";
 import { CardSkeleton } from "../components/ui/Skeleton";
@@ -100,8 +104,10 @@ export function A2APage() {
       />
 
       {/* Discover overlay */}
+      <AnimatePresence>
       {showDiscover && (
-        <Card padding="md" className="animate-fade-in-scale">
+        <motion.div variants={fadeInScale} initial="initial" animate="animate" exit="exit">
+        <Card padding="md">
           <h3 className="text-sm font-black mb-3">{t("a2a.discover_agent")}</h3>
           <div className="flex flex-col sm:flex-row gap-3">
             <input
@@ -126,7 +132,9 @@ export function A2APage() {
             </button>
           </div>
         </Card>
+        </motion.div>
       )}
+      </AnimatePresence>
 
       {agentsQuery.isLoading ? (
         <div className="grid gap-4 md:grid-cols-2">
@@ -158,7 +166,7 @@ export function A2APage() {
                 }
               />
             ) : (
-              <div className="grid gap-3 md:grid-cols-2 stagger-children">
+              <StaggerList className="grid gap-3 md:grid-cols-2">
                 {agents.map((agent, idx) => (
                   <Card key={agent.url || idx} hover padding="md">
                     <div className="flex items-start justify-between">
@@ -201,52 +209,54 @@ export function A2APage() {
                     </div>
                   </Card>
                 ))}
-              </div>
+              </StaggerList>
             )}
           </div>
 
-          {/* Send task modal */}
+          {/* Send task panel */}
           {taskAgent && (
-            <div className="fixed inset-0 z-[200] flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setTaskAgent(null)}>
-              <div className="w-full sm:max-w-lg sm:mx-4 animate-fade-in-scale" onClick={(e) => e.stopPropagation()}>
-                <Card padding="lg">
-                  <h3 className="text-lg font-black mb-1">{t("a2a.send_task")}</h3>
-                  <p className="text-xs text-text-dim mb-4">
-                    {t("a2a.send_to")} <span className="font-bold text-brand">{taskAgent.name || taskAgent.url}</span>
-                  </p>
-                  <textarea
-                    value={taskMessage}
-                    onChange={(e) => setTaskMessage(e.target.value)}
-                    placeholder={t("a2a.task_placeholder")}
-                    rows={4}
-                    className="w-full rounded-xl border border-border-subtle bg-main px-4 py-3 text-sm focus:border-brand focus:ring-2 focus:ring-brand/10 outline-none resize-none"
-                  />
-                  <div className="flex justify-end gap-3 mt-4">
-                    <button
-                      onClick={() => setTaskAgent(null)}
-                      className="px-4 py-2 rounded-xl text-sm font-bold text-text-dim hover:bg-surface-hover transition-colors"
-                    >
-                      {t("common.cancel")}
-                    </button>
-                    <button
-                      onClick={handleSendTask}
-                      disabled={isSending || !taskMessage.trim()}
-                      className="flex items-center gap-2 rounded-xl bg-brand px-5 py-2 text-sm font-bold text-white hover:bg-brand/90 disabled:opacity-40 transition-colors"
-                    >
-                      {isSending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                      {t("a2a.send")}
-                    </button>
-                  </div>
-                </Card>
+            <DrawerPanel
+              isOpen
+              onClose={() => setTaskAgent(null)}
+              size="lg"
+              title={t("a2a.send_task")}
+            >
+              <div className="p-5 space-y-4">
+                <p className="text-xs text-text-dim">
+                  {t("a2a.send_to")} <span className="font-bold text-brand">{taskAgent.name || taskAgent.url}</span>
+                </p>
+                <textarea
+                  value={taskMessage}
+                  onChange={(e) => setTaskMessage(e.target.value)}
+                  placeholder={t("a2a.task_placeholder")}
+                  rows={4}
+                  className="w-full rounded-xl border border-border-subtle bg-main px-4 py-3 text-sm focus:border-brand focus:ring-2 focus:ring-brand/10 outline-none resize-none"
+                />
+                <div className="flex justify-end gap-3">
+                  <button
+                    onClick={() => setTaskAgent(null)}
+                    className="px-4 py-2 rounded-xl text-sm font-bold text-text-dim hover:bg-surface-hover transition-colors"
+                  >
+                    {t("common.cancel")}
+                  </button>
+                  <button
+                    onClick={handleSendTask}
+                    disabled={isSending || !taskMessage.trim()}
+                    className="flex items-center gap-2 rounded-xl bg-brand px-5 py-2 text-sm font-bold text-white hover:bg-brand/90 disabled:opacity-40 transition-colors"
+                  >
+                    {isSending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                    {t("a2a.send")}
+                  </button>
+                </div>
               </div>
-            </div>
+            </DrawerPanel>
           )}
 
           {/* Tracked tasks */}
           {trackedTasks.length > 0 && (
             <div>
               <h2 className="text-lg font-black tracking-tight mb-4">{t("a2a.tracked_tasks")}</h2>
-              <div className="space-y-2 stagger-children">
+              <StaggerList className="space-y-2">
                 {trackedTasks.map((task) => (
                   <Card key={task.id} padding="sm">
                     <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
@@ -291,7 +301,7 @@ export function A2APage() {
                     )}
                   </Card>
                 ))}
-              </div>
+              </StaggerList>
             </div>
           )}
         </>

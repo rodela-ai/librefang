@@ -1,7 +1,7 @@
 //! Metering engine — tracks LLM cost and enforces spending quotas.
 
 use librefang_memory::usage::{ModelUsage, UsageRecord, UsageStore, UsageSummary};
-use librefang_types::agent::{AgentId, ResourceQuota};
+use librefang_types::agent::{AgentId, ResourceQuota, UserId};
 use librefang_types::error::{LibreFangError, LibreFangResult};
 use librefang_types::model_catalog::ModelCatalogEntry;
 use std::sync::Arc;
@@ -397,6 +397,56 @@ impl MeteringEngine {
         Ok(())
     }
 
+    /// RBAC M5: check a per-user spending budget.
+    ///
+    /// Post-call: invoked AFTER `check_all_and_record` succeeds (the cost
+    /// of the just-finished call is already in the rolled-up totals
+    /// returned by `query_user_*`). Mirrors the global / per-agent /
+    /// per-provider semantics — the LLM call already happened, so
+    /// "exceeded" means the *next* call from this user must be denied,
+    /// not that the current one is rolled back.
+    ///
+    /// Each window with a `0.0` limit is treated as unlimited and
+    /// skipped. Returns `QuotaExceeded` when any non-zero window has
+    /// already been crossed.
+    pub fn check_user_budget(
+        &self,
+        user_id: UserId,
+        budget: &librefang_types::config::UserBudgetConfig,
+    ) -> LibreFangResult<()> {
+        if budget.max_hourly_usd > 0.0 {
+            let cost = self.store.query_user_hourly(user_id)?;
+            if cost >= budget.max_hourly_usd {
+                return Err(LibreFangError::QuotaExceeded(format!(
+                    "User {} exceeded hourly cost budget: ${:.4} / ${:.4}",
+                    user_id, cost, budget.max_hourly_usd
+                )));
+            }
+        }
+
+        if budget.max_daily_usd > 0.0 {
+            let cost = self.store.query_user_daily(user_id)?;
+            if cost >= budget.max_daily_usd {
+                return Err(LibreFangError::QuotaExceeded(format!(
+                    "User {} exceeded daily cost budget: ${:.4} / ${:.4}",
+                    user_id, cost, budget.max_daily_usd
+                )));
+            }
+        }
+
+        if budget.max_monthly_usd > 0.0 {
+            let cost = self.store.query_user_monthly(user_id)?;
+            if cost >= budget.max_monthly_usd {
+                return Err(LibreFangError::QuotaExceeded(format!(
+                    "User {} exceeded monthly cost budget: ${:.4} / ${:.4}",
+                    user_id, cost, budget.max_monthly_usd
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Clean up old usage records.
     pub fn cleanup(&self, days: u32) -> LibreFangResult<usize> {
         self.store.cleanup_old(days)
@@ -483,6 +533,7 @@ mod tests {
                 cost_usd: 0.001,
                 tool_calls: 0,
                 latency_ms: 150,
+                ..Default::default()
             })
             .unwrap();
 
@@ -508,6 +559,7 @@ mod tests {
                 cost_usd: 0.05,
                 tool_calls: 0,
                 latency_ms: 300,
+                ..Default::default()
             })
             .unwrap();
 
@@ -537,6 +589,7 @@ mod tests {
                 cost_usd: 100.0,
                 tool_calls: 0,
                 latency_ms: 500,
+                ..Default::default()
             })
             .unwrap();
 
@@ -549,13 +602,45 @@ mod tests {
         assert!((cost - 4.0).abs() < 0.01); // $1.00 + $3.00
     }
 
+    /// Build a synthetic two-entry catalog (canonical id + alias) so the
+    /// next two tests don't depend on registry state. They previously
+    /// hardcoded a specific Sonnet version id against the live catalog
+    /// and broke the moment the registry retired it — same anti-pattern
+    /// the `_chatgpt_zero_price_*` test already moved away from.
+    fn synthetic_priced_catalog() -> librefang_runtime::model_catalog::ModelCatalog {
+        use librefang_types::model_catalog::{ModelCatalogEntry, ModelCatalogFile, ModelTier};
+        let mut catalog = librefang_runtime::model_catalog::ModelCatalog::new_from_dir(
+            &std::path::PathBuf::from("/nonexistent"),
+        );
+        catalog.merge_catalog_file(ModelCatalogFile {
+            provider: None,
+            models: vec![ModelCatalogEntry {
+                id: "synthetic-priced-frontier".to_string(),
+                display_name: "Synthetic Priced Frontier".to_string(),
+                provider: "anthropic".to_string(),
+                tier: ModelTier::Smart,
+                context_window: 200_000,
+                max_output_tokens: 64_000,
+                input_cost_per_m: 3.0,
+                output_cost_per_m: 15.0,
+                supports_tools: true,
+                supports_vision: true,
+                supports_streaming: true,
+                supports_thinking: false,
+                aliases: vec!["synthetic-priced-alias".to_string()],
+                ..Default::default()
+            }],
+        });
+        catalog
+    }
+
     #[test]
     fn test_estimate_cost_with_catalog() {
-        let catalog = test_catalog();
-        // Sonnet: $3/M input, $15/M output
+        let catalog = synthetic_priced_catalog();
+        // 1M input * $3/M + 1M output * $15/M = $18.
         let cost = MeteringEngine::estimate_cost_with_catalog(
             &catalog,
-            "claude-sonnet-4-20250514",
+            "synthetic-priced-frontier",
             1_000_000,
             1_000_000,
             0,
@@ -566,10 +651,15 @@ mod tests {
 
     #[test]
     fn test_estimate_cost_with_catalog_alias() {
-        let catalog = test_catalog();
-        // "sonnet" alias should resolve to same pricing
+        let catalog = synthetic_priced_catalog();
+        // Alias should resolve to the same pricing as the canonical id.
         let cost = MeteringEngine::estimate_cost_with_catalog(
-            &catalog, "sonnet", 1_000_000, 1_000_000, 0, 0,
+            &catalog,
+            "synthetic-priced-alias",
+            1_000_000,
+            1_000_000,
+            0,
+            0,
         );
         assert!((cost - 18.0).abs() < 0.01);
     }
@@ -613,6 +703,7 @@ mod tests {
                 supports_streaming: true,
                 supports_thinking: false,
                 aliases: vec![],
+                ..Default::default()
             }],
         });
         let cost = MeteringEngine::estimate_cost_with_catalog(
@@ -654,11 +745,11 @@ mod tests {
         // Output: 1M * $3/M = $3.00
         // Total = $3.55
         let cost = MeteringEngine::estimate_cost(
-            "claude-sonnet-4-20250514",
-            1_000_000, // total input
-            1_000_000, // output
-            500_000,   // cache_read
-            0,         // cache_creation
+            "test-model", // estimate_cost is catalog-agnostic; id is just a label
+            1_000_000,    // total input
+            1_000_000,    // output
+            500_000,      // cache_read
+            0,            // cache_creation
         );
         assert!((cost - 3.55).abs() < 0.01);
     }
@@ -672,11 +763,11 @@ mod tests {
         // Output: 1M * $3/M = $3.00
         // Total = $4.05
         let cost = MeteringEngine::estimate_cost(
-            "claude-sonnet-4-20250514",
-            1_000_000, // total input
-            1_000_000, // output
-            0,         // cache_read
-            200_000,   // cache_creation
+            "test-model", // estimate_cost is catalog-agnostic; id is just a label
+            1_000_000,    // total input
+            1_000_000,    // output
+            0,            // cache_read
+            200_000,      // cache_creation
         );
         assert!((cost - 4.05).abs() < 0.01);
     }
@@ -691,11 +782,11 @@ mod tests {
         // Output: 1M * $3/M = $3.00
         // Total = $3.665
         let cost = MeteringEngine::estimate_cost(
-            "claude-sonnet-4-20250514",
-            1_000_000, // total input
-            1_000_000, // output
-            400_000,   // cache_read
-            100_000,   // cache_creation
+            "test-model", // estimate_cost is catalog-agnostic; id is just a label
+            1_000_000,    // total input
+            1_000_000,    // output
+            400_000,      // cache_read
+            100_000,      // cache_creation
         );
         assert!((cost - 3.665).abs() < 0.01);
     }
@@ -704,7 +795,8 @@ mod tests {
     fn test_estimate_cost_zero_cache_matches_no_cache() {
         // estimate_cost uses default rates: $1/M input, $3/M output
         // With zero cache tokens, should match the original behavior
-        let cost_with_cache = MeteringEngine::estimate_cost("gpt-4o", 1_000_000, 1_000_000, 0, 0);
+        let cost_with_cache =
+            MeteringEngine::estimate_cost("test-model", 1_000_000, 1_000_000, 0, 0);
         let expected = 4.00; // $1.00 + $3.00
         assert!((cost_with_cache - expected).abs() < 0.01);
     }
@@ -724,6 +816,7 @@ mod tests {
                 cost_usd: 0.005,
                 tool_calls: 3,
                 latency_ms: 100,
+                ..Default::default()
             })
             .unwrap();
 
@@ -745,6 +838,7 @@ mod tests {
                 cost_usd: cost,
                 tool_calls: 0,
                 latency_ms: 50,
+                ..Default::default()
             })
             .unwrap();
     }
@@ -850,6 +944,7 @@ mod tests {
             cost_usd: 0.10,
             tool_calls: 0,
             latency_ms: 10,
+            ..Default::default()
         };
         let err = engine
             .check_all_and_record(&record, &quota, &budget)
@@ -890,9 +985,100 @@ mod tests {
             cost_usd: 0.0,
             tool_calls: 0,
             latency_ms: 10,
+            ..Default::default()
         };
         assert!(engine
             .check_all_and_record(&record, &quota, &budget)
             .is_ok());
+    }
+
+    // ── RBAC M5: per-user budget enforcement ─────────────────────────
+
+    #[test]
+    fn test_check_user_budget_under_limit_passes() {
+        let engine = setup();
+        let alice = UserId::from_name("Alice");
+        engine
+            .record(&UsageRecord {
+                agent_id: AgentId::new(),
+                cost_usd: 0.10,
+                user_id: Some(alice),
+                ..Default::default()
+            })
+            .unwrap();
+        let budget = librefang_types::config::UserBudgetConfig {
+            max_hourly_usd: 1.0,
+            max_daily_usd: 10.0,
+            max_monthly_usd: 100.0,
+            alert_threshold: 0.8,
+        };
+        assert!(engine.check_user_budget(alice, &budget).is_ok());
+    }
+
+    #[test]
+    fn test_check_user_budget_zero_means_unlimited() {
+        // 0.0 on every window MUST be treated as "no cap" — even after
+        // a record larger than any plausible cap, the check passes.
+        let engine = setup();
+        let alice = UserId::from_name("Alice");
+        engine
+            .record(&UsageRecord {
+                agent_id: AgentId::new(),
+                cost_usd: 9_999.0,
+                user_id: Some(alice),
+                ..Default::default()
+            })
+            .unwrap();
+        let budget = librefang_types::config::UserBudgetConfig::default();
+        assert_eq!(budget.max_hourly_usd, 0.0);
+        assert!(engine.check_user_budget(alice, &budget).is_ok());
+    }
+
+    #[test]
+    fn test_check_user_budget_exceeds_hourly() {
+        let engine = setup();
+        let alice = UserId::from_name("Alice");
+        engine
+            .record(&UsageRecord {
+                agent_id: AgentId::new(),
+                cost_usd: 0.50,
+                user_id: Some(alice),
+                ..Default::default()
+            })
+            .unwrap();
+        let budget = librefang_types::config::UserBudgetConfig {
+            max_hourly_usd: 0.10,
+            max_daily_usd: 0.0,
+            max_monthly_usd: 0.0,
+            alert_threshold: 0.8,
+        };
+        let err = engine.check_user_budget(alice, &budget).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("hourly"), "expected 'hourly' in '{msg}'");
+        assert!(msg.contains(&alice.to_string()), "expected uid in '{msg}'");
+    }
+
+    #[test]
+    fn test_check_user_budget_isolates_users() {
+        // Bob's spend MUST NOT count against Alice's cap.
+        let engine = setup();
+        let alice = UserId::from_name("Alice");
+        let bob = UserId::from_name("Bob");
+        engine
+            .record(&UsageRecord {
+                agent_id: AgentId::new(),
+                cost_usd: 5.0,
+                user_id: Some(bob),
+                ..Default::default()
+            })
+            .unwrap();
+        let budget = librefang_types::config::UserBudgetConfig {
+            max_hourly_usd: 1.0,
+            max_daily_usd: 0.0,
+            max_monthly_usd: 0.0,
+            alert_threshold: 0.8,
+        };
+        assert!(engine.check_user_budget(alice, &budget).is_ok());
+        assert!(engine.check_user_budget(bob, &budget).is_err());
     }
 }

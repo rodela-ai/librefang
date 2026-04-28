@@ -61,11 +61,13 @@ export {
   getMcpCatalogEntry,
   getMcpHealth,
   getMcpAuthStatus,
+  listMcpTaintRules,
   // memory
   listMemories,
   searchMemories,
   getMemoryStats,
   getMemoryConfig,
+  getAgentKvMemory,
   // models
   listModels,
   getModelOverrides,
@@ -104,6 +106,7 @@ export {
   pollVideo,
   // workflows
   listWorkflows,
+  getWorkflow,
   listWorkflowRuns,
   getWorkflowRun,
   listWorkflowTemplates,
@@ -127,6 +130,21 @@ export {
   // audit
   listAuditRecent,
   verifyAuditChain,
+  queryAudit,
+  // users (RBAC M6)
+  listUsers,
+  getUser,
+  // per-user budget (M5) / policy (M3 #3205 — wired)
+  getUserBudget,
+  getUserPolicy,
+  // effective permissions snapshot (RBAC follow-up — backs the simulator)
+  getEffectivePermissions,
+} from "../../api";
+
+export type {
+  UserBudgetResponse,
+  UserBudgetWindow,
+  UserBudgetPayload,
 } from "../../api";
 
 // ---------------------------------------------------------------------------
@@ -143,6 +161,8 @@ export {
   clearAgentHistory,
   patchAgent,
   patchAgentConfig,
+  patchHandAgentRuntimeConfig,
+  clearHandAgentRuntimeConfig,
   createAgentSession,
   switchAgentSession,
   deleteSession,
@@ -164,6 +184,8 @@ export {
   reloadChannels,
   sendCommsMessage,
   postCommsTask,
+  // attachments
+  uploadAgentFile,
   // media
   generateImage,
   synthesizeSpeech,
@@ -188,6 +210,7 @@ export {
   // mcp
   addMcpServer,
   updateMcpServer,
+  patchMcpServerTaint,
   deleteMcpServer,
   reconnectMcpServer,
   reloadMcp,
@@ -256,6 +279,17 @@ export {
   triggerAutoDream,
   abortAutoDream,
   setAutoDreamEnabled,
+  // users (RBAC M6)
+  createUser,
+  updateUser,
+  deleteUser,
+  importUsers,
+  rotateUserKey,
+  // per-user policy (M3 #3205)
+  updateUserPolicy,
+  // per-user budget (RBAC M5)
+  updateUserBudget,
+  deleteUserBudget,
 } from "../../api";
 
 // ---------------------------------------------------------------------------
@@ -271,6 +305,8 @@ export type {
   AutoDreamStatusName,
   AutoDreamTriggerOutcome,
   AutoDreamTurn,
+  CronDeliveryTarget,
+  CronDeliveryTargetType,
   CronJobItem,
   HandDefinitionItem,
   HandInstanceItem,
@@ -280,6 +316,8 @@ export type {
   McpAuthStartResponse,
   McpAuthStatusResponse,
   MemoryItem,
+  AgentKvPair,
+  AgentKvResponse,
   ModelOverrides,
   MediaImageResult,
   MediaMusicResult,
@@ -289,4 +327,28 @@ export type {
   SpeechResult,
   TerminalHealth,
   TerminalWindow,
+  // users / RBAC
+  UserItem,
+  UserUpsertPayload,
+  UserRoleName,
+  BulkImportRow,
+  BulkImportResult,
+  RotateUserKeyResponse,
+  // audit / per-user budget / policy
+  AuditQueryEntry,
+  AuditQueryFilters,
+  AuditQueryResponse,
+  PermissionPolicy,
+  PermissionPolicyUpdate,
+  UserToolPolicy,
+  UserToolCategories,
+  UserMemoryAccess,
+  ChannelToolPolicy,
+  // effective permissions snapshot (RBAC follow-up)
+  EffectivePermissions,
+  EffectiveToolPolicy,
+  EffectiveToolCategories,
+  EffectiveMemoryAccess,
+  EffectiveBudget,
+  EffectiveChannelToolPolicy,
 } from "../../api";

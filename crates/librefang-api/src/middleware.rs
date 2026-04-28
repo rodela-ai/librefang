@@ -11,6 +11,7 @@ use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use axum::middleware::Next;
 use librefang_kernel::auth::UserRole;
+use librefang_types::agent::UserId;
 use librefang_types::i18n;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,13 +35,27 @@ pub struct AuthState {
     /// Whether dashboard username/password auth is configured.
     pub dashboard_auth_enabled: bool,
     /// Optional per-user API-key hashes used for role-based API access.
-    pub user_api_keys: Arc<Vec<ApiUserAuth>>,
+    ///
+    /// Wrapped in a `RwLock` (mirroring `api_key_lock`) so the rotate-key
+    /// endpoint can swap the in-memory snapshot atomically. Without a live
+    /// swap, a leaked per-user bearer token could only be revoked by
+    /// restarting the daemon — defeating the point of rotation.
+    pub user_api_keys: Arc<tokio::sync::RwLock<Vec<ApiUserAuth>>>,
     /// When `true` and an `api_key` is configured, GET endpoints that are
     /// otherwise on the dashboard public-read allowlist (agents, config,
     /// budget, sessions, approvals, hands, skills, workflows, …) are forced
     /// through bearer authentication. Static assets, OAuth entry points, and
     /// `/api/health*` remain public so the daemon stays probeable.
     pub require_auth_for_reads: bool,
+    /// Set from `LIBREFANG_ALLOW_NO_AUTH=1` to permit running without an
+    /// api_key on a non-loopback bind. Off by default so empty keys
+    /// fail closed for LAN/public origins (see issue #1034 port).
+    pub allow_no_auth: bool,
+    /// RBAC M5: optional handle to the kernel's audit log so the
+    /// middleware can record `PermissionDenied` events when a request is
+    /// rejected by the role gate. Wrapped in `Option` because some test
+    /// harnesses construct `AuthState` without a kernel attached.
+    pub audit_log: Option<Arc<librefang_runtime::audit::AuditLog>>,
 }
 
 #[derive(Clone)]
@@ -48,12 +63,20 @@ pub struct ApiUserAuth {
     pub name: String,
     pub role: UserRole,
     pub api_key_hash: String,
+    /// Stable LibreFang user id derived from `name` via [`UserId::from_name`].
+    /// Pre-computed at config-load so the auth middleware does not need a
+    /// kernel handle to identify the caller.
+    pub user_id: UserId,
 }
 
 #[derive(Clone, Debug)]
 pub struct AuthenticatedApiUser {
     pub name: String,
     pub role: UserRole,
+    /// Same id stored on [`ApiUserAuth`]; downstream handlers read this
+    /// from request extensions to pass the caller through to kernel
+    /// `authorize()` calls and into [`librefang_runtime::audit::AuditEntry`].
+    pub user_id: UserId,
 }
 
 /// Endpoints that mutate kernel-wide configuration, user accounts, or
@@ -71,14 +94,27 @@ fn is_owner_only_write(method: &axum::http::Method, path: &str) -> bool {
     // exposes that cross the "Owner action" line; add here rather than
     // matching a prefix so a new Admin-write endpoint doesn't silently
     // get locked to Owner by accident.
-    matches!(
+    if matches!(
         path,
         "/api/config"
             | "/api/config/set"
             | "/api/config/reload"
             | "/api/auth/change-password"
             | "/api/shutdown"
-    )
+    ) {
+        return true;
+    }
+    // RBAC user-management surface (M6) — every mutating call under
+    // `/api/users*` (create / replace / delete / bulk import) maps to
+    // `Action::ManageUsers` in the kernel, which requires `Owner`. We
+    // match by prefix because the path can be `/api/users`,
+    // `/api/users/{name}`, or `/api/users/import`. GET is left to the
+    // generic Admin-or-above gate so the dashboard's user list and
+    // permission simulator stay usable for Admins.
+    if path == "/api/users" || path.starts_with("/api/users/") {
+        return true;
+    }
+    false
 }
 
 /// Whitelist check for per-user API-key access.
@@ -123,6 +159,35 @@ fn user_role_allows_request(role: UserRole, method: &axum::http::Method, path: &
     }
 
     false
+}
+
+/// Pull a caller-provided token from the standard locations the auth path
+/// understands: `Authorization: Bearer <x>` or `X-API-Key: <x>`. Bearer wins
+/// over X-API-Key — same precedence as the non-loopback flow at
+/// `auth(...)` line ~528. Returns `None` if no shape is present.
+///
+/// SECURITY: `?token=` query-string auth is intentionally NOT supported here.
+/// Query parameters appear in server access logs, browser history, and HTTP
+/// Referer headers forwarded to third parties, making them unsuitable for
+/// carrying credentials on regular HTTP routes. WebSocket upgrades are the
+/// sole exception — browsers cannot set custom headers on WebSocket
+/// connections — and they handle `?token=` in `crate::ws::ws_auth_token`
+/// rather than going through this middleware path.
+fn extract_request_token(request: &Request<Body>) -> Option<String> {
+    let bearer = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string);
+    if bearer.is_some() {
+        return bearer;
+    }
+    request
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 /// Request ID header name (standard).
@@ -289,6 +354,12 @@ pub async fn auth(
     next: Next,
 ) -> Response<Body> {
     let api_key = auth_state.api_key_lock.read().await.clone();
+    // Snapshot the per-user API key list once per request — `user_api_keys`
+    // is now an `Arc<RwLock<Vec<…>>>` so the rotate-key endpoint can swap
+    // entries live. The snapshot is cheap (small Vec of role records, no
+    // hash work) and lets every downstream read avoid re-acquiring the
+    // lock, including the constant-time `verify_password` loop below.
+    let user_api_keys: Vec<ApiUserAuth> = auth_state.user_api_keys.read().await.clone();
     // SECURITY: Capture method early for method-aware public endpoint checks.
     let method = request.method().clone();
 
@@ -314,7 +385,17 @@ pub async fn auth(
     } else {
         after_version.strip_suffix('/').unwrap_or(&after_version)
     };
-    // Loopback requests (CLI on the same machine) bypass auth entirely.
+    // SECURITY: Loopback requests go through the same auth check as all other
+    // connections. The unconditional loopback bypass has been removed — any
+    // process on the same host must supply a valid token just like a remote
+    // caller (see bug #3558).
+    //
+    // We still perform early token attribution here so that RBAC-gated
+    // handlers (audit, per-user budget write, …) that require an
+    // AuthenticatedApiUser extension work correctly for loopback callers that
+    // carry a valid session or per-user API key (e.g. the CLI, a Vite
+    // dev-proxy). After attribution the request falls through to the normal
+    // is_public / token-verification flow below — there is no early return.
     {
         let is_loopback = request
             .extensions()
@@ -322,7 +403,81 @@ pub async fn auth(
             .map(|ci| ci.0.ip().is_loopback())
             .unwrap_or(false);
         if is_loopback {
-            return next.run(request).await;
+            if let Some(token_str) = extract_request_token(&request) {
+                // First try active dashboard sessions (random hex token exact
+                // match) — the SPA proxied through Vite at 127.0.0.1 presents
+                // a session cookie that must retain its role attribution.
+                let session_attribution = {
+                    let sessions = auth_state.active_sessions.read().await;
+                    sessions.get(&token_str).cloned()
+                };
+                if let Some(session) = session_attribution {
+                    if let (Some(name), Some(role_str)) = (session.user_name, session.user_role) {
+                        let role = UserRole::from_str_role(&role_str);
+                        let user_id = UserId::from_name(&name);
+                        request.extensions_mut().insert(AuthenticatedApiUser {
+                            name,
+                            role,
+                            user_id,
+                        });
+                    }
+                    // Fall through to normal auth — the session token will be
+                    // validated again in the main token-check path below.
+                }
+                // Try per-user API keys (Argon2 verify against api_key_hash).
+                // Use the local `user_api_keys` snapshot taken at the top of
+                // `auth()` — single source of truth for this request.
+                else if let Some(user) = user_api_keys
+                    .iter()
+                    .find(|user| {
+                        crate::password_hash::verify_password(&token_str, &user.api_key_hash)
+                    })
+                    .cloned()
+                {
+                    // Apply the role gate so a Viewer/User key on loopback
+                    // cannot smuggle a write it would be denied over the LAN.
+                    if !user_role_allows_request(user.role, &method, path) {
+                        if let Some(ref audit) = auth_state.audit_log {
+                            audit.record_with_context(
+                                "system",
+                                librefang_runtime::audit::AuditAction::PermissionDenied,
+                                format!("{} {}", method, path),
+                                format!("role={}", user.role),
+                                Some(user.user_id),
+                                Some("api".to_string()),
+                            );
+                        }
+                        let lang = request
+                            .extensions()
+                            .get::<RequestLanguage>()
+                            .map(|rl| rl.0)
+                            .unwrap_or(i18n::DEFAULT_LANGUAGE);
+                        return Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .header("content-type", "application/json")
+                            .header("content-language", lang)
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "error": format!(
+                                        "Role '{}' is not allowed to access this endpoint",
+                                        user.role
+                                    )
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap_or_default();
+                    }
+                    request.extensions_mut().insert(AuthenticatedApiUser {
+                        name: user.name,
+                        role: user.role,
+                        user_id: user.user_id,
+                    });
+                    // Fall through to normal auth — the token will be
+                    // re-verified in the main token-check path below.
+                }
+            }
+            // No early return — loopback requests continue through the
+            // standard is_public check and token verification below.
         }
     }
 
@@ -365,6 +520,9 @@ pub async fn auth(
             | "/api/auth/callback"
             | "/api/auth/dashboard-login"
             | "/api/auth/dashboard-check"
+            // Mobile pairing — phone has no API key yet, needs to exchange
+            // the one-time QR token for the daemon's api_key.
+            | "/api/pairing/complete"
     ) || path.starts_with("/api/providers/github-copilot/oauth/");
     // MCP OAuth callback — browser redirect from OAuth provider, no API key.
     // Pattern: /api/mcp/servers/{name}/auth/callback — GET only.
@@ -383,7 +541,7 @@ pub async fn auth(
     // (see the 401 handler below). When no auth is configured the shell
     // stays public so the out-of-the-box dev experience still works.
     let auth_configured = !api_key.trim().is_empty()
-        || !auth_state.user_api_keys.is_empty()
+        || !user_api_keys.is_empty()
         || auth_state.dashboard_auth_enabled;
     // The inline login page (`login_page.html`) only speaks username/password,
     // so only gate the shell when *that* mode is actually enabled. API-key-only
@@ -393,18 +551,27 @@ pub async fn auth(
     //
     // Dashboard assets (JS/CSS/font chunks) are always public — they contain
     // no sensitive data and the SPA shell needs them to render even the
-    // inline login page returned for unauthenticated browsers.
+    // inline login page returned for unauthenticated browsers. The same
+    // applies to `/locales/*.json` — translation bundles are static i18n
+    // resources fetched by the SPA shell before any auth flow runs.
     let is_dashboard_asset = path.starts_with("/dashboard/assets/");
-    let dashboard_shell_public =
-        (!auth_state.dashboard_auth_enabled && is_dashboard_path) || is_dashboard_asset;
+    let is_locale_bundle = path.starts_with("/locales/");
+    let dashboard_shell_public = (!auth_state.dashboard_auth_enabled && is_dashboard_path)
+        || is_dashboard_asset
+        || is_locale_bundle;
 
     let always_public_get_only = is_get
         && (matches!(
             path,
             "/.well-known/agent.json" | "/api/config/schema" | "/api/auth/providers"
         ) || dashboard_shell_public
-            || path.starts_with("/a2a/")
-            || path.starts_with("/api/uploads/")
+            // The /a2a/agents listing is public so external callers can discover
+            // local agents without a bearer token (matches the A2A spec intent).
+            // All other /a2a/* paths — including /a2a/tasks/{id} which returns full
+            // task transcripts — require authentication (Bug #3781).
+            || path == "/a2a/agents"
+            // /api/uploads/* is intentionally NOT in the public list — uploads
+            // require authentication, UUID guessing is not access control (#3361).
             || path.starts_with("/api/auth/login"));
     let always_public =
         always_public_method_free || always_public_get_only || is_mcp_oauth_callback;
@@ -437,13 +604,24 @@ pub async fn auth(
             | "/api/mcp/catalog"
             | "/api/mcp/health"
             | "/api/workflows"
+            | "/api/auto-dream/status"
     );
+    // SECURITY #3367: /api/approvals/session/{id} exposes pending shell
+    // commands and must require authentication.  The broader
+    // /api/approvals/* prefix is kept public for the dashboard polling
+    // paths that do not contain sensitive payload detail (e.g. the
+    // individual approval GET by id), but the /session/ sub-tree is
+    // explicitly excluded here and falls through to the normal auth gate.
+    let approvals_prefix_public =
+        path.starts_with("/api/approvals/") && !path.starts_with("/api/approvals/session/");
     let dashboard_read_prefix = path.starts_with("/api/budget/agents/")
-        || path.starts_with("/api/approvals/")
+        || approvals_prefix_public
         || path.starts_with("/api/hands/")
         || path.starts_with("/api/cron/");
-    let dashboard_read_public =
-        (is_get && (dashboard_read_exact || dashboard_read_prefix)) || path == "/api/logs/stream"; // SSE stream, read-only
+    // NOTE: /api/logs/stream (SSE) is intentionally excluded from the public
+    // allowlist. It streams real-time audit/log events and must require auth
+    // the same way every other sensitive read endpoint does. (#3593/#3680)
+    let dashboard_read_public = is_get && (dashboard_read_exact || dashboard_read_prefix);
 
     let enforce_auth_on_reads = auth_state.require_auth_for_reads && auth_configured;
 
@@ -453,15 +631,38 @@ pub async fn auth(
         return next.run(request).await;
     }
 
-    // If no API key configured (empty, whitespace-only, or missing), skip auth
-    // entirely. Users who don't set api_key accept that all endpoints are open.
-    // To secure the dashboard, set a non-empty api_key in config.toml.
+    // If no API key configured (empty/whitespace) and no other auth method is
+    // active, fail closed for any request that did NOT come from loopback —
+    // unless the operator explicitly opted in via LIBREFANG_ALLOW_NO_AUTH=1.
+    //
+    // SECURITY: This closes the openfang #1034 hole where an empty api_key
+    // bypassed auth for every origin (LAN/public), exposing agent config,
+    // channel tokens, and LLM keys to anyone reachable on the bind address.
+    // Loopback already short-circuits above for the single-user dev UX, so
+    // reaching this branch means the caller is on the LAN/WAN.
     let api_key = api_key.trim();
-    if api_key.is_empty()
-        && auth_state.user_api_keys.is_empty()
-        && !auth_state.dashboard_auth_enabled
-    {
-        return next.run(request).await;
+    if api_key.is_empty() && user_api_keys.is_empty() && !auth_state.dashboard_auth_enabled {
+        // Re-check ConnectInfo defensively — if it is missing for any reason
+        // we MUST treat the origin as non-loopback (fail closed, never open).
+        let is_loopback = request
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0.ip().is_loopback())
+            .unwrap_or(false);
+        if is_loopback || auth_state.allow_no_auth {
+            return next.run(request).await;
+        }
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("www-authenticate", "Bearer")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "error": "API key required for non-loopback requests. Set api_key in config.toml, bind to 127.0.0.1, or set LIBREFANG_ALLOW_NO_AUTH=1 to opt out."
+                })
+                .to_string(),
+            ))
+            .unwrap_or_default();
     }
 
     // Check Authorization: Bearer <token> header, then fallback to X-API-Key
@@ -513,27 +714,23 @@ pub async fn auth(
     // SECURITY: Use constant-time comparison to prevent timing attacks.
     let header_auth = api_token.map(&matches_any);
 
-    // Also check ?token= query parameter (for EventSource/SSE clients that
-    // cannot set custom headers, same approach as WebSocket auth).
-    let query_token = request
-        .uri()
-        .query()
-        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")));
+    // SECURITY: ?token= query-string auth is deliberately NOT checked here.
+    // Query parameters are written to server access logs, retained in browser
+    // history, and forwarded in HTTP Referer headers to third parties. Tokens
+    // must only arrive via Authorization: Bearer or X-API-Key headers, or via
+    // the session cookie. WebSocket upgrades are the sole exception (browsers
+    // cannot set custom headers on WebSocket connections); they authenticate
+    // via crate::ws::ws_auth_token, which never passes through this middleware.
 
-    // SECURITY: Use constant-time comparison to prevent timing attacks.
-    let query_auth = query_token.map(&matches_any);
-
-    // Accept if either auth method matches a static API key or legacy token
-    if header_auth == Some(true) || query_auth == Some(true) {
+    // Accept if header auth matches a static API key or legacy token
+    if header_auth == Some(true) {
         return next.run(request).await;
     }
 
     // Check the active session store for randomly generated dashboard tokens.
     // Also prune expired sessions opportunistically. Cookie token is only
     // consulted for `/dashboard/*` navigation (filtered upstream).
-    let provided_token = api_token
-        .or(query_token)
-        .or(cookie_session_token.as_deref());
+    let provided_token = api_token.or(cookie_session_token.as_deref());
     if let Some(token_str) = provided_token {
         let mut sessions = auth_state.active_sessions.write().await;
         // Remove expired sessions while we hold the lock
@@ -543,19 +740,52 @@ pub async fn auth(
                 crate::password_hash::DEFAULT_SESSION_TTL_SECS,
             )
         });
-        if sessions.contains_key(token_str) {
+        if let Some(session) = sessions.get(token_str).cloned() {
             drop(sessions);
+            // If the session was issued by a credential flow that carried
+            // identity (dashboard_login attaches `user_name` + `user_role`),
+            // rebuild the AuthenticatedApiUser extension so RBAC-gated
+            // handlers (audit/query, per-user budget writes) can see the
+            // role. Legacy sessions persisted before attribution was added
+            // load with both fields `None` and continue through as
+            // trusted-anonymous — preserves the pre-fix behaviour for any
+            // session sitting in `~/.librefang/sessions.json` from older
+            // builds.
+            if let (Some(name), Some(role_str)) = (session.user_name, session.user_role) {
+                let role = UserRole::from_str_role(&role_str);
+                let user_id = UserId::from_name(&name);
+                request.extensions_mut().insert(AuthenticatedApiUser {
+                    name,
+                    role,
+                    user_id,
+                });
+            }
             return next.run(request).await;
         }
         drop(sessions);
 
-        if let Some(user) = auth_state
-            .user_api_keys
+        if let Some(user) = user_api_keys
             .iter()
             .find(|user| crate::password_hash::verify_password(token_str, &user.api_key_hash))
             .cloned()
         {
             if !user_role_allows_request(user.role, &method, path) {
+                // RBAC M5: surface the denial in the hash-chained audit
+                // log so an operator can correlate 403s with the user
+                // who tripped them. Best-effort — we do not have a
+                // direct kernel handle in the middleware extension so
+                // we read it back via the `audit_log_handle` injected
+                // into AuthState at server build time.
+                if let Some(ref audit) = auth_state.audit_log {
+                    audit.record_with_context(
+                        "system",
+                        librefang_runtime::audit::AuditAction::PermissionDenied,
+                        format!("{} {}", method, path),
+                        format!("role={}", user.role),
+                        Some(user.user_id),
+                        Some("api".to_string()),
+                    );
+                }
                 let lang = request
                     .extensions()
                     .get::<RequestLanguage>()
@@ -580,6 +810,7 @@ pub async fn auth(
             request.extensions_mut().insert(AuthenticatedApiUser {
                 name: user.name,
                 role: user.role,
+                user_id: user.user_id,
             });
             return next.run(request).await;
         }
@@ -594,7 +825,7 @@ pub async fn auth(
         .unwrap_or(i18n::DEFAULT_LANGUAGE);
     let translator = i18n::ErrorTranslator::new(lang);
 
-    let credential_provided = header_auth.is_some() || query_auth.is_some();
+    let credential_provided = header_auth.is_some();
     let error_msg = if credential_provided {
         translator.t("api-error-auth-invalid-key")
     } else {
@@ -634,9 +865,14 @@ pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Bo
     headers.insert("x-frame-options", "DENY".parse().unwrap());
     headers.insert("x-xss-protection", "1; mode=block".parse().unwrap());
     // All JS/CSS is bundled inline — only external resource is Google Fonts.
+    // SECURITY: 'unsafe-eval' removed from script-src (#3732). 'unsafe-inline'
+    // removed from script-src as well; the bundled SPA does not need it.
+    // 'unsafe-inline' is kept in style-src only because the React/Vite bundle
+    // injects CSS-in-JS style tags at runtime and removing it would break the
+    // dashboard UI until a nonce-based approach is wired through the build.
     headers.insert(
         "content-security-policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'"
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'"
             .parse()
             .unwrap(),
     );
@@ -730,6 +966,56 @@ mod tests {
                 "User must NOT be allowed to POST {path}"
             );
         }
+    }
+
+    #[test]
+    fn test_user_role_admin_cannot_mutate_users_endpoints() {
+        // RBAC M6: every mutating call under /api/users* maps to
+        // Action::ManageUsers, which requires Owner. Without this gate an
+        // Admin per-user API key could promote itself to Owner via
+        // POST /api/users.
+        for method in [
+            axum::http::Method::POST,
+            axum::http::Method::PUT,
+            axum::http::Method::DELETE,
+        ] {
+            for path in ["/api/users", "/api/users/alice", "/api/users/import"] {
+                assert!(
+                    !user_role_allows_request(UserRole::Admin, &method, path),
+                    "Admin must NOT be allowed to {method} {path}"
+                );
+                assert!(
+                    user_role_allows_request(UserRole::Owner, &method, path),
+                    "Owner must be allowed to {method} {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_user_role_viewer_can_still_list_users_for_simulator() {
+        // GET on /api/users* stays at the generic Admin-or-above gate (the
+        // permission simulator needs the list). Viewer/User remain GET-only
+        // by the existing user_role_allows_request rules.
+        let get = axum::http::Method::GET;
+        assert!(user_role_allows_request(
+            UserRole::Admin,
+            &get,
+            "/api/users"
+        ));
+        assert!(user_role_allows_request(
+            UserRole::Owner,
+            &get,
+            "/api/users"
+        ));
+        // GET is universally allowed by the role-allows logic, so even
+        // Viewer can read — middleware-level filtering of PII is a
+        // separate concern (UserView already redacts api_key_hash).
+        assert!(user_role_allows_request(
+            UserRole::Viewer,
+            &get,
+            "/api/users"
+        ));
     }
 
     #[test]
@@ -848,8 +1134,10 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("secret".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(Vec::new()),
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             require_auth_for_reads: false,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/private", get(|| async { "ok" }))
@@ -876,12 +1164,15 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(vec![ApiUserAuth {
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(vec![ApiUserAuth {
                 name: "Guest".to_string(),
                 role: UserRole::User,
                 api_key_hash: crate::password_hash::hash_password("user-key").unwrap(),
-            }]),
+                user_id: UserId::from_name("Guest"),
+            }])),
             require_auth_for_reads: false,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route(
@@ -911,12 +1202,15 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(vec![ApiUserAuth {
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(vec![ApiUserAuth {
                 name: "Guest".to_string(),
                 role: UserRole::User,
                 api_key_hash: crate::password_hash::hash_password("user-key").unwrap(),
-            }]),
+                user_id: UserId::from_name("Guest"),
+            }])),
             require_auth_for_reads: false,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route(
@@ -946,12 +1240,15 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(vec![ApiUserAuth {
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(vec![ApiUserAuth {
                 name: "ReadOnly".to_string(),
                 role: UserRole::Viewer,
                 api_key_hash: crate::password_hash::hash_password("viewer-key").unwrap(),
-            }]),
+                user_id: UserId::from_name("ReadOnly"),
+            }])),
             require_auth_for_reads: false,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route(
@@ -981,12 +1278,15 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(vec![ApiUserAuth {
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(vec![ApiUserAuth {
                 name: "ReadOnly".to_string(),
                 role: UserRole::Viewer,
                 api_key_hash: crate::password_hash::hash_password("viewer-key").unwrap(),
-            }]),
+                user_id: UserId::from_name("ReadOnly"),
+            }])),
             require_auth_for_reads: false,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/budget", get(|| async { "ok" }))
@@ -1015,12 +1315,15 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(vec![ApiUserAuth {
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(vec![ApiUserAuth {
                 name: "Guest".to_string(),
                 role: UserRole::User,
                 api_key_hash: crate::password_hash::hash_password("user-key").unwrap(),
-            }]),
+                user_id: UserId::from_name("Guest"),
+            }])),
             require_auth_for_reads: false,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route(
@@ -1060,8 +1363,10 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("somekey".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(vec![]),
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(vec![])),
             require_auth_for_reads: false,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/", get(|| async { "dashboard html" }))
@@ -1091,12 +1396,15 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(vec![ApiUserAuth {
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(vec![ApiUserAuth {
                 name: "Guest".to_string(),
                 role: UserRole::User,
                 api_key_hash: crate::password_hash::hash_password("user-key").unwrap(),
-            }]),
+                user_id: UserId::from_name("Guest"),
+            }])),
             require_auth_for_reads: false,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route(
@@ -1130,8 +1438,10 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("secret".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(Vec::new()),
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             require_auth_for_reads: true,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/agents", get(|| async { "agents listing" }))
@@ -1163,8 +1473,10 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("secret".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(Vec::new()),
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             require_auth_for_reads: true,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/agents", get(|| async { "agents listing" }))
@@ -1193,8 +1505,10 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("secret".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(Vec::new()),
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             require_auth_for_reads: true,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/health", get(|| async { "ok" }))
@@ -1222,8 +1536,10 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("secret".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(Vec::new()),
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             require_auth_for_reads: false,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/agents", get(|| async { "agents listing" }))
@@ -1233,6 +1549,41 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// `/api/auto-dream/status` is a dashboard read — same shape as
+    /// `/api/agents` etc.: GET returns the global toggle + per-agent
+    /// state, drives the Settings page's Dream Mode card. Must not 401
+    /// when no auth is configured (default install) so the SPA renders.
+    /// POST endpoints under `/api/auto-dream/agents/*` (trigger / abort /
+    /// enabled) stay write-protected — they are not added to the
+    /// allowlist.
+    #[tokio::test]
+    async fn test_auto_dream_status_get_is_dashboard_read_public() {
+        let auth_state = AuthState {
+            api_key_lock: Arc::new(tokio::sync::RwLock::new(String::new())),
+            active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            dashboard_auth_enabled: false,
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            require_auth_for_reads: false,
+            allow_no_auth: false,
+            audit_log: None,
+        };
+        let app = Router::new()
+            .route("/api/auto-dream/status", get(|| async { "status" }))
+            .layer(axum::middleware::from_fn_with_state(auth_state, auth));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auto-dream/status")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1258,8 +1609,10 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("secret".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(Vec::new()),
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             require_auth_for_reads: false,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app_off = Router::new()
             .route("/api/health", get(|| async { "ok" }))
@@ -1303,8 +1656,10 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("secret".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(Vec::new()),
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             require_auth_for_reads: true,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app_on = Router::new()
             .route("/api/health/detail", get(|| async { "detail" }))
@@ -1332,8 +1687,10 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new("secret".to_string())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(Vec::new()),
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             require_auth_for_reads: true,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/status", get(|| async { "status" }))
@@ -1366,12 +1723,15 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new(String::new())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(vec![ApiUserAuth {
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(vec![ApiUserAuth {
                 name: "alice".into(),
                 role: UserRole::User,
                 api_key_hash: crate::password_hash::hash_password("alice-key").unwrap(),
-            }]),
+                user_id: UserId::from_name("alice"),
+            }])),
             require_auth_for_reads: true,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/agents", get(|| async { "agents listing" }))
@@ -1418,8 +1778,10 @@ mod tests {
             api_key_lock: Arc::new(tokio::sync::RwLock::new(String::new())),
             active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dashboard_auth_enabled: false,
-            user_api_keys: Arc::new(Vec::new()),
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             require_auth_for_reads: true,
+            allow_no_auth: false,
+            audit_log: None,
         };
         let app = Router::new()
             .route("/api/agents", get(|| async { "agents listing" }))
@@ -1440,6 +1802,334 @@ mod tests {
             StatusCode::OK,
             "flag must not block unauthenticated reads when no auth is configured — \
              the startup warning handles operator feedback"
+        );
+    }
+
+    // ---- openfang #1034 port: empty-api_key fail-closed coverage --------
+    //
+    // Helper builders + 6 scenarios specified by the security port:
+    //   (a) loopback + no key      → 200
+    //   (b) LAN IP + no key        → 401
+    //   (c) public IP + no key     → 401
+    //   (d) allow_no_auth=1        → 200 from any origin
+    //   (e) configured key         → still does normal Bearer validation
+    //   (f) missing ConnectInfo    → 401 (fail-closed, never open)
+
+    fn no_auth_state() -> AuthState {
+        AuthState {
+            api_key_lock: Arc::new(tokio::sync::RwLock::new(String::new())),
+            active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            dashboard_auth_enabled: false,
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            require_auth_for_reads: false,
+            allow_no_auth: false,
+            audit_log: None,
+        }
+    }
+
+    fn with_key_state(key: &str) -> AuthState {
+        AuthState {
+            api_key_lock: Arc::new(tokio::sync::RwLock::new(key.to_string())),
+            active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            dashboard_auth_enabled: false,
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            require_auth_for_reads: false,
+            allow_no_auth: false,
+            audit_log: None,
+        }
+    }
+
+    fn protected_router(state: AuthState) -> Router {
+        Router::new()
+            .route("/api/agents/1", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(state, auth))
+    }
+
+    fn req_with_addr(ip: &str) -> Request<Body> {
+        let addr: std::net::SocketAddr = format!("{ip}:40000").parse().unwrap();
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/api/agents/1")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+        req
+    }
+
+    /// (a) Empty api_key + loopback origin → 200. Single-user dev UX kept.
+    #[tokio::test]
+    async fn empty_key_allows_loopback() {
+        let app = protected_router(no_auth_state());
+        let resp = app.oneshot(req_with_addr("127.0.0.1")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// (b) Empty api_key + LAN origin → 401. Closes the #1034 hole where a
+    /// 192.168.x caller could hit every non-public endpoint.
+    #[tokio::test]
+    async fn empty_key_blocks_lan_origin() {
+        let app = protected_router(no_auth_state());
+        let resp = app.oneshot(req_with_addr("192.168.1.50")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// (c) Empty api_key + public IP origin → 401.
+    #[tokio::test]
+    async fn empty_key_blocks_public_origin() {
+        let app = protected_router(no_auth_state());
+        let resp = app.oneshot(req_with_addr("203.0.113.5")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// (d) `allow_no_auth = true` (i.e. LIBREFANG_ALLOW_NO_AUTH=1 at boot)
+    /// opens the door from any origin. Operators must opt in explicitly.
+    #[tokio::test]
+    async fn empty_key_with_allow_no_auth_opens_lan() {
+        let mut s = no_auth_state();
+        s.allow_no_auth = true;
+        let app = protected_router(s);
+        let resp = app.oneshot(req_with_addr("10.0.0.9")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// (e) With an api_key configured, missing token → 401, valid bearer → 200.
+    /// Confirms the new branch only fires on the no-auth code path.
+    #[tokio::test]
+    async fn configured_key_still_validates_bearer() {
+        let app = protected_router(with_key_state("secret"));
+        let resp = app
+            .clone()
+            .oneshot(req_with_addr("203.0.113.5"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let addr: std::net::SocketAddr = "203.0.113.5:40000".parse().unwrap();
+        let mut authed = Request::builder()
+            .method("GET")
+            .uri("/api/agents/1")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        authed
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+        let ok = app.oneshot(authed).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+    }
+
+    /// (f) ConnectInfo extension is missing → fail closed. The middleware
+    /// must never treat unknown origin as loopback. Defense in depth in case
+    /// upstream wiring changes (e.g. a future router skips
+    /// `into_make_service_with_connect_info`).
+    #[tokio::test]
+    async fn empty_key_blocks_when_connect_info_missing() {
+        let app = protected_router(no_auth_state());
+        // No ConnectInfo extension inserted.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/agents/1")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ---- Regression tests for bug #3558: loopback bypass removed -----------
+
+    /// Regression #3558: when an api_key IS configured, a loopback request
+    /// with NO token must be rejected. The old code unconditionally let any
+    /// loopback caller through; the fix removes that bypass so loopback goes
+    /// through the same token check as every other origin.
+    #[tokio::test]
+    async fn configured_key_loopback_no_token_is_rejected() {
+        let app = protected_router(with_key_state("secret"));
+        let resp = app.oneshot(req_with_addr("127.0.0.1")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "loopback with a configured api_key but no token must be 401, not bypassed"
+        );
+    }
+
+    /// Regression #3558: when an api_key IS configured, a loopback request
+    /// WITH the correct token must still succeed (the fix must not break
+    /// legitimate loopback callers that present credentials).
+    #[tokio::test]
+    async fn configured_key_loopback_valid_token_is_allowed() {
+        let app = protected_router(with_key_state("secret"));
+        let addr: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/api/agents/1")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "loopback with a valid bearer token must still be allowed through"
+        );
+    }
+
+    // ---- Bug #3781: GET /a2a/tasks/{id} must require auth ---------------
+    //
+    // Before the fix, `path.starts_with("/a2a/")` in the always_public_get_only
+    // block let any caller read full task transcripts (agent prompts + LLM
+    // outputs) without a bearer token. Only `/a2a/agents` (capability discovery)
+    // should remain public; task-level resources contain sensitive data.
+
+    /// GET /a2a/agents (the capability listing) must stay public — external
+    /// A2A peers call this to discover what skills a local agent exposes.
+    #[tokio::test]
+    async fn a2a_agents_listing_is_always_public() {
+        let app = Router::new()
+            .route("/a2a/agents", get(|| async { "agent list" }))
+            .layer(axum::middleware::from_fn_with_state(
+                with_key_state("secret"),
+                auth,
+            ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/a2a/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "GET /a2a/agents must be public so external A2A peers can discover local agents"
+        );
+    }
+
+    /// GET /a2a/tasks/{id} must require auth (Bug #3781). Task transcripts
+    /// contain full agent prompts and LLM outputs — sensitive operational data.
+    #[tokio::test]
+    async fn a2a_task_transcript_requires_auth() {
+        let app = Router::new()
+            .route("/a2a/tasks/{id}", get(|| async { "full task transcript" }))
+            .layer(axum::middleware::from_fn_with_state(
+                with_key_state("secret"),
+                auth,
+            ));
+
+        // Unauthenticated → must be rejected.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/a2a/tasks/some-uuid-1234")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "GET /a2a/tasks/{{id}} must require auth — it returns full task transcripts"
+        );
+    }
+
+    /// GET /a2a/tasks/{id} must allow access with a valid bearer token.
+    #[tokio::test]
+    async fn a2a_task_transcript_accessible_with_valid_token() {
+        let app = Router::new()
+            .route("/a2a/tasks/{id}", get(|| async { "full task transcript" }))
+            .layer(axum::middleware::from_fn_with_state(
+                with_key_state("secret"),
+                auth,
+            ));
+
+        let addr: std::net::SocketAddr = "203.0.113.5:40000".parse().unwrap();
+        let mut req = Request::builder()
+            .uri("/a2a/tasks/some-uuid-1234")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+
+        let response = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "valid bearer token must allow access to /a2a/tasks/{{id}}"
+        );
+    }
+
+    /// Regression: #3367 — GET /api/approvals/session/{id} used to be
+    /// publicly readable via the `/api/approvals/` prefix in
+    /// `dashboard_read_prefix`. That endpoint returns pending approval
+    /// details including shell commands, so it must require authentication
+    /// even when `require_auth_for_reads` is off.
+    ///
+    /// The broader `/api/approvals/{id}` path (individual approval GET) is
+    /// still in the public bucket; only the `/session/` sub-tree is locked.
+    #[tokio::test]
+    async fn approvals_session_get_requires_auth() {
+        // Auth state: api_key configured, require_auth_for_reads OFF — this
+        // is the scenario where the bug was exploitable.
+        let auth_state = AuthState {
+            api_key_lock: Arc::new(tokio::sync::RwLock::new("secret".to_string())),
+            active_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            dashboard_auth_enabled: false,
+            user_api_keys: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            require_auth_for_reads: false,
+            allow_no_auth: false,
+            audit_log: None,
+        };
+
+        let app = Router::new()
+            .route(
+                "/api/approvals/session/{id}",
+                get(|| async { "pending approvals" }),
+            )
+            .route("/api/approvals/{id}", get(|| async { "approval detail" }))
+            .layer(axum::middleware::from_fn_with_state(auth_state, auth));
+
+        // GET /api/approvals/session/{id} — must require auth.
+        let session_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/approvals/session/sess-abc-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session_resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "/api/approvals/session/{{id}} must be auth-gated"
+        );
+
+        // GET /api/approvals/{id} — must still be accessible without auth
+        // (dashboard polling).
+        let detail_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/approvals/some-approval-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            detail_resp.status(),
+            StatusCode::OK,
+            "/api/approvals/{{id}} should remain publicly readable"
         );
     }
 }

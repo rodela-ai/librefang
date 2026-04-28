@@ -18,6 +18,7 @@ import { EmptyState } from "../components/ui/EmptyState";
 import { ErrorState } from "../components/ui/ErrorState";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
+import { ResponsiveTable, type ResponsiveTableColumn } from "../components/ui/ResponsiveTable";
 import { Badge } from "../components/ui/Badge";
 import { useUIStore } from "../lib/store";
 import { CheckCircle, XCircle, Clock, MessageSquare, ChevronLeft, ChevronRight } from "lucide-react";
@@ -177,51 +178,55 @@ function AuditLogTab() {
     );
   }
 
+  const auditColumns = useMemo<ResponsiveTableColumn<ApprovalAuditEntry>[]>(
+    () => [
+      {
+        key: "tool_name",
+        label: t("approvals.auditLog.tool"),
+        tdClass: "px-4 py-3 font-medium",
+        render: (e) => e.tool_name,
+      },
+      {
+        key: "agent_id",
+        label: t("approvals.auditLog.agent"),
+        tdClass: "px-4 py-3 text-text-dim",
+        render: (e) => e.agent_id,
+      },
+      {
+        key: "decision",
+        label: t("approvals.auditLog.decision"),
+        tdClass: "px-4 py-3",
+        render: (e) => decisionBadge(e.decision, t),
+      },
+      {
+        key: "decided_by",
+        label: t("approvals.auditLog.decidedBy"),
+        tdClass: "px-4 py-3 text-text-dim",
+        render: (e) => e.decided_by ?? "—",
+      },
+      {
+        key: "decided_at",
+        label: t("approvals.auditLog.decidedAt"),
+        tdClass: "px-4 py-3 text-text-dim text-xs",
+        render: (e) => (e.decided_at ? new Date(e.decided_at).toLocaleString() : "—"),
+      },
+      {
+        key: "feedback",
+        label: t("approvals.auditLog.feedback"),
+        tdClass: "px-4 py-3 text-text-dim text-xs max-w-48 truncate",
+        render: (e) => e.feedback ?? "—",
+      },
+    ],
+    [t],
+  );
+
   return (
     <div className="flex flex-col gap-4">
-      {/* Table */}
-      <div className="overflow-x-auto rounded-xl border border-border-subtle">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-border-subtle bg-surface-hover/50">
-              <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-text-dim">
-                {t("approvals.auditLog.tool")}
-              </th>
-              <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-text-dim">
-                {t("approvals.auditLog.agent")}
-              </th>
-              <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-text-dim">
-                {t("approvals.auditLog.decision")}
-              </th>
-              <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-text-dim">
-                {t("approvals.auditLog.decidedBy")}
-              </th>
-              <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-text-dim">
-                {t("approvals.auditLog.decidedAt")}
-              </th>
-              <th className="px-4 py-3 text-left text-xs font-bold uppercase tracking-wider text-text-dim">
-                {t("approvals.auditLog.feedback")}
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {entries.map((entry) => (
-              <tr key={entry.id} className="border-b last:border-0 border-border-subtle hover:bg-surface-hover/30 transition-colors">
-                <td className="px-4 py-3 font-medium">{entry.tool_name}</td>
-                <td className="px-4 py-3 text-text-dim">{entry.agent_id}</td>
-                <td className="px-4 py-3">{decisionBadge(entry.decision, t)}</td>
-                <td className="px-4 py-3 text-text-dim">{entry.decided_by ?? "-"}</td>
-                <td className="px-4 py-3 text-text-dim text-xs">
-                  {entry.decided_at ? new Date(entry.decided_at).toLocaleString() : "-"}
-                </td>
-                <td className="px-4 py-3 text-text-dim text-xs max-w-48 truncate">
-                  {entry.feedback ?? "-"}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <ResponsiveTable
+        columns={auditColumns}
+        rows={entries}
+        rowKey={(e) => e.id}
+      />
 
       {/* Pagination */}
       <div className="flex items-center justify-between text-sm text-text-dim">
@@ -365,8 +370,16 @@ export function ApprovalsPage() {
       />
 
       {/* Tab toggle */}
-      <div className="flex gap-2">
-        <button className={tabClass("pending", activeTab === "pending")} onClick={() => setActiveTab("pending")}>
+      <div role="tablist" aria-label={t("approvals.title")} className="flex gap-2">
+        <button
+          id="approvals-tab-pending"
+          role="tab"
+          aria-selected={activeTab === "pending"}
+          aria-controls="approvals-panel-pending"
+          tabIndex={activeTab === "pending" ? 0 : -1}
+          className={tabClass("pending", activeTab === "pending")}
+          onClick={() => setActiveTab("pending")}
+        >
           {t("approvals.tabPending")}
           {pendingApprovals.length > 0 && (
             <span className="ml-2 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-warning/20 px-1.5 text-[10px] font-bold text-warning">
@@ -374,15 +387,25 @@ export function ApprovalsPage() {
             </span>
           )}
         </button>
-        <button className={tabClass("audit", activeTab === "audit")} onClick={() => setActiveTab("audit")}>
+        <button
+          id="approvals-tab-audit"
+          role="tab"
+          aria-selected={activeTab === "audit"}
+          aria-controls="approvals-panel-audit"
+          tabIndex={activeTab === "audit" ? 0 : -1}
+          className={tabClass("audit", activeTab === "audit")}
+          onClick={() => setActiveTab("audit")}
+        >
           {t("approvals.tabAuditLog")}
         </button>
       </div>
 
       {activeTab === "audit" ? (
-        <AuditLogTab />
+        <div id="approvals-panel-audit" role="tabpanel" aria-labelledby="approvals-tab-audit">
+          <AuditLogTab />
+        </div>
       ) : (
-        <>
+        <div id="approvals-panel-pending" role="tabpanel" aria-labelledby="approvals-tab-pending">
           {/* Batch action bar */}
           {pendingApprovals.length > 0 && (
             <div className="flex items-center gap-3 flex-wrap">
@@ -526,7 +549,7 @@ export function ApprovalsPage() {
               })}
             </div>
           )}
-        </>
+        </div>
       )}
     </div>
   );

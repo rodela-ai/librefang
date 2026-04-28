@@ -16,7 +16,7 @@ use std::time::Instant;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing::info;
 
 /// Daemon info written to `~/.librefang/daemon.json` so the CLI can find us.
@@ -47,6 +47,8 @@ fn api_v1_routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(routes::config::router())
         .merge(routes::agents::router())
+        .merge(routes::audit::router())
+        .merge(routes::authz::router())
         .merge(routes::channels::router())
         .merge(routes::system::router())
         .merge(routes::memory::router())
@@ -62,6 +64,7 @@ fn api_v1_routes() -> Router<Arc<AppState>> {
         .merge(routes::media::router())
         .merge(routes::prompts::routes())
         .merge(routes::terminal::router())
+        .merge(routes::users::router())
         // Dashboard credential login (handler defined locally in server.rs)
         .route(
             "/auth/dashboard-login",
@@ -208,7 +211,30 @@ pub(crate) fn configured_user_api_keys(kernel: &LibreFangKernel) -> Vec<middlewa
                 name: user.name.clone(),
                 role: librefang_kernel::auth::UserRole::from_str_role(&user.role),
                 api_key_hash: api_key_hash.to_string(),
+                user_id: librefang_types::agent::UserId::from_name(&user.name),
             })
+        })
+        .collect()
+}
+
+/// Wrap each persisted paired-device api key as an `ApiUserAuth` so the
+/// auth middleware can verify mobile bearers against the same in-memory
+/// table it uses for config-defined users. `device:{id}` namespacing keeps
+/// device entries distinguishable from regular users — `pairing_remove_device`
+/// also keys on this prefix when revoking access.
+pub(crate) fn paired_device_user_keys(kernel: &LibreFangKernel) -> Vec<middleware::ApiUserAuth> {
+    kernel
+        .pairing_ref()
+        .device_api_keys()
+        .into_iter()
+        .map(|(device_id, api_key_hash)| {
+            let name = format!("device:{device_id}");
+            middleware::ApiUserAuth {
+                user_id: librefang_types::agent::UserId::from_name(&name),
+                role: librefang_kernel::auth::UserRole::User,
+                api_key_hash,
+                name,
+            }
         })
         .collect()
 }
@@ -315,13 +341,28 @@ async fn dashboard_login(
                         }))
                         .into_response();
                     }
+                    // Replay-prevention check (#3359): reject a code already used
+                    // in the last 60 seconds.
+                    if state.kernel.approvals().is_totp_code_used(totp_code) {
+                        return (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            axum::response::Json(serde_json::json!({
+                                "ok": false,
+                                "error": "TOTP code has already been used. Wait for the next 30-second window.",
+                            })),
+                        )
+                            .into_response();
+                    }
                     // Verify TOTP code
                     let secret = state.kernel.vault_get("totp_secret").unwrap_or_default();
                     let issuer = policy.totp_issuer.clone();
                     match librefang_kernel::approval::ApprovalManager::verify_totp_code_with_issuer(
                         &secret, totp_code, &issuer,
                     ) {
-                        Ok(true) => { /* TOTP valid, proceed to session creation */ }
+                        Ok(true) => {
+                            // Mark code as used so it cannot be replayed.
+                            state.kernel.approvals().record_totp_code_used(totp_code);
+                        }
                         Ok(false) => {
                             return (
                                 axum::http::StatusCode::UNAUTHORIZED,
@@ -348,9 +389,18 @@ async fn dashboard_login(
             }
 
             // Store the session token so the auth middleware can validate it.
+            // Attach the dashboard credential identity so the middleware can
+            // attribute follow-up requests to an Owner-level principal — without
+            // this, the session matches but the request stays anonymous and
+            // RBAC-gated handlers (audit/query, per-user budget writes) reject
+            // the dashboard caller as `None`. dashboard_pass is a single
+            // operator-level credential, so Owner is the right ceiling.
+            let mut session = token.clone();
+            session.user_name = Some(cfg_user.clone());
+            session.user_role = Some("owner".to_string());
             {
                 let mut sessions = state.active_sessions.write().await;
-                sessions.insert(token.token.clone(), token.clone());
+                sessions.insert(session.token.clone(), session);
                 // Persist so sessions survive daemon restarts.
                 save_sessions(state.kernel.home_dir(), &sessions);
             }
@@ -732,6 +782,9 @@ fn load_sessions(
 }
 
 /// Persist active sessions to disk so they survive daemon restarts.
+///
+/// SECURITY: The file is written with owner-only permissions (0600) so that
+/// bearer tokens stored in it cannot be read by other local users (#3589/#3725).
 fn save_sessions(
     home_dir: &std::path::Path,
     sessions: &std::collections::HashMap<String, crate::password_hash::SessionToken>,
@@ -741,6 +794,10 @@ fn save_sessions(
         Ok(content) => {
             if let Err(e) = std::fs::write(&path, content) {
                 tracing::warn!("Failed to persist sessions: {e}");
+            } else {
+                // Restrict to owner-read/write only so bearer tokens are not
+                // world-readable on multi-user systems.
+                restrict_permissions(&path);
             }
         }
         Err(e) => tracing::warn!("Failed to serialize sessions: {e}"),
@@ -792,6 +849,16 @@ pub async fn build_router(
     // Create api_key_lock before AppState so both AppState and AuthState share the same Arc.
     let api_key = valid_api_tokens(kernel.as_ref()).join("\n");
     let api_key_lock = Arc::new(tokio::sync::RwLock::new(api_key));
+    // Per-user API key snapshot is wrapped in a `RwLock` so the rotate-key
+    // endpoint (`POST /api/users/{name}/rotate-key`) can swap entries live —
+    // both AppState (mutator) and AuthState (reader) share the same Arc, so
+    // the next request after rotation sees the new hash and the old plaintext
+    // bearer token immediately fails authentication.
+    let user_api_keys_lock = Arc::new(tokio::sync::RwLock::new({
+        let mut keys = configured_user_api_keys(kernel.as_ref());
+        keys.extend(paired_device_user_keys(kernel.as_ref()));
+        keys
+    }));
 
     let state = Arc::new(AppState {
         kernel: kernel.clone(),
@@ -809,11 +876,13 @@ pub async fn build_router(
         ),
         active_sessions: active_sessions.clone(),
         api_key_lock: api_key_lock.clone(),
+        user_api_keys: user_api_keys_lock.clone(),
         media_drivers: librefang_runtime::media::MediaDriverCache::new_with_urls(
             kernel.config_ref().provider_urls.clone(),
         ),
         webhook_router,
         config_write_lock: tokio::sync::Mutex::new(()),
+        pending_a2a_agents: dashmap::DashMap::new(),
         #[cfg(feature = "telemetry")]
         prometheus_handle: prom_handle,
     });
@@ -852,11 +921,13 @@ pub async fn build_router(
             .allow_headers(tower_http::cors::Any)
     };
 
-    // AuthState shares api_key_lock with AppState so change_password can update it live.
-    let user_api_keys_vec = configured_user_api_keys(state.kernel.as_ref());
+    // AuthState shares api_key_lock + user_api_keys with AppState so
+    // change_password / rotate-key can update them live without a daemon
+    // restart.
+    let user_api_keys_initial_len = state.user_api_keys.read().await.len();
     let dashboard_auth_enabled = has_dashboard_credentials(state.kernel.as_ref());
     let api_key_set = !state.kernel.config_ref().api_key.trim().is_empty();
-    let any_auth = api_key_set || !user_api_keys_vec.is_empty() || dashboard_auth_enabled;
+    let any_auth = api_key_set || user_api_keys_initial_len > 0 || dashboard_auth_enabled;
 
     // Resolve the effective value of `require_auth_for_reads`.
     // - Explicit `Some(true)`  → operators are forcing the allowlist
@@ -889,12 +960,53 @@ pub async fn build_router(
              to restore the legacy public reads allowlist."
         );
     }
+    // Read LIBREFANG_ALLOW_NO_AUTH once at boot — operators flip this to
+    // run intentionally open on a non-loopback bind. Without it, an empty
+    // api_key on a LAN/public bind fails closed for non-loopback origins.
+    let allow_no_auth = std::env::var("LIBREFANG_ALLOW_NO_AUTH")
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false);
+
+    // Loud startup warning when the server is bound to a non-loopback
+    // address with no authentication configured. The middleware enforces
+    // fail-closed for non-loopback traffic; this warning makes the
+    // operator-facing posture explicit at boot.
+    //
+    // The default bind address is 127.0.0.1:4545 (loopback-only). Operators
+    // who change api_listen to 0.0.0.0 or a public IP without configuring auth
+    // get a security warning here (#3572).
+    let bind_is_loopback = listen_addr.ip().is_loopback();
+    if !any_auth && !bind_is_loopback {
+        if allow_no_auth {
+            // LIBREFANG_ALLOW_NO_AUTH=1 means the operator knowingly accepted
+            // the risk. Use error! so the message stands out in logs regardless
+            // of the configured log level.
+            tracing::error!(
+                "SECURITY WARNING: librefang is listening on {} with no authentication. \
+                 Set api_key in config.toml or use 127.0.0.1:4545 for local-only access. \
+                 (LIBREFANG_ALLOW_NO_AUTH=1 — operator accepted risk; running open.)",
+                listen_addr
+            );
+        } else {
+            tracing::warn!(
+                "SECURITY WARNING: librefang is listening on {} with no authentication. \
+                 Set api_key in config.toml or use 127.0.0.1:4545 for local-only access. \
+                 Non-loopback requests will be rejected with 401 until an api_key is set.",
+                listen_addr
+            );
+        }
+    }
+
     let auth_state = middleware::AuthState {
         api_key_lock: api_key_lock.clone(),
         active_sessions: active_sessions.clone(),
         dashboard_auth_enabled,
-        user_api_keys: Arc::new(user_api_keys_vec),
+        user_api_keys: state.user_api_keys.clone(),
         require_auth_for_reads,
+        allow_no_auth,
+        // RBAC M5: hand the audit log to the auth layer so role-denial
+        // events land in the same hash chain as everything else.
+        audit_log: Some(state.kernel.audit().clone()),
     };
     let rl_cfg = state.kernel.config_ref().rate_limit.clone();
     let gcra_limiter = rate_limiter::GcraState {
@@ -906,6 +1018,19 @@ pub async fn build_router(
     // in api_v1_routes() and mounted at both /api and /api/v1 for backward
     // compatibility. Future versions (v2, v3) can be added as separate routers.
     let v1_routes = api_v1_routes();
+
+    // Upload routes are defined separately so they can share the auth/rate-limit
+    // layers but bypass RequestBodyLimitLayer — the handler enforces its own
+    // configurable max_upload_size_bytes (default 10 MB).
+    let upload_routes = Router::new()
+        .route(
+            "/api/agents/{id}/upload",
+            axum::routing::post(routes::agents::upload_file),
+        )
+        .route(
+            "/api/v1/agents/{id}/upload",
+            axum::routing::post(routes::agents::upload_file),
+        );
 
     let app = Router::new()
         .route("/", axum::routing::get(webchat::webchat_page))
@@ -935,8 +1060,19 @@ pub async fn build_router(
         // Webhook trigger endpoints (not versioned — external callers use fixed URLs)
         .route("/hooks/wake", axum::routing::post(routes::webhook_wake))
         .route("/hooks/agent", axum::routing::post(routes::webhook_agent))
-        // A2A protocol endpoints + MCP HTTP (protocol-level, not versioned)
-        .merge(routes::network::protocol_router())
+        // A2A protocol endpoints + MCP HTTP (protocol-level, not versioned).
+        // Apply an explicit body limit (1 MB) to inbound A2A task payloads so
+        // that external callers cannot exhaust server memory via oversized JSON
+        // bodies. This is a defence-in-depth companion to the global
+        // RequestBodyLimitLayer applied further down — the global limit uses the
+        // operator-configurable max_request_body_bytes value, which may be
+        // raised for other endpoints (e.g. file uploads). Pinning A2A separately
+        // ensures memory exhaustion DoS attacks via /a2a/tasks/send are always
+        // bounded (Bug #3785).
+        .merge(
+            routes::network::protocol_router()
+                .layer(RequestBodyLimitLayer::new(1024 * 1024)),
+        )
         // MCP HTTP endpoint (protocol-level, not versioned)
         .route("/mcp", axum::routing::post(routes::mcp_http))
         // OpenAI-compatible API (follows OpenAI versioning, not ours)
@@ -948,6 +1084,11 @@ pub async fn build_router(
             "/v1/models",
             axum::routing::get(crate::openai_compat::list_models),
         )
+        // Upload routes must be merged BEFORE the layer calls so that auth and
+        // rate-limit middleware apply to them.  They are intentionally excluded
+        // from RequestBodyLimitLayer (applied below) because the handler
+        // enforces its own configurable limit.
+        .merge(upload_routes)
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
             middleware::auth,
@@ -965,27 +1106,26 @@ pub async fn build_router(
         .layer(axum::middleware::from_fn(middleware::security_headers))
         .layer(axum::middleware::from_fn(middleware::request_logging))
         .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
+        // INFO-level request spans so they're created even when the console
+        // log level is INFO. Required for the OpenTelemetry layer to pick
+        // them up and ship to the OTLP collector — at DEBUG (the default for
+        // `new_for_http`) spans never exist at INFO and the OTel exporter
+        // sees nothing.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO)),
+        )
         .layer(cors);
 
-    // Split body-limit application: apply the global limit to the main app,
-    // then merge the upload route WITHOUT the limit.  The handler enforces its
-    // own configurable max_upload_size_bytes (default 10 MB).
-    let upload_routes = Router::new()
-        .route(
-            "/api/agents/{id}/upload",
-            axum::routing::post(routes::agents::upload_file),
-        )
-        .route(
-            "/api/v1/agents/{id}/upload",
-            axum::routing::post(routes::agents::upload_file),
-        );
-
-    let app = app
-        .layer(RequestBodyLimitLayer::new(
-            kernel.config_ref().max_request_body_bytes,
-        ))
-        .merge(upload_routes);
+    // Apply the global request body size limit to the full app.  Upload routes
+    // were merged before the security layers above and therefore covered by
+    // auth/rate-limit, but they are NOT wrapped by this layer — Axum layers
+    // only apply to routes registered before the layer call, so routes merged
+    // after this point (channel_routes below) are also exempt.  Upload handler
+    // enforces its own max_upload_size_bytes cap instead.
+    let app = app.layer(RequestBodyLimitLayer::new(
+        kernel.config_ref().max_request_body_bytes,
+    ));
 
     // NOTE: HTTP metrics are recorded inside `request_logging` middleware via
     // `librefang_telemetry::metrics::record_http_request()`.  A separate metrics
@@ -995,24 +1135,34 @@ pub async fn build_router(
     // These bypass auth/rate-limit layers since external platforms (Feishu,
     // Teams, etc.) handle their own signature verification.
     // The router is dynamic (behind RwLock) so hot-reload can swap routes.
+    //
+    // SECURITY: Apply a per-route body-size cap *before* merging so that
+    // webhook handlers are not exempt from the global RequestBodyLimitLayer
+    // (which was applied above to `app`). Tower layers wrap the router they
+    // are attached to; a layer added to `app` after `.nest()` would not
+    // cover the nested router. 1 MiB is generous for any webhook payload
+    // (Slack, Teams, Feishu, Line) while capping memory-exhaustion attacks.
+    const WEBHOOK_BODY_LIMIT: usize = 1024 * 1024; // 1 MiB
     let channel_webhook_state = state.webhook_router.clone();
-    let channel_routes = Router::new().fallback(move |req: axum::extract::Request| {
-        let wr = channel_webhook_state.clone();
-        async move {
-            use tower::ServiceExt;
-            let guard = wr.read().await;
-            let router: Arc<axum::Router> = Arc::clone(&guard);
-            drop(guard);
-            // Unwrap the Arc — if we hold the only reference we avoid a clone,
-            // otherwise Router::clone is needed (only during hot-reload overlap).
-            Arc::try_unwrap(router)
-                .unwrap_or_else(|arc| (*arc).clone())
-                .into_service()
-                .oneshot(req)
-                .await
-                .unwrap_or_else(|e: std::convert::Infallible| match e {})
-        }
-    });
+    let channel_routes = Router::new()
+        .fallback(move |req: axum::extract::Request| {
+            let wr = channel_webhook_state.clone();
+            async move {
+                use tower::ServiceExt;
+                let guard = wr.read().await;
+                let router: Arc<axum::Router> = Arc::clone(&guard);
+                drop(guard);
+                // Unwrap the Arc — if we hold the only reference we avoid a clone,
+                // otherwise Router::clone is needed (only during hot-reload overlap).
+                Arc::try_unwrap(router)
+                    .unwrap_or_else(|arc| (*arc).clone())
+                    .into_service()
+                    .oneshot(req)
+                    .await
+                    .unwrap_or_else(|e: std::convert::Infallible| match e {})
+            }
+        })
+        .layer(RequestBodyLimitLayer::new(WEBHOOK_BODY_LIMIT));
     let app = app.nest("/channels", channel_routes);
 
     let app = app.with_state(state.clone());
@@ -1034,13 +1184,77 @@ pub async fn run_daemon(
     kernel.set_self_handle();
     kernel.start_background_agents().await;
 
+    // Auto-start observability stack (OTLP collector + Prometheus + Grafana)
+    // ONLY when the operator has opted in via `telemetry.auto_start_observability_stack`.
+    // Default is off because spinning four containers on every `librefang
+    // start` is a strong implicit side effect; users who only want OTel export
+    // to an existing collector should keep this off and just configure
+    // `otlp_endpoint`. Issue #3136.
+    //
+    // Done before OTLP exporter init so the exporter gate can observe the
+    // actual startup outcome — if `auto_start = true` but Docker is missing
+    // or a port conflict kills compose, we must NOT init the exporter at the
+    // default localhost:4317, otherwise the BatchSpanProcessor spams
+    // ConnectionRefused on every export interval (issue #3136 follow-up).
+    let mut observability_guard: Option<ObservabilityHandle> = if kernel
+        .config_ref()
+        .telemetry
+        .enabled
+        && kernel.config_ref().telemetry.auto_start_observability_stack
+    {
+        let project = derive_compose_project_name(kernel.home_dir());
+        match start_observability_stack(kernel.home_dir(), &project) {
+            Ok(ObservabilityStartup::Started) => {
+                info!(
+                    "Observability stack started ({project}: OTLP :4317/:4318, Tempo :3200, Prometheus :9090, Grafana :3000)"
+                );
+                Some(ObservabilityHandle::new(
+                    kernel.home_dir().to_path_buf(),
+                    project,
+                ))
+            }
+            Ok(ObservabilityStartup::DockerUnavailable) => {
+                info!("Docker not available, skipping observability stack");
+                None
+            }
+            Ok(ObservabilityStartup::ComposeFailed { stderr }) => {
+                tracing::warn!(
+                    "Observability stack failed to start (likely a port conflict on 3000/3200/4317/9090 or an existing stack): {}",
+                    stderr.trim()
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Failed to start observability stack: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Initialize OpenTelemetry OTLP tracing when telemetry feature is compiled
-    // in and the config has `telemetry.enabled = true`.
+    // in and the config has `telemetry.enabled = true`. Skip the exporter when
+    // no collector is reachable: explicit empty endpoint, or default localhost
+    // endpoint without a running bundled stack (auto_start off, OR auto_start
+    // on but startup failed above).
     #[cfg(feature = "telemetry")]
     {
         let cfg = kernel.config_ref();
         if cfg.telemetry.enabled {
-            if let Err(e) = crate::telemetry::init_otel_tracing(
+            let stack_running = observability_guard.is_some();
+            if cfg.telemetry.otlp_export_disabled(stack_running) {
+                tracing::info!(
+                    otlp_endpoint = %cfg.telemetry.otlp_endpoint,
+                    auto_start_observability_stack =
+                        cfg.telemetry.auto_start_observability_stack,
+                    stack_running,
+                    "Telemetry OTLP exporter skipped: no collector reachable. \
+                     Set telemetry.auto_start_observability_stack = true (and \
+                     ensure Docker is available) or override \
+                     telemetry.otlp_endpoint to point at a running collector."
+                );
+            } else if let Err(e) = crate::telemetry::init_otel_tracing(
                 &cfg.telemetry.otlp_endpoint,
                 &cfg.telemetry.service_name,
                 cfg.telemetry.sample_rate,
@@ -1050,7 +1264,10 @@ pub async fn run_daemon(
         }
     }
 
-    // Track background task handles for graceful shutdown
+    // Track background task handles for graceful shutdown.
+    // `bg_shutdown_tx` is broadcast to all looping bg_tasks so they can exit
+    // cleanly before we resort to abort().
+    let (bg_shutdown_tx, _bg_shutdown_rx) = tokio::sync::watch::channel::<bool>(false);
     let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     let (app, state) = build_router(kernel.clone(), addr).await;
@@ -1076,18 +1293,29 @@ pub async fn run_daemon(
     // `task_board.sweep_interval_secs` (default 30s).
     kernel.clone().spawn_task_board_sweep_task();
 
+    // Session stream hub idle GC — drops broadcast entries with no live
+    // receivers so the per-session sender map does not grow unbounded under
+    // churn (multi-client SSE attach, PR #3078).
+    kernel.clone().spawn_session_stream_hub_gc_task();
+
     // Config file hot-reload watcher (polls every 30 seconds).
     // Spawned after `build_router` so it can access `AppState` for bridge reload.
     {
         let k = kernel.clone();
         let st = state.clone();
         let config_path = kernel.home_dir().join("config.toml");
+        let mut shutdown_rx = bg_shutdown_tx.subscribe();
         bg_tasks.push(tokio::spawn(async move {
             let mut last_modified = std::fs::metadata(&config_path)
                 .and_then(|m| m.modified())
                 .ok();
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tokio::select! {
+                    // Graceful shutdown signal: exit the loop so the task
+                    // finishes cleanly instead of being aborted mid-operation.
+                    _ = shutdown_rx.wait_for(|v| *v) => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                }
                 let current = std::fs::metadata(&config_path)
                     .and_then(|m| m.modified())
                     .ok();
@@ -1146,7 +1374,9 @@ pub async fn run_daemon(
             }
             // Stale PID file (process dead or different process reused PID), remove it
             info!("Removing stale daemon info file");
-            let _ = std::fs::remove_file(info_path);
+            if let Err(e) = std::fs::remove_file(info_path) {
+                tracing::warn!("Failed to remove stale daemon info file: {e}");
+            }
         }
 
         let daemon_info = DaemonInfo {
@@ -1157,7 +1387,9 @@ pub async fn run_daemon(
             platform: std::env::consts::OS.to_string(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&daemon_info) {
-            let _ = std::fs::write(info_path, json);
+            if let Err(e) = std::fs::write(info_path, json) {
+                tracing::warn!("Failed to write daemon info file: {e}");
+            }
             // SECURITY: Restrict daemon info file permissions (contains PID and port).
             restrict_permissions(info_path);
         }
@@ -1174,36 +1406,10 @@ pub async fn run_daemon(
     info!("WebChat UI available at http://{addr}/",);
     info!("WebSocket endpoint: ws://{addr}/api/agents/{{id}}/ws",);
 
-    // Auto-start observability stack (Prometheus + Grafana) if Docker is available
-    let observability_started = if kernel.config_ref().telemetry.enabled {
-        match start_observability_stack() {
-            Ok(ObservabilityStartup::Started) => {
-                info!("Observability stack started (Prometheus :9090, Grafana :3000)");
-                true
-            }
-            Ok(ObservabilityStartup::DockerUnavailable) => {
-                info!("Docker not available, skipping observability stack");
-                false
-            }
-            Ok(ObservabilityStartup::ComposeFailed { stderr }) => {
-                tracing::warn!(
-                    "Observability stack failed to start (likely a port conflict on 9090/3000 or an existing stack): {}",
-                    stderr.trim()
-                );
-                false
-            }
-            Err(e) => {
-                tracing::warn!("Failed to start observability stack: {e}");
-                false
-            }
-        }
-    } else {
-        false
-    };
-
     // Background: sync model catalog from community repo on startup, then every 24 hours
     {
         let kernel = state.kernel.clone();
+        let mut shutdown_rx = bg_shutdown_tx.subscribe();
         bg_tasks.push(tokio::spawn(async move {
             loop {
                 let cfg = kernel.config_snapshot();
@@ -1240,7 +1446,11 @@ pub async fn run_daemon(
                         );
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+                // Wait 24 hours or until shutdown signal, whichever comes first.
+                tokio::select! {
+                    _ = shutdown_rx.wait_for(|v| *v) => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)) => {}
+                }
             }
         }));
     }
@@ -1248,11 +1458,15 @@ pub async fn run_daemon(
     // Background: periodic GC for API-layer caches (every 5 minutes)
     {
         let st = state.clone();
+        let mut shutdown_rx = bg_shutdown_tx.subscribe();
         bg_tasks.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
             interval.tick().await; // Skip first immediate tick
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = shutdown_rx.wait_for(|v| *v) => break,
+                    _ = interval.tick() => {}
+                }
 
                 // Evict expired clawhub/skillhub cache entries (120s TTL)
                 let cache_ttl = std::time::Duration::from_secs(120);
@@ -1318,18 +1532,33 @@ pub async fn run_daemon(
     .with_graceful_shutdown(shutdown_signal(api_shutdown))
     .await?;
 
-    // Abort tracked background tasks (config reload watcher, catalog sync)
-    for handle in &bg_tasks {
-        handle.abort();
-    }
+    // Signal background tasks to exit their loops gracefully, then wait up to
+    // 5 seconds for each to finish. Abort any that haven't exited by then so
+    // we don't stall shutdown indefinitely.
+    let _ = bg_shutdown_tx.send(true);
+    let grace = std::time::Duration::from_secs(5);
     for handle in bg_tasks {
-        let _ = handle.await;
+        let abort = handle.abort_handle();
+        match tokio::time::timeout(grace, handle).await {
+            Ok(_) => {}
+            Err(_) => {
+                // Task did not finish within the grace period — abort as a
+                // last resort so a mid-operation task does not stall shutdown.
+                tracing::warn!(
+                    "Background task did not finish within {}s of shutdown signal; aborting",
+                    grace.as_secs()
+                );
+                abort.abort();
+            }
+        }
     }
     info!("Background tasks stopped");
 
     // Clean up daemon info file
     if let Some(info_path) = daemon_info_path {
-        let _ = std::fs::remove_file(info_path);
+        if let Err(e) = std::fs::remove_file(info_path) {
+            tracing::warn!("Failed to remove daemon info file on shutdown: {e}");
+        }
     }
 
     // Stop channel bridges
@@ -1337,13 +1566,16 @@ pub async fn run_daemon(
         b.stop().await;
     }
 
-    // Stop observability stack
-    if observability_started {
-        if let Err(e) = stop_observability_stack() {
-            tracing::warn!("Failed to stop observability stack: {e}");
-        } else {
-            info!("Observability stack stopped");
+    // Stop observability stack — graceful path. `.take()` consumes the guard
+    // so its Drop becomes a no-op; if we never reach this line (panic, OOM,
+    // SIGTERM) the Drop impl will still attempt a best-effort `compose down`.
+    if let Some(handle) = observability_guard.take() {
+        match stop_observability_stack(handle.home_dir(), handle.project_name()) {
+            Ok(()) => info!("Observability stack stopped ({})", handle.project_name()),
+            Err(e) => tracing::warn!("Failed to stop observability stack: {e}"),
         }
+        // Mark the guard's stop as already attempted so its Drop is silent.
+        std::mem::forget(handle);
     }
 
     // Clean up tmux session so child shell processes don't linger after shutdown.
@@ -1386,8 +1618,143 @@ enum ObservabilityStartup {
     ComposeFailed { stderr: String },
 }
 
-/// Check if Docker is available and start the observability stack.
-fn start_observability_stack() -> Result<ObservabilityStartup, Box<dyn std::error::Error>> {
+/// Observability assets embedded at compile time. Written to
+/// `<home>/observability/` on boot so Docker Desktop (macOS) can bind-mount
+/// them from a path that is always in its File Sharing list (`~`). Avoids
+/// the `operation not permitted` failure we hit when the daemon runs from
+/// an external disk (`/Volumes/...`) that the user has not added manually.
+const OBSERVABILITY_ASSETS: &[(&str, &str)] = &[
+    (
+        "docker-compose.observability.yml",
+        include_str!("../../../deploy/docker-compose.observability.yml"),
+    ),
+    (
+        "prometheus/prometheus.yml",
+        include_str!("../../../deploy/prometheus/prometheus.yml"),
+    ),
+    (
+        "otel-collector/config.yaml",
+        include_str!("../../../deploy/otel-collector/config.yaml"),
+    ),
+    (
+        "tempo/tempo.yaml",
+        include_str!("../../../deploy/tempo/tempo.yaml"),
+    ),
+    (
+        "grafana/provisioning/datasources/prometheus.yml",
+        include_str!("../../../deploy/grafana/provisioning/datasources/prometheus.yml"),
+    ),
+    (
+        "grafana/provisioning/datasources/tempo.yml",
+        include_str!("../../../deploy/grafana/provisioning/datasources/tempo.yml"),
+    ),
+    (
+        "grafana/provisioning/dashboards/dashboard.yml",
+        include_str!("../../../deploy/grafana/provisioning/dashboards/dashboard.yml"),
+    ),
+    (
+        "grafana/dashboards/librefang.json",
+        include_str!("../../../deploy/grafana/dashboards/librefang.json"),
+    ),
+    (
+        "grafana/dashboards/librefang-llm.json",
+        include_str!("../../../deploy/grafana/dashboards/librefang-llm.json"),
+    ),
+    (
+        "grafana/dashboards/librefang-http.json",
+        include_str!("../../../deploy/grafana/dashboards/librefang-http.json"),
+    ),
+    (
+        "grafana/dashboards/librefang-cost.json",
+        include_str!("../../../deploy/grafana/dashboards/librefang-cost.json"),
+    ),
+    (
+        "grafana/dashboards/ollama.json",
+        include_str!("../../../deploy/grafana/dashboards/ollama.json"),
+    ),
+];
+
+/// Stage all embedded observability assets under `<home>/observability/`,
+/// overwriting on every call so upgrades ship new configs without
+/// manual intervention. Returns the staged compose file path.
+fn stage_observability_assets(home_dir: &Path) -> std::io::Result<std::path::PathBuf> {
+    let root = home_dir.join("observability");
+    for (rel, contents) in OBSERVABILITY_ASSETS {
+        let target = root.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&target, contents)?;
+    }
+    Ok(root.join("docker-compose.observability.yml"))
+}
+
+/// Derive a Docker Compose project name unique to this `home_dir`. Without
+/// an explicit `-p`, compose falls back to the working-dir basename
+/// (`observability`) which collides between two daemons booted with
+/// different home dirs and lets either tear down the other's stack. Hash
+/// the absolute home_dir path and prefix with `librefang-` so the project
+/// name stays scannable in `docker ps` output. Issue #3136.
+fn derive_compose_project_name(home_dir: &Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    // Canonicalize when possible so equivalent paths (`/tmp/x` vs
+    // `/private/tmp/x` on macOS) map to the same project.
+    let canonical = std::fs::canonicalize(home_dir).unwrap_or_else(|_| home_dir.to_path_buf());
+    canonical.hash(&mut hasher);
+    format!("librefang-{:08x}", hasher.finish() as u32)
+}
+
+/// RAII guard that calls `stop_observability_stack` on Drop. The graceful
+/// shutdown path consumes the guard via `mem::forget` after explicitly
+/// stopping (so success can be logged at the right moment); any path that
+/// skips the explicit stop — panic, early return, axum's error branch —
+/// still gets a best-effort cleanup. SIGKILL is unreachable from here, so
+/// operators on hostile-shutdown paths still need `docker compose -p
+/// librefang-<hash> down` manually; that's acknowledged in issue #3136.
+struct ObservabilityHandle {
+    home_dir: std::path::PathBuf,
+    project_name: String,
+}
+
+impl ObservabilityHandle {
+    fn new(home_dir: std::path::PathBuf, project_name: String) -> Self {
+        Self {
+            home_dir,
+            project_name,
+        }
+    }
+
+    fn home_dir(&self) -> &Path {
+        &self.home_dir
+    }
+
+    fn project_name(&self) -> &str {
+        &self.project_name
+    }
+}
+
+impl Drop for ObservabilityHandle {
+    fn drop(&mut self) {
+        // Best-effort: log the failure but never panic from Drop.
+        if let Err(e) = stop_observability_stack(&self.home_dir, &self.project_name) {
+            tracing::warn!(
+                project = %self.project_name,
+                "non-graceful exit: failed to tear down observability stack: {e}"
+            );
+        }
+    }
+}
+
+/// Check if Docker is available and start the observability stack under
+/// `project_name` so two daemons with different home dirs don't fight over
+/// the same compose project.
+fn start_observability_stack(
+    home_dir: &Path,
+    project_name: &str,
+) -> Result<ObservabilityStartup, Box<dyn std::error::Error>> {
     // Check if docker CLI exists and daemon is reachable
     let docker_check = std::process::Command::new("docker")
         .arg("version")
@@ -1400,11 +1767,11 @@ fn start_observability_stack() -> Result<ObservabilityStartup, Box<dyn std::erro
         _ => return Ok(ObservabilityStartup::DockerUnavailable),
     }
 
-    // Find the compose file relative to the executable or well-known paths
-    let compose_file = find_compose_file()?;
+    let compose_file = stage_observability_assets(home_dir)
+        .map_err(|e| format!("failed to stage observability assets: {e}"))?;
 
     let output = std::process::Command::new("docker")
-        .args(["compose", "-f"])
+        .args(["compose", "-p", project_name, "-f"])
         .arg(&compose_file)
         .args(["up", "-d"])
         .output()
@@ -1419,12 +1786,22 @@ fn start_observability_stack() -> Result<ObservabilityStartup, Box<dyn std::erro
     }
 }
 
-/// Stop the observability stack.
-fn stop_observability_stack() -> Result<(), Box<dyn std::error::Error>> {
-    let compose_file = find_compose_file()?;
+/// Stop the observability stack identified by `project_name`. Idempotent:
+/// returns `Ok(())` when the compose file is missing (already torn down or
+/// never started) or when `compose down` succeeds with no containers.
+fn stop_observability_stack(
+    home_dir: &Path,
+    project_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let compose_file = home_dir
+        .join("observability")
+        .join("docker-compose.observability.yml");
+    if !compose_file.exists() {
+        return Ok(());
+    }
 
     std::process::Command::new("docker")
-        .args(["compose", "-f"])
+        .args(["compose", "-p", project_name, "-f"])
         .arg(&compose_file)
         .args(["down"])
         .stdout(std::process::Stdio::null())
@@ -1435,28 +1812,31 @@ fn stop_observability_stack() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Locate the observability docker-compose file.
-fn find_compose_file() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    // Try relative to current exe
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            // Binary might be in target/release or target/debug
-            for ancestor in dir.ancestors().take(4) {
-                let candidate = ancestor.join("deploy/docker-compose.observability.yml");
-                if candidate.exists() {
-                    return Ok(candidate);
-                }
-            }
-        }
+#[cfg(test)]
+mod observability_tests {
+    use super::*;
+
+    #[test]
+    fn derive_project_name_is_stable_for_same_home() {
+        let p = std::path::PathBuf::from("/tmp/librefang-test-home-a");
+        let a = derive_compose_project_name(&p);
+        let b = derive_compose_project_name(&p);
+        assert_eq!(a, b, "same home_dir must produce the same project name");
+        assert!(
+            a.starts_with("librefang-"),
+            "project name must be operator-recognisable in `docker ps`: {a}"
+        );
     }
 
-    // Try current working directory
-    let cwd_candidate = std::path::PathBuf::from("deploy/docker-compose.observability.yml");
-    if cwd_candidate.exists() {
-        return Ok(cwd_candidate);
+    #[test]
+    fn derive_project_name_differs_for_different_homes() {
+        let a = derive_compose_project_name(std::path::Path::new("/tmp/librefang-home-A"));
+        let b = derive_compose_project_name(std::path::Path::new("/tmp/librefang-home-B"));
+        assert_ne!(
+            a, b,
+            "two daemons with distinct home_dirs must NOT share a compose project"
+        );
     }
-
-    Err("Could not find deploy/docker-compose.observability.yml".into())
 }
 
 /// SECURITY: Restrict file permissions to owner-only (0600) on Unix.
@@ -1464,7 +1844,9 @@ fn find_compose_file() -> Result<std::path::PathBuf, Box<dyn std::error::Error>>
 #[cfg(unix)]
 fn restrict_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!("Failed to restrict permissions on {}: {e}", path.display());
+    }
 }
 
 #[cfg(not(unix))]
@@ -1545,7 +1927,7 @@ fn is_process_alive(pid: u32) -> bool {
 
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = pid;
+        let _ = pid; // suppress unused variable warning on unsupported platforms
         false
     }
 }

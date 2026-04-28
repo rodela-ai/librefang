@@ -9,7 +9,7 @@
 
 use chrono::{Duration, Utc};
 use dashmap::DashMap;
-use librefang_types::agent::AgentId;
+use librefang_types::agent::{AgentId, SessionId, SessionMode};
 use librefang_types::error::{LibreFangError, LibreFangResult};
 use librefang_types::scheduler::{CronJob, CronJobId, CronSchedule};
 use serde::{Deserialize, Serialize};
@@ -74,8 +74,15 @@ pub struct CronScheduler {
     jobs: DashMap<CronJobId, JobMeta>,
     /// Path to the persistence file (`<home>/cron_jobs.json`).
     persist_path: PathBuf,
+    /// Daemon home directory (e.g. `~/.librefang`). Used to enforce the
+    /// `<home>/scripts/` allowlist on `pre_script.argv[0]` at validation time.
+    home_dir: PathBuf,
     /// Global cap on total jobs across all agents (atomic for hot-reload).
     max_total_jobs: AtomicUsize,
+    /// Serializes `persist()` writes so concurrent callers (cron loop, API
+    /// routes, spawned cron tasks) don't corrupt the tmp file by interleaving
+    /// `O_TRUNC`/write/rename on the same path.
+    persist_lock: std::sync::Mutex<()>,
 }
 
 impl CronScheduler {
@@ -88,7 +95,9 @@ impl CronScheduler {
         Self {
             jobs: DashMap::new(),
             persist_path: home_dir.join("data").join("cron_jobs.json"),
+            home_dir: home_dir.to_path_buf(),
             max_total_jobs: AtomicUsize::new(max_total_jobs),
+            persist_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -120,7 +129,11 @@ impl CronScheduler {
     }
 
     /// Persist all jobs to disk via atomic write (write to `.tmp`, then rename).
+    ///
+    /// Serialized through `persist_lock` so concurrent callers can't both
+    /// `O_TRUNC` the same `.tmp` path and produce a torn file before rename.
     pub fn persist(&self) -> LibreFangResult<()> {
+        let _guard = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         let metas: Vec<JobMeta> = self.jobs.iter().map(|r| r.value().clone()).collect();
         let data = serde_json::to_string_pretty(&metas)
             .map_err(|e| LibreFangError::Internal(format!("Failed to serialize cron jobs: {e}")))?;
@@ -129,10 +142,21 @@ impl CronScheduler {
                 LibreFangError::Internal(format!("Failed to create cron jobs dir: {e}"))
             })?;
         }
-        let tmp_path = self.persist_path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, data.as_bytes()).map_err(|e| {
-            LibreFangError::Internal(format!("Failed to write cron jobs temp file: {e}"))
-        })?;
+        let tmp_path = self
+            .persist_path
+            .with_extension(format!("json.tmp.{}", std::process::id()));
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp_path).map_err(|e| {
+                LibreFangError::Internal(format!("Failed to create cron jobs temp file: {e}"))
+            })?;
+            f.write_all(data.as_bytes()).map_err(|e| {
+                LibreFangError::Internal(format!("Failed to write cron jobs temp file: {e}"))
+            })?;
+            f.sync_all().map_err(|e| {
+                LibreFangError::Internal(format!("Failed to fsync cron jobs temp file: {e}"))
+            })?;
+        }
         std::fs::rename(&tmp_path, &self.persist_path).map_err(|e| {
             LibreFangError::Internal(format!("Failed to rename cron jobs file: {e}"))
         })?;
@@ -164,8 +188,11 @@ impl CronScheduler {
             .filter(|r| r.value().job.agent_id == job.agent_id)
             .count();
 
-        // CronJob.validate returns Result<(), String>
-        job.validate(agent_count)
+        // CronJob.validate_with_home returns Result<(), String>.
+        // Passing `Some(home_dir)` enables the `<home>/scripts/` allowlist
+        // check on `pre_script.argv[0]` and the dangerous-env-key denylist
+        // on `pre_script.env` (defends against `LD_PRELOAD`, `PATH`, etc.).
+        job.validate_with_home(agent_count, Some(&self.home_dir))
             .map_err(LibreFangError::InvalidInput)?;
 
         // Compute initial next_run
@@ -268,7 +295,37 @@ impl CronScheduler {
                     meta.job.delivery = delivery;
                 }
 
+                // Replace fan-out delivery_targets if provided. Must be an
+                // array of CronDeliveryTarget objects; an empty array clears
+                // all targets.
+                if !updates["delivery_targets"].is_null() {
+                    let targets: Vec<librefang_types::scheduler::CronDeliveryTarget> =
+                        serde_json::from_value(updates["delivery_targets"].clone()).map_err(
+                            |e| LibreFangError::Internal(format!("Invalid delivery_targets: {e}")),
+                        )?;
+                    meta.job.delivery_targets = targets;
+                }
+
                 Ok(meta.job.clone())
+            }
+            None => Err(LibreFangError::Internal(format!("Cron job {id} not found"))),
+        }
+    }
+
+    /// Replace the multi-destination delivery targets on an existing job.
+    ///
+    /// The schedule, action, and primary `delivery` field are left untouched;
+    /// only the `delivery_targets` fan-out list is swapped in. Call
+    /// [`Self::persist`] afterwards to write the change to disk.
+    pub fn set_delivery_targets(
+        &self,
+        id: CronJobId,
+        targets: Vec<librefang_types::scheduler::CronDeliveryTarget>,
+    ) -> LibreFangResult<()> {
+        match self.jobs.get_mut(&id) {
+            Some(mut meta) => {
+                meta.job.delivery_targets = targets;
+                Ok(())
             }
             None => Err(LibreFangError::Internal(format!("Cron job {id} not found"))),
         }
@@ -339,6 +396,55 @@ impl CronScheduler {
         count
     }
 
+    /// Warn about cron fires that were missed while the daemon was offline.
+    ///
+    /// Should be called immediately after [`Self::load`] on daemon startup.
+    /// Any enabled job whose `next_run` is more than 60 seconds in the past
+    /// is considered to have missed at least one fire during downtime. The
+    /// method logs a warning with the estimated missed-fire count and
+    /// immediately reschedules the job to fire on the next tick (by setting
+    /// `next_run = now`) so the scheduler can catch up without further delay.
+    ///
+    /// The 60-second grace window prevents false positives for jobs that
+    /// were just about to fire when the daemon stopped.
+    pub fn warn_missed_fires(&self) {
+        let now = Utc::now();
+        for mut entry in self.jobs.iter_mut() {
+            let meta = entry.value_mut();
+            if !meta.job.enabled {
+                continue;
+            }
+            if let Some(next_run) = meta.job.next_run {
+                let grace = Duration::seconds(60);
+                if next_run < now - grace {
+                    let overdue_secs = (now - next_run).num_seconds();
+                    // Estimate how many fires were skipped based on schedule interval.
+                    let interval_secs: i64 = match &meta.job.schedule {
+                        CronSchedule::Every { every_secs } => *every_secs as i64,
+                        CronSchedule::At { .. } => overdue_secs, // one-shot: effectively 1 missed fire
+                        CronSchedule::Cron { .. } => {
+                            // For cron expressions, approximate with the gap between
+                            // `next_run` and what `next_run` would have been after one cycle.
+                            let hypothetical_next =
+                                compute_next_run_after(&meta.job.schedule, next_run);
+                            (hypothetical_next - next_run).num_seconds().max(1)
+                        }
+                    };
+                    let missed_count = (overdue_secs / interval_secs).max(1);
+                    warn!(
+                        agent_id = %meta.job.agent_id,
+                        job_id = %meta.job.id,
+                        missed_count,
+                        overdue_secs,
+                        "cron job missed fires during daemon downtime; firing now"
+                    );
+                    // Reschedule to fire immediately on the next tick.
+                    meta.job.next_run = Some(now);
+                }
+            }
+        }
+    }
+
     /// Remove all cron jobs belonging to a specific agent.
     ///
     /// Used when an agent is deleted so its cron entries don't linger as
@@ -399,6 +505,65 @@ impl CronScheduler {
         }
     }
 
+    /// Log warnings for any cron jobs that should have fired between
+    /// `since` (typically the daemon's previous shutdown time) and `now`
+    /// but were missed due to the daemon being down.
+    ///
+    /// This is called once at daemon startup, after jobs are loaded from
+    /// disk. It does **not** catch-up-fire the missed jobs — it only
+    /// produces `warn!` log entries so operators can see what was skipped
+    /// (Bug #3828).
+    ///
+    /// The function works by walking `next_run` backwards in time: for
+    /// each enabled job whose `last_run` is older than `since`, it counts
+    /// how many times the schedule would have fired in `[since, now)` and
+    /// emits one warning per missed fire.  For `Every` schedules this is
+    /// an exact count; for `Cron` expression schedules it is approximate
+    /// (iterates up to 1440 times per job to avoid pathological inputs).
+    /// `At` one-shot jobs that have already passed are silently ignored
+    /// (they would have been removed on successful execution anyway).
+    pub fn warn_missed_fires(&self, since: chrono::DateTime<Utc>) {
+        let now = Utc::now();
+        if since >= now {
+            return;
+        }
+        for entry in self.jobs.iter() {
+            let meta = entry.value();
+            if !meta.job.enabled {
+                continue;
+            }
+            // One-shot At-schedules that already passed are expected to be
+            // gone; silence them to avoid false-positive noise.
+            if let CronSchedule::At { at } = &meta.job.schedule {
+                if *at < since {
+                    continue;
+                }
+            }
+            // Find the first time this job *should* have fired after `since`.
+            let mut cursor = compute_next_run_after(&meta.job.schedule, since);
+            let mut missed_count = 0usize;
+            // Safety cap: stop after 1440 iterations (≈1 minute-resolution
+            // cron firing every minute for a day) to avoid spinning on
+            // high-frequency schedules.
+            const MAX_ITER: usize = 1440;
+            while cursor < now && missed_count < MAX_ITER {
+                missed_count += 1;
+                cursor = compute_next_run_after(&meta.job.schedule, cursor);
+            }
+            if missed_count > 0 {
+                warn!(
+                    job = %meta.job.name,
+                    job_id = %meta.job.id,
+                    agent = %meta.job.agent_id,
+                    missed = missed_count,
+                    since = %since.format("%Y-%m-%dT%H:%M:%SZ"),
+                    "Cron: missed {} fire(s) while daemon was down",
+                    missed_count
+                );
+            }
+        }
+    }
+
     // -- Outcome recording --------------------------------------------------
 
     /// Record a successful execution for a job.
@@ -421,6 +586,17 @@ impl CronScheduler {
         };
         if should_remove {
             self.jobs.remove(&id);
+        }
+    }
+
+    /// Record a skipped execution for a job (e.g. agent was Suspended).
+    ///
+    /// Sets `last_status` to `"skipped"` without touching error counters or
+    /// removing one-shot jobs — the job remains scheduled for its next run.
+    pub fn record_skipped(&self, id: CronJobId) {
+        if let Some(mut meta) = self.jobs.get_mut(&id) {
+            meta.last_status = Some("skipped: agent suspended".to_string());
+            debug!(job_id = %id, "Cron job skipped (agent suspended)");
         }
     }
 
@@ -486,6 +662,17 @@ pub fn compute_next_run(schedule: &CronSchedule) -> chrono::DateTime<Utc> {
 /// this offset, calling `compute_next_run` right after a job fires can
 /// return the same minute (or even the same second), causing the
 /// scheduler to re-fire immediately.
+///
+/// # DST safety
+///
+/// All fire times are stored and compared in UTC. `chrono::Local` is never
+/// used internally — even when a job specifies a named `tz` (e.g.
+/// `"America/New_York"`), the computation converts `after` to that timezone
+/// only to honour the user's wall-clock intent, then immediately converts
+/// the result back to UTC before storing it. This means the scheduler is
+/// immune to DST transitions: a "09:00 daily" job in a DST-observing
+/// timezone will naturally shift by one UTC hour at the clock change, but
+/// will never fire twice or be skipped.
 pub fn compute_next_run_after(
     schedule: &CronSchedule,
     after: chrono::DateTime<Utc>,
@@ -530,10 +717,40 @@ pub fn compute_next_run_after(
                             match tz_str.parse::<chrono_tz::Tz>() {
                                 Ok(timezone) => {
                                     let base_local = base.with_timezone(&timezone);
-                                    sched
+                                    let result = sched
                                         .after(&base_local)
                                         .next()
-                                        .map(|dt| dt.with_timezone(&Utc))
+                                        .map(|dt| dt.with_timezone(&Utc));
+
+                                    // Warn when a DST boundary is crossed: spring-forward may
+                                    // silently skip a scheduled local time; fall-back picks the
+                                    // earlier UTC occurrence.
+                                    if let Some(next) = result {
+                                        let next_local = next.with_timezone(&timezone);
+                                        let base_utc_secs = (base_local.naive_utc()
+                                            - base_local.naive_local())
+                                        .num_seconds();
+                                        let next_utc_secs = (next_local.naive_utc()
+                                            - next_local.naive_local())
+                                        .num_seconds();
+                                        if base_utc_secs != next_utc_secs {
+                                            warn!(
+                                                expr = %expr,
+                                                timezone = %tz_str,
+                                                base_local = %base_local.format("%Y-%m-%dT%H:%M:%S%z"),
+                                                adjusted_utc = %next.format("%Y-%m-%dT%H:%M:%SZ"),
+                                                adjusted_local = %next_local.format("%Y-%m-%dT%H:%M:%S%z"),
+                                                "Cron job next-fire crosses a DST boundary in \
+                                                 timezone '{}'; scheduled local time may have been \
+                                                 skipped (spring-forward) or moved to the first \
+                                                 occurrence (fall-back). Next fire adjusted to {}",
+                                                tz_str,
+                                                next.format("%Y-%m-%dT%H:%M:%SZ"),
+                                            );
+                                        }
+                                    }
+
+                                    result
                                 }
                                 Err(_) => {
                                     warn!(
@@ -558,14 +775,108 @@ pub fn compute_next_run_after(
 }
 
 // ---------------------------------------------------------------------------
+// Per-fire session derivation
+// ---------------------------------------------------------------------------
+
+/// Compute `(session_mode_override, session_id_override)` for a cron fire.
+///
+/// `session_mode = Some(New)` means each fire must land on its own isolated
+/// session: the channel-derived branch in `send_message_full` would otherwise
+/// always route cron back to the persistent `(agent, "cron")` session
+/// because the synthetic `SenderContext{channel:"cron"}` wins over a
+/// session-mode override (see CLAUDE.md note on cron + session_mode). We
+/// bypass that by handing `send_message_full` an explicit
+/// `session_id_override` derived from the job id and fire timestamp via
+/// [`SessionId::for_cron_run`], so the override path takes priority over
+/// the channel branch.
+///
+/// `Persistent` (or `None` — historical default) returns `(None, None)`,
+/// preserving the long-standing `(agent, "cron")` shared-session behaviour.
+pub fn cron_fire_session_override(
+    agent_id: AgentId,
+    job_session_mode: Option<SessionMode>,
+    job_id: CronJobId,
+    fire_time: chrono::DateTime<chrono::Utc>,
+) -> (Option<SessionMode>, Option<SessionId>) {
+    if job_session_mode != Some(SessionMode::New) {
+        return (None, None);
+    }
+    let run_key = format!(
+        "{}:{}",
+        job_id.0,
+        fire_time.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+    );
+    (
+        Some(SessionMode::New),
+        Some(SessionId::for_cron_run(agent_id, &run_key)),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, Timelike};
+    use chrono::{Duration, TimeZone, Timelike};
     use librefang_types::scheduler::{CronAction, CronDelivery};
+
+    #[test]
+    fn fire_session_override_persistent_returns_none() {
+        let agent = AgentId::new();
+        let job_id = CronJobId::new();
+        let now = chrono::Utc::now();
+        // Default (no per-job override) — historical persistent cron session.
+        let (mode, sid) = cron_fire_session_override(agent, None, job_id, now);
+        assert!(mode.is_none());
+        assert!(sid.is_none());
+        // Explicit Persistent same.
+        let (mode, sid) =
+            cron_fire_session_override(agent, Some(SessionMode::Persistent), job_id, now);
+        assert!(mode.is_none());
+        assert!(sid.is_none());
+    }
+
+    #[test]
+    fn fire_session_override_new_yields_isolated_id() {
+        let agent = AgentId::new();
+        let job_id = CronJobId::new();
+        let now = chrono::Utc::now();
+        let (mode, sid) = cron_fire_session_override(agent, Some(SessionMode::New), job_id, now);
+        assert_eq!(mode, Some(SessionMode::New));
+        let sid = sid.expect("New must produce a session id override");
+        // And it must NOT collide with the persistent (agent, "cron") session.
+        assert_ne!(sid, SessionId::for_channel(agent, "cron"));
+    }
+
+    #[test]
+    fn fire_session_override_new_distinguishes_two_fires() {
+        let agent = AgentId::new();
+        let job_id = CronJobId::new();
+        // Two distinct timestamps representing two fires.
+        let t1 = chrono::Utc.with_ymd_and_hms(2026, 4, 25, 10, 0, 0).unwrap();
+        let t2 = chrono::Utc.with_ymd_and_hms(2026, 4, 25, 10, 5, 0).unwrap();
+        let (_, sid_a) = cron_fire_session_override(agent, Some(SessionMode::New), job_id, t1);
+        let (_, sid_b) = cron_fire_session_override(agent, Some(SessionMode::New), job_id, t2);
+        assert_ne!(
+            sid_a, sid_b,
+            "two fires of the same New-mode job must yield distinct session ids"
+        );
+    }
+
+    #[test]
+    fn fire_session_override_new_is_deterministic_per_fire() {
+        // Reproducibility: same (agent, job_id, fire_time) must always derive
+        // the same session id — useful for log correlation when a fire's
+        // session id is referenced after the fact.
+        let agent = AgentId::new();
+        let job_id = CronJobId::new();
+        let t = chrono::Utc.with_ymd_and_hms(2026, 4, 25, 10, 0, 0).unwrap();
+        let (_, sid_a) = cron_fire_session_override(agent, Some(SessionMode::New), job_id, t);
+        let (_, sid_b) = cron_fire_session_override(agent, Some(SessionMode::New), job_id, t);
+        assert_eq!(sid_a, sid_b);
+    }
 
     /// Build a minimal valid `CronJob` with an `Every` schedule.
     fn make_job(agent_id: AgentId) -> CronJob {
@@ -579,6 +890,7 @@ mod tests {
                 text: "ping".into(),
             },
             delivery: CronDelivery::None,
+            delivery_targets: Vec::new(),
             peer_id: None,
             session_mode: None,
             created_at: Utc::now(),
@@ -1441,5 +1753,124 @@ mod tests {
             assert!(sched.list_jobs(agent).is_empty());
             assert_eq!(sched.list_jobs(other).len(), 1);
         }
+    }
+
+    // -- delivery_targets management ---------------------------------------
+
+    #[test]
+    fn set_delivery_targets_replaces_existing_list() {
+        use librefang_types::scheduler::CronDeliveryTarget;
+
+        let (sched, _tmp) = make_scheduler(100);
+        let agent = AgentId::new();
+        let id = sched.add_job(make_job(agent), false).unwrap();
+
+        // Initially empty.
+        assert!(sched.get_job(id).unwrap().delivery_targets.is_empty());
+
+        // Set two targets.
+        let targets = vec![
+            CronDeliveryTarget::Channel {
+                channel_type: "slack".into(),
+                recipient: "C123".into(),
+                thread_id: None,
+                account_id: None,
+            },
+            CronDeliveryTarget::LocalFile {
+                path: "/tmp/x.log".into(),
+                append: true,
+            },
+        ];
+        sched.set_delivery_targets(id, targets.clone()).unwrap();
+        assert_eq!(sched.get_job(id).unwrap().delivery_targets, targets);
+
+        // Replace with a single target — full replacement, not append.
+        let single = vec![CronDeliveryTarget::Webhook {
+            url: "https://example.com/hook".into(),
+            auth_header: None,
+        }];
+        sched.set_delivery_targets(id, single.clone()).unwrap();
+        assert_eq!(sched.get_job(id).unwrap().delivery_targets, single);
+
+        // Clear with an empty Vec.
+        sched.set_delivery_targets(id, Vec::new()).unwrap();
+        assert!(sched.get_job(id).unwrap().delivery_targets.is_empty());
+    }
+
+    #[test]
+    fn set_delivery_targets_unknown_id_returns_error() {
+        let (sched, _tmp) = make_scheduler(100);
+        let unknown = CronJobId::new();
+        let res = sched.set_delivery_targets(unknown, Vec::new());
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn update_job_patches_delivery_targets() {
+        use librefang_types::scheduler::CronDeliveryTarget;
+
+        let (sched, _tmp) = make_scheduler(100);
+        let agent = AgentId::new();
+        let id = sched.add_job(make_job(agent), false).unwrap();
+
+        let updates = serde_json::json!({
+            "delivery_targets": [
+                {"type": "webhook", "url": "https://example.com/hook"},
+                {"type": "local_file", "path": "/tmp/y.log"},
+            ]
+        });
+        let updated = sched.update_job(id, &updates).unwrap();
+        assert_eq!(updated.delivery_targets.len(), 2);
+        assert!(matches!(
+            &updated.delivery_targets[0],
+            CronDeliveryTarget::Webhook { url, .. } if url == "https://example.com/hook"
+        ));
+        assert!(matches!(
+            &updated.delivery_targets[1],
+            CronDeliveryTarget::LocalFile { append, .. } if !*append
+        ));
+    }
+
+    #[test]
+    fn update_job_invalid_delivery_targets_rejected() {
+        let (sched, _tmp) = make_scheduler(100);
+        let agent = AgentId::new();
+        let id = sched.add_job(make_job(agent), false).unwrap();
+        let updates = serde_json::json!({
+            "delivery_targets": [{"type": "bogus_target_type"}]
+        });
+        let res = sched.update_job(id, &updates);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn delivery_targets_persist_across_reload() {
+        use librefang_types::scheduler::CronDeliveryTarget;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = AgentId::new();
+        let job_id = {
+            let sched = CronScheduler::new(tmp.path(), 100);
+            let id = sched.add_job(make_job(agent), false).unwrap();
+            sched
+                .set_delivery_targets(
+                    id,
+                    vec![CronDeliveryTarget::Email {
+                        to: "alice@example.com".into(),
+                        subject_template: Some("Cron: {job}".into()),
+                    }],
+                )
+                .unwrap();
+            sched.persist().unwrap();
+            id
+        };
+        let sched = CronScheduler::new(tmp.path(), 100);
+        sched.load().unwrap();
+        let job = sched.get_job(job_id).unwrap();
+        assert_eq!(job.delivery_targets.len(), 1);
+        assert!(matches!(
+            &job.delivery_targets[0],
+            CronDeliveryTarget::Email { to, .. } if to == "alice@example.com"
+        ));
     }
 }

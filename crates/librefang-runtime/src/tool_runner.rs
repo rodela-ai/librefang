@@ -413,7 +413,11 @@ pub async fn execute_tool_raw(
 
     let result = match tool_name {
         // Filesystem tools
-        "file_read" => tool_file_read(input, *workspace_root).await,
+        "file_read" => {
+            let extra = named_ws_prefixes(*kernel, *caller_agent_id);
+            let extra_refs: Vec<&Path> = extra.iter().map(|p| p.as_path()).collect();
+            tool_file_read(input, *workspace_root, &extra_refs).await
+        }
         "file_write" => {
             // Enforce named workspace read-only restrictions before the sandbox resolves the path.
             // Agents learn absolute workspace paths from TOOLS.md; an absolute path that falls
@@ -436,12 +440,77 @@ pub async fn execute_tool_raw(
                 }
             }
             maybe_snapshot(checkpoint_manager, *workspace_root, "pre file_write").await;
-            tool_file_write(input, *workspace_root).await
+            let extra = named_ws_prefixes_writable(*kernel, *caller_agent_id);
+            let extra_refs: Vec<&Path> = extra.iter().map(|p| p.as_path()).collect();
+            tool_file_write(input, *workspace_root, &extra_refs).await
         }
-        "file_list" => tool_file_list(input, *workspace_root).await,
+        "file_list" => {
+            let extra = named_ws_prefixes(*kernel, *caller_agent_id);
+            let extra_refs: Vec<&Path> = extra.iter().map(|p| p.as_path()).collect();
+            tool_file_list(input, *workspace_root, &extra_refs).await
+        }
         "apply_patch" => {
+            // SECURITY #3662: Enforce named workspace read-only restrictions
+            // before applying the patch.  Mirrors the upfront check in the
+            // `file_write` arm: any absolute target path that falls inside a
+            // read-only named workspace is rejected here, before the sandbox
+            // resolver even runs.  The sandbox itself would also block such
+            // writes (readonly workspaces are excluded from `additional_roots`),
+            // but the explicit pre-check catches the violation earlier and
+            // returns a clearer error message.
+            if let (Some(k), Some(agent_id)) = (kernel, caller_agent_id) {
+                let ro = k.readonly_workspace_prefixes(agent_id);
+                if !ro.is_empty() {
+                    // Parse the patch to inspect target paths before executing.
+                    if let Some(patch_str) = input["patch"].as_str() {
+                        if let Ok(ops) = crate::apply_patch::parse_patch(patch_str) {
+                            for op in &ops {
+                                let raw_paths: Vec<&str> = match op {
+                                    crate::apply_patch::PatchOp::AddFile { path, .. } => {
+                                        vec![path.as_str()]
+                                    }
+                                    crate::apply_patch::PatchOp::UpdateFile {
+                                        path,
+                                        move_to,
+                                        ..
+                                    } => {
+                                        let mut v = vec![path.as_str()];
+                                        if let Some(dest) = move_to {
+                                            v.push(dest.as_str());
+                                        }
+                                        v
+                                    }
+                                    crate::apply_patch::PatchOp::DeleteFile { path } => {
+                                        vec![path.as_str()]
+                                    }
+                                };
+                                for raw in raw_paths {
+                                    if Path::new(raw).is_absolute()
+                                        && ro
+                                            .iter()
+                                            .any(|prefix| Path::new(raw).starts_with(prefix))
+                                    {
+                                        return ToolResult {
+                                            tool_use_id: tool_use_id.to_string(),
+                                            content: format!(
+                                                "Write denied: '{}' is in a read-only named workspace",
+                                                raw
+                                            ),
+                                            is_error: true,
+                                            ..Default::default()
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             maybe_snapshot(checkpoint_manager, *workspace_root, "pre apply_patch").await;
-            tool_apply_patch(input, *workspace_root).await
+            // apply_patch needs write access — restrict to rw named workspaces only.
+            let extra = named_ws_prefixes_writable(*kernel, *caller_agent_id);
+            let extra_refs: Vec<&Path> = extra.iter().map(|p| p.as_path()).collect();
+            tool_apply_patch(input, *workspace_root, &extra_refs).await
         }
 
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
@@ -525,6 +594,26 @@ pub async fn execute_tool_raw(
                     ..Default::default()
                 };
             };
+
+            // FIXME(#3822): shell_exec does not enforce readonly_workspace_prefixes.
+            // Named workspaces declared with `mode = "r"` are exposed to the shell
+            // environment via TOOLS.md, but nothing prevents the spawned process from
+            // writing to those directories.  A proper sandbox (e.g. Linux mount
+            // namespaces, macOS sandbox-exec, or a chroot) is required to close this
+            // gap.  Until then we emit a warning whenever readonly prefixes exist so
+            // the issue is visible in daemon logs.
+            // Track: https://github.com/librefang/librefang/issues/3822
+            if let (Some(k), Some(aid)) = (kernel, caller_agent_id) {
+                let ro = k.readonly_workspace_prefixes(aid);
+                if !ro.is_empty() {
+                    tracing::warn!(
+                        agent_id = %aid,
+                        readonly_prefixes = ?ro,
+                        "shell_exec: readonly_workspace_prefixes are not enforced for shell \
+                         commands — the spawned process may write to read-only named workspaces"
+                    );
+                }
+            }
 
             let is_full_exec = exec_policy
                 .is_some_and(|p| p.mode == librefang_types::config::ExecSecurityMode::Full);
@@ -612,6 +701,75 @@ pub async fn execute_tool_raw(
                         is_error: true,
                         ..Default::default()
                     };
+                }
+            }
+
+            // SECURITY (fix #3822): enforce named workspace read-only restrictions for
+            // shell_exec. The shell tool runs commands that can write arbitrary paths,
+            // so we scan the command string (and any explicit args array) for references
+            // to read-only workspace paths and block execution if any are found.
+            // This mirrors the read-only enforcement already applied to file_write and
+            // apply_patch (see the "file_write" arm above).
+            if let (Some(k), Some(agent_id)) = (kernel, caller_agent_id) {
+                let ro_prefixes = k.readonly_workspace_prefixes(agent_id);
+                if !ro_prefixes.is_empty() {
+                    // Collect the command string and all argument strings as a single
+                    // list of tokens to scan. We look for any token that starts with
+                    // (or equals) a read-only workspace prefix, which indicates the
+                    // shell command is targeting a read-only workspace path.
+                    let mut tokens: Vec<&str> = vec![command];
+                    if let Some(args_arr) = input.get("args").and_then(|a| a.as_array()) {
+                        for v in args_arr {
+                            if let Some(s) = v.as_str() {
+                                tokens.push(s);
+                            }
+                        }
+                    }
+                    for ro_prefix in &ro_prefixes {
+                        let prefix_str = ro_prefix.to_string_lossy();
+                        // A token references a read-only workspace if it starts with the
+                        // prefix path. We also check that the match is at a path boundary
+                        // (next char is '/' or the token equals the prefix exactly) to
+                        // avoid false-positives on shared prefixes like /data vs /data2.
+                        let blocked = tokens.iter().any(|token| {
+                            if let Some(rest) = token.strip_prefix(prefix_str.as_ref()) {
+                                rest.is_empty() || rest.starts_with('/')
+                            } else {
+                                false
+                            }
+                        });
+                        // Also check if the prefix path string appears as a contiguous
+                        // substring within the full command (handles redirect operators,
+                        // quoted paths, etc.). This is a best-effort heuristic — the
+                        // primary check is the token scan above.
+                        let in_command = {
+                            let ps = prefix_str.as_ref();
+                            if let Some(idx) = command.find(ps) {
+                                // Verify path boundary after the match
+                                let after = &command[idx + ps.len()..];
+                                after.is_empty()
+                                    || after.starts_with('/')
+                                    || after.starts_with('"')
+                                    || after.starts_with('\'')
+                                    || after.starts_with(' ')
+                            } else {
+                                false
+                            }
+                        };
+                        if blocked || in_command {
+                            // Find the workspace name for the error message. The name is
+                            // not stored in the prefix list, so we report the path.
+                            return ToolResult {
+                                tool_use_id: tool_use_id.to_string(),
+                                content: format!(
+                                    "shell_exec blocked: path '{}' is in a read-only workspace (mode = r). Writes are not allowed.",
+                                    prefix_str
+                                ),
+                                is_error: true,
+                                ..Default::default()
+                            };
+                        }
+                    }
                 }
             }
 
@@ -725,7 +883,7 @@ pub async fn execute_tool_raw(
         "cron_cancel" => tool_cron_cancel(input, *kernel, *caller_agent_id).await,
 
         // Channel send tool (proactive outbound messaging)
-        "channel_send" => tool_channel_send(input, *kernel, *workspace_root).await,
+        "channel_send" => tool_channel_send(input, *kernel, *workspace_root, *sender_id).await,
 
         // Persistent process tools
         "process_start" => tool_process_start(input, *process_manager, *caller_agent_id).await,
@@ -916,11 +1074,13 @@ pub async fn execute_tool_raw(
                 if let Some(skill) = registry.find_tool_provider(other) {
                     debug!(tool = other, skill = %skill.manifest.skill.name, "Dispatching to skill");
                     let skill_dir = skill.path.clone();
+                    let env_policy = kernel.and_then(|k| k.skill_env_passthrough_policy());
                     match librefang_skills::loader::execute_skill_tool(
                         &skill.manifest,
                         &skill.path,
                         other,
                         input,
+                        env_policy.as_ref(),
                     )
                     .await
                     {
@@ -1032,7 +1192,7 @@ pub async fn execute_tool(
         }
     }
 
-    let skip_approval_for_full_exec = tool_name == "shell_exec"
+    let shell_exec_full_mode = tool_name == "shell_exec"
         && exec_policy.is_some_and(|p| p.mode == librefang_types::config::ExecSecurityMode::Full);
 
     // Approval gate: check if this tool requires human approval before execution.
@@ -1050,8 +1210,38 @@ pub async fn execute_tool(
             };
         }
 
+        // Per-user RBAC gate (RBAC M3, issue #3054 Phase 2). Layered on
+        // top of the existing channel deny: an explicit `Deny` here
+        // hard-blocks the call; `NeedsApproval` flips the call into
+        // approval-required mode regardless of the global require list;
+        // `Allow` defers to the existing approval logic.
+        let user_gate = kh.resolve_user_tool_decision(tool_name, sender_id, channel);
+        let force_approval = match &user_gate {
+            librefang_types::user_policy::UserToolGate::Allow => false,
+            librefang_types::user_policy::UserToolGate::Deny { reason } => {
+                warn!(tool_name, channel, %reason, "Execution denied by per-user policy");
+                return ToolResult {
+                    tool_use_id: tool_use_id.to_string(),
+                    content: format!("Execution denied: {reason}"),
+                    is_error: true,
+                    ..Default::default()
+                };
+            }
+            librefang_types::user_policy::UserToolGate::NeedsApproval { reason } => {
+                debug!(tool_name, %reason, "Per-user policy escalating to approval");
+                true
+            }
+        };
+
+        // SECURITY: the shell-Full bypass only applies to the global
+        // `require_approval` list — a user-policy `NeedsApproval` MUST
+        // still route through the approval queue. Without `!force_approval`
+        // here, a user whose RBAC policy demanded approval would have the
+        // call execute directly under Full mode, defeating Phase-2.
+        let skip_approval_for_full_exec = shell_exec_full_mode && !force_approval;
+
         if !skip_approval_for_full_exec
-            && kh.requires_approval_with_context(tool_name, sender_id, channel)
+            && (force_approval || kh.requires_approval_with_context(tool_name, sender_id, channel))
         {
             let agent_id_str = caller_agent_id.unwrap_or("unknown");
             let input_str = input.to_string();
@@ -1081,6 +1271,9 @@ pub async fn execute_tool(
                 sender_id: sender_id.map(|s| s.to_string()),
                 channel: channel.map(|c| c.to_string()),
                 workspace_root: workspace_root.map(|p| p.to_path_buf()),
+                // When the user gate demanded approval, hand-tagged agents
+                // must NOT auto-approve — see kernel `submit_tool_approval`.
+                force_human: force_approval,
             };
             match kh
                 .submit_tool_approval(agent_id_str, tool_name, &summary, deferred, session_id)
@@ -1871,12 +2064,12 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Channel send tool (proactive outbound messaging) ---
         ToolDefinition {
             name: "channel_send".to_string(),
-            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use thread_id to reply in a specific thread/topic.".to_string(),
+            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use thread_id to reply in a specific thread/topic. When recipient is omitted during message handling, the tool automatically replies to the original sender.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "channel": { "type": "string", "description": "Channel adapter name (e.g., 'email', 'telegram', 'slack', 'discord')" },
-                    "recipient": { "type": "string", "description": "Platform-specific recipient identifier (email address, user ID, etc.)" },
+                    "recipient": { "type": "string", "description": "Platform-specific recipient identifier (email address, user ID, etc.). Omit only when replying from an inbound message context where the original sender is available." },
                     "subject": { "type": "string", "description": "Optional subject line (used for email; ignored for other channels)" },
                     "message": { "type": "string", "description": "The message body to send (required for text, optional caption for media)" },
                     "image_url": { "type": "string", "description": "URL of an image to send (supported on Telegram, Discord, Slack)" },
@@ -1891,7 +2084,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "poll_correct_option": { "type": "integer", "description": "Index of the correct answer (0-based, for quiz mode)" },
                     "poll_explanation": { "type": "string", "description": "Explanation shown after answering (quiz mode)" }
                 },
-                "required": ["channel", "recipient"]
+                "required": ["channel"]
             }),
         },
         // --- Hand tools (curated autonomous capability packages) ---
@@ -2241,11 +2434,55 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
 /// unrestricted filesystem access. All file operations MUST be confined
 /// to the agent's workspace directory.
 fn resolve_file_path(raw_path: &str, workspace_root: Option<&Path>) -> Result<PathBuf, String> {
+    resolve_file_path_ext(raw_path, workspace_root, &[])
+}
+
+/// Like [`resolve_file_path`] but accepts additional canonical roots that
+/// should also be considered "inside the sandbox" — used to honor named
+/// workspaces declared in the agent's manifest.
+fn resolve_file_path_ext(
+    raw_path: &str,
+    workspace_root: Option<&Path>,
+    additional_roots: &[&Path],
+) -> Result<PathBuf, String> {
     let root = workspace_root.ok_or(
         "Workspace sandbox not configured: file operations are disabled. \
          Set a workspace_root in the agent manifest or kernel config to enable file tools.",
     )?;
-    crate::workspace_sandbox::resolve_sandbox_path(raw_path, root)
+    crate::workspace_sandbox::resolve_sandbox_path_ext(raw_path, root, additional_roots)
+}
+
+/// Fetch the named-workspace prefixes (all modes) for the calling agent.
+/// Returns an empty vec when either kernel or agent id is missing.
+fn named_ws_prefixes(
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Vec<std::path::PathBuf> {
+    match (kernel, caller_agent_id) {
+        (Some(k), Some(aid)) => k
+            .named_workspace_prefixes(aid)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Like [`named_ws_prefixes`] but only returns prefixes for read-write
+/// workspaces. Used by `file_write` to widen the writable allowlist.
+fn named_ws_prefixes_writable(
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Vec<std::path::PathBuf> {
+    match (kernel, caller_agent_id) {
+        (Some(k), Some(aid)) => k
+            .named_workspace_prefixes(aid)
+            .into_iter()
+            .filter(|(_, mode)| *mode == librefang_types::agent::WorkspaceMode::ReadWrite)
+            .map(|(p, _)| p)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2307,9 +2544,10 @@ async fn maybe_snapshot(
 async fn tool_file_read(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    additional_roots: &[&Path],
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path_ext(raw_path, workspace_root, additional_roots)?;
     tokio::fs::read_to_string(&resolved)
         .await
         .map_err(|e| format!("Failed to read file: {e}"))
@@ -2318,9 +2556,10 @@ async fn tool_file_read(
 async fn tool_file_write(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    additional_roots: &[&Path],
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path_ext(raw_path, workspace_root, additional_roots)?;
     let content = input["content"]
         .as_str()
         .ok_or("Missing 'content' parameter")?;
@@ -2342,11 +2581,12 @@ async fn tool_file_write(
 async fn tool_file_list(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    additional_roots: &[&Path],
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or(
         "Missing 'path' parameter — retry with {\"path\": \".\"} to list the workspace root",
     )?;
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path_ext(raw_path, workspace_root, additional_roots)?;
     let mut entries = tokio::fs::read_dir(&resolved)
         .await
         .map_err(|e| format!("Failed to list directory: {e}"))?;
@@ -2375,11 +2615,12 @@ async fn tool_file_list(
 async fn tool_apply_patch(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    additional_roots: &[&Path],
 ) -> Result<String, String> {
     let patch_str = input["patch"].as_str().ok_or("Missing 'patch' parameter")?;
     let root = workspace_root.ok_or("apply_patch requires a workspace root")?;
     let ops = crate::apply_patch::parse_patch(patch_str)?;
-    let result = crate::apply_patch::apply_patch(&ops, root).await;
+    let result = crate::apply_patch::apply_patch(&ops, root, additional_roots).await;
     if result.is_ok() {
         Ok(result.summary())
     } else {
@@ -2582,6 +2823,10 @@ async fn tool_shell_exec(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
+    // Ensure the child is terminated when the Child handle is dropped (e.g.
+    // on timeout or session cancellation) rather than becoming an orphan.
+    cmd.kill_on_drop(true);
+
     // Spawn the child process so we hold a handle that can be killed if the
     // session interrupt fires while the command is running.  Using `output()`
     // instead would block until the process *completes*, meaning cancel() would
@@ -2685,6 +2930,15 @@ async fn tool_agent_send(
     let message = input["message"]
         .as_str()
         .ok_or("Missing 'message' parameter")?;
+
+    // Self-send guard: sending a message to oneself would attempt to acquire
+    // `agent_msg_locks[id]` while that lock is already held by the current
+    // turn, causing an unrecoverable deadlock (issue #3613).
+    if let Some(caller) = caller_agent_id {
+        if caller == agent_id {
+            return Err("agent_send: an agent cannot send a message to itself".to_string());
+        }
+    }
 
     // Taint check: refuse to pass obvious credential payloads across
     // the agent boundary. `tool_agent_send` is the entry point for
@@ -3840,6 +4094,7 @@ async fn tool_channel_send(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
     workspace_root: Option<&Path>,
+    sender_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
 
@@ -3848,9 +4103,16 @@ async fn tool_channel_send(
         .ok_or("Missing 'channel' parameter")?
         .trim()
         .to_lowercase();
+
+    // Use recipient from input, or fall back to sender_id from context
+    // This allows agents to reply to the original sender without explicitly
+    // knowing the platform-specific ID (e.g., Telegram chat_id)
     let recipient = input["recipient"]
         .as_str()
-        .ok_or("Missing 'recipient' parameter")?
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(sender_id)
+        .ok_or("Missing 'recipient' parameter. When replying to the original sender, recipient is auto-filled — ensure channel_send is called in response to a message.")?
         .trim();
 
     if recipient.is_empty() {
@@ -5055,6 +5317,7 @@ async fn convert_to_ogg_opus(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn();
 
     let mut child = match spawn_result {
@@ -6078,6 +6341,7 @@ mod tests {
     async fn test_tool_a2a_send_blocks_secret_in_message() {
         let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
             approval_requests: Arc::new(AtomicUsize::new(0)),
+            user_gate_override: None,
         });
         let input = serde_json::json!({
             "agent_url": "https://example.com/a2a",
@@ -6096,13 +6360,14 @@ mod tests {
     async fn test_tool_channel_send_blocks_secret_in_text_message() {
         let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
             approval_requests: Arc::new(AtomicUsize::new(0)),
+            user_gate_override: None,
         });
         let input = serde_json::json!({
             "channel": "telegram",
             "recipient": "@user",
             "message": "here is the api_key=sk-abcdefghijklmnop",
         });
-        let err = tool_channel_send(&input, Some(&kernel), None)
+        let err = tool_channel_send(&input, Some(&kernel), None, Some("test_user_id"))
             .await
             .expect_err("channel_send must reject tainted message");
         assert!(
@@ -6115,6 +6380,7 @@ mod tests {
     async fn test_tool_channel_send_blocks_secret_in_image_caption() {
         let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
             approval_requests: Arc::new(AtomicUsize::new(0)),
+            user_gate_override: None,
         });
         let input = serde_json::json!({
             "channel": "telegram",
@@ -6122,7 +6388,7 @@ mod tests {
             "image_url": "https://example.com/cat.png",
             "message": "see attached. token=sk-abcdefghijklmnop",
         });
-        let err = tool_channel_send(&input, Some(&kernel), None)
+        let err = tool_channel_send(&input, Some(&kernel), None, Some("test_user_id"))
             .await
             .expect_err("image caption must be sink-checked");
         assert!(
@@ -6135,6 +6401,7 @@ mod tests {
     async fn test_tool_channel_send_blocks_secret_in_poll_question() {
         let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
             approval_requests: Arc::new(AtomicUsize::new(0)),
+            user_gate_override: None,
         });
         let input = serde_json::json!({
             "channel": "telegram",
@@ -6142,7 +6409,7 @@ mod tests {
             "poll_question": "guess my api_key=sk-abcdefghijklmnop",
             "poll_options": ["yes", "no"],
         });
-        let err = tool_channel_send(&input, Some(&kernel), None)
+        let err = tool_channel_send(&input, Some(&kernel), None, Some("test_user_id"))
             .await
             .expect_err("poll question must be sink-checked");
         assert!(
@@ -6151,8 +6418,65 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_tool_channel_send_auto_fills_recipient_from_sender_id() {
+        // Test that channel_send uses sender_id when recipient is omitted
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::new(AtomicUsize::new(0)),
+            user_gate_override: None,
+        });
+        let input = serde_json::json!({
+            "channel": "telegram",
+            // recipient intentionally omitted
+            "message": "Hello from auto-reply!",
+        });
+        // This should NOT error with "Missing recipient" because sender_id is provided
+        // It will error with "Channel file data send not available" because the mock kernel
+        // doesn't implement channel_send, but that's expected
+        let result = tool_channel_send(&input, Some(&kernel), None, Some("12345_telegram")).await;
+        // The error should NOT be about missing recipient
+        let err_msg = result.unwrap_err();
+        assert!(
+            !err_msg.contains("Missing 'recipient'"),
+            "Expected auto-fill to work, but got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_channel_send_requires_recipient_without_sender_id() {
+        // Test that channel_send still requires recipient when sender_id is None
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::new(AtomicUsize::new(0)),
+            user_gate_override: None,
+        });
+        let input = serde_json::json!({
+            "channel": "telegram",
+            // recipient intentionally omitted
+            "message": "Hello!",
+        });
+        let err = tool_channel_send(&input, Some(&kernel), None, None)
+            .await
+            .expect_err("channel_send must require recipient without sender_id");
+        assert!(
+            err.contains("Missing 'recipient'"),
+            "Expected missing recipient error, got: {err}"
+        );
+    }
+
     struct ApprovalKernel {
         approval_requests: Arc<AtomicUsize>,
+        /// RBAC M3 — overrides what `resolve_user_tool_decision` returns
+        /// for every call. `None` keeps the default-impl behaviour
+        /// (`UserToolGate::Allow`) so pre-RBAC tests are unaffected.
+        user_gate_override: Option<librefang_types::user_policy::UserToolGate>,
+    }
+
+    /// Captures the `DeferredToolExecution.force_human` flag so tests
+    /// can assert that the user-gate escalation propagates through.
+    struct ForceHumanCapturingKernel {
+        approval_requests: Arc<AtomicUsize>,
+        last_force_human: Arc<std::sync::Mutex<Option<bool>>>,
+        user_gate_override: Option<librefang_types::user_policy::UserToolGate>,
     }
 
     #[async_trait]
@@ -6306,6 +6630,257 @@ mod tests {
                 request_id: uuid::Uuid::new_v4(),
             })
         }
+
+        fn resolve_user_tool_decision(
+            &self,
+            _tool_name: &str,
+            _sender_id: Option<&str>,
+            _channel: Option<&str>,
+        ) -> librefang_types::user_policy::UserToolGate {
+            self.user_gate_override
+                .clone()
+                .unwrap_or(librefang_types::user_policy::UserToolGate::Allow)
+        }
+    }
+
+    #[async_trait]
+    impl KernelHandle for ForceHumanCapturingKernel {
+        async fn spawn_agent(
+            &self,
+            _manifest_toml: &str,
+            _parent_id: Option<&str>,
+        ) -> Result<(String, String), String> {
+            Err("not used".to_string())
+        }
+        async fn send_to_agent(&self, _agent_id: &str, _message: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+        fn list_agents(&self) -> Vec<AgentInfo> {
+            vec![]
+        }
+        fn kill_agent(&self, _agent_id: &str) -> Result<(), String> {
+            Err("not used".to_string())
+        }
+        fn memory_store(
+            &self,
+            _key: &str,
+            _value: serde_json::Value,
+            _peer_id: Option<&str>,
+        ) -> Result<(), String> {
+            Err("not used".to_string())
+        }
+        fn memory_recall(
+            &self,
+            _key: &str,
+            _peer_id: Option<&str>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            Err("not used".to_string())
+        }
+        fn memory_list(&self, _peer_id: Option<&str>) -> Result<Vec<String>, String> {
+            Err("not used".to_string())
+        }
+        fn find_agents(&self, _query: &str) -> Vec<AgentInfo> {
+            vec![]
+        }
+        async fn task_post(
+            &self,
+            _title: &str,
+            _description: &str,
+            _assigned_to: Option<&str>,
+            _created_by: Option<&str>,
+        ) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+        async fn task_claim(&self, _agent_id: &str) -> Result<Option<serde_json::Value>, String> {
+            Err("not used".to_string())
+        }
+        async fn task_complete(
+            &self,
+            _agent_id: &str,
+            _task_id: &str,
+            _result: &str,
+        ) -> Result<(), String> {
+            Err("not used".to_string())
+        }
+        async fn task_list(&self, _status: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
+            Err("not used".to_string())
+        }
+        async fn task_delete(&self, _task_id: &str) -> Result<bool, String> {
+            Err("not used".to_string())
+        }
+        async fn task_retry(&self, _task_id: &str) -> Result<bool, String> {
+            Err("not used".to_string())
+        }
+        async fn task_get(&self, _task_id: &str) -> Result<Option<serde_json::Value>, String> {
+            Err("not used".to_string())
+        }
+        async fn task_update_status(
+            &self,
+            _task_id: &str,
+            _new_status: &str,
+        ) -> Result<bool, String> {
+            Err("not used".to_string())
+        }
+        async fn publish_event(
+            &self,
+            _event_type: &str,
+            _payload: serde_json::Value,
+        ) -> Result<(), String> {
+            Err("not used".to_string())
+        }
+        async fn knowledge_add_entity(
+            &self,
+            _entity: librefang_types::memory::Entity,
+        ) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+        async fn knowledge_add_relation(
+            &self,
+            _relation: librefang_types::memory::Relation,
+        ) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+        async fn knowledge_query(
+            &self,
+            _pattern: librefang_types::memory::GraphPattern,
+        ) -> Result<Vec<librefang_types::memory::GraphMatch>, String> {
+            Err("not used".to_string())
+        }
+
+        fn requires_approval(&self, tool_name: &str) -> bool {
+            tool_name == "shell_exec"
+        }
+
+        async fn submit_tool_approval(
+            &self,
+            _agent_id: &str,
+            _tool_name: &str,
+            _action_summary: &str,
+            deferred: librefang_types::tool::DeferredToolExecution,
+            _session_id: Option<&str>,
+        ) -> Result<librefang_types::tool::ToolApprovalSubmission, String> {
+            self.approval_requests.fetch_add(1, Ordering::SeqCst);
+            *self.last_force_human.lock().unwrap() = Some(deferred.force_human);
+            Ok(librefang_types::tool::ToolApprovalSubmission::Pending {
+                request_id: uuid::Uuid::new_v4(),
+            })
+        }
+
+        fn resolve_user_tool_decision(
+            &self,
+            _tool_name: &str,
+            _sender_id: Option<&str>,
+            _channel: Option<&str>,
+        ) -> librefang_types::user_policy::UserToolGate {
+            self.user_gate_override
+                .clone()
+                .unwrap_or(librefang_types::user_policy::UserToolGate::Allow)
+        }
+    }
+
+    /// Regression: when the per-user gate returns `NeedsApproval`, the
+    /// `DeferredToolExecution.force_human` flag MUST be set so the
+    /// kernel's `submit_tool_approval` can disable the hand-agent
+    /// auto-approve carve-out. (B3 of PR #3205 review.)
+    #[tokio::test]
+    async fn tool_runner_rbac_force_human_propagates_to_deferred() {
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ForceHumanCapturingKernel {
+            approval_requests: Arc::clone(&approval_requests),
+            last_force_human: Arc::clone(&last),
+            user_gate_override: Some(librefang_types::user_policy::UserToolGate::NeedsApproval {
+                reason: "user policy escalated".to_string(),
+            }),
+        });
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let _ = execute_tool(
+            "tu-1",
+            "file_write",
+            &serde_json::json!({"path": "scratch.txt", "content": "hi"}),
+            Some(&kernel),
+            None,
+            Some("agent-1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(workspace.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("bob"),
+            Some("telegram"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *last.lock().unwrap(),
+            Some(true),
+            "force_human must be true when user policy escalated"
+        );
+    }
+
+    /// Sanity: when the user gate is `Allow` and only the global
+    /// `require_approval` list pulls the call into approval, `force_human`
+    /// stays false — hand-agent auto-approval keeps working in the
+    /// non-RBAC path.
+    #[tokio::test]
+    async fn tool_runner_rbac_force_human_stays_false_for_global_require_approval() {
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let last = Arc::new(std::sync::Mutex::new(None));
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ForceHumanCapturingKernel {
+            approval_requests: Arc::clone(&approval_requests),
+            last_force_human: Arc::clone(&last),
+            user_gate_override: Some(librefang_types::user_policy::UserToolGate::Allow),
+        });
+
+        let _ = execute_tool(
+            "tu-1",
+            "shell_exec",
+            &serde_json::json!({"command": "echo ok"}),
+            Some(&kernel),
+            None,
+            Some("agent-1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("alice"),
+            Some("telegram"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(*last.lock().unwrap(), Some(false));
     }
 
     #[test]
@@ -6567,6 +7142,611 @@ mod tests {
         .await;
         assert!(result.is_error);
         assert!(result.content.contains("traversal"));
+    }
+
+    // ── Named-workspace read-side support ────────────────────────────────
+    //
+    // Mock kernel that surfaces a configurable list of named workspaces
+    // (paired with their access modes) via `named_workspace_prefixes`.
+    // `readonly_workspace_prefixes` is derived from that list so the existing
+    // file_write denial path stays consistent.
+
+    struct NamedWsKernel {
+        named: Vec<(std::path::PathBuf, librefang_types::agent::WorkspaceMode)>,
+    }
+
+    #[async_trait]
+    impl KernelHandle for NamedWsKernel {
+        async fn spawn_agent(
+            &self,
+            _manifest_toml: &str,
+            _parent_id: Option<&str>,
+        ) -> Result<(String, String), String> {
+            Err("not used".to_string())
+        }
+        async fn send_to_agent(&self, _agent_id: &str, _message: &str) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+        fn list_agents(&self) -> Vec<AgentInfo> {
+            vec![]
+        }
+        fn kill_agent(&self, _agent_id: &str) -> Result<(), String> {
+            Err("not used".to_string())
+        }
+        fn memory_store(
+            &self,
+            _key: &str,
+            _value: serde_json::Value,
+            _peer_id: Option<&str>,
+        ) -> Result<(), String> {
+            Err("not used".to_string())
+        }
+        fn memory_recall(
+            &self,
+            _key: &str,
+            _peer_id: Option<&str>,
+        ) -> Result<Option<serde_json::Value>, String> {
+            Err("not used".to_string())
+        }
+        fn memory_list(&self, _peer_id: Option<&str>) -> Result<Vec<String>, String> {
+            Err("not used".to_string())
+        }
+        fn find_agents(&self, _query: &str) -> Vec<AgentInfo> {
+            vec![]
+        }
+        async fn task_post(
+            &self,
+            _title: &str,
+            _description: &str,
+            _assigned_to: Option<&str>,
+            _created_by: Option<&str>,
+        ) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+        async fn task_claim(&self, _agent_id: &str) -> Result<Option<serde_json::Value>, String> {
+            Err("not used".to_string())
+        }
+        async fn task_complete(
+            &self,
+            _agent_id: &str,
+            _task_id: &str,
+            _result: &str,
+        ) -> Result<(), String> {
+            Err("not used".to_string())
+        }
+        async fn task_list(&self, _status: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
+            Err("not used".to_string())
+        }
+        async fn task_delete(&self, _task_id: &str) -> Result<bool, String> {
+            Err("not used".to_string())
+        }
+        async fn task_retry(&self, _task_id: &str) -> Result<bool, String> {
+            Err("not used".to_string())
+        }
+        async fn task_get(&self, _task_id: &str) -> Result<Option<serde_json::Value>, String> {
+            Err("not used".to_string())
+        }
+        async fn task_update_status(
+            &self,
+            _task_id: &str,
+            _new_status: &str,
+        ) -> Result<bool, String> {
+            Err("not used".to_string())
+        }
+        async fn publish_event(
+            &self,
+            _event_type: &str,
+            _payload: serde_json::Value,
+        ) -> Result<(), String> {
+            Err("not used".to_string())
+        }
+        async fn knowledge_add_entity(
+            &self,
+            _entity: librefang_types::memory::Entity,
+        ) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+        async fn knowledge_add_relation(
+            &self,
+            _relation: librefang_types::memory::Relation,
+        ) -> Result<String, String> {
+            Err("not used".to_string())
+        }
+        async fn knowledge_query(
+            &self,
+            _pattern: librefang_types::memory::GraphPattern,
+        ) -> Result<Vec<librefang_types::memory::GraphMatch>, String> {
+            Err("not used".to_string())
+        }
+        fn named_workspace_prefixes(
+            &self,
+            _agent_id: &str,
+        ) -> Vec<(std::path::PathBuf, librefang_types::agent::WorkspaceMode)> {
+            self.named.clone()
+        }
+        fn readonly_workspace_prefixes(&self, _agent_id: &str) -> Vec<std::path::PathBuf> {
+            self.named
+                .iter()
+                .filter(|(_, m)| *m == librefang_types::agent::WorkspaceMode::ReadOnly)
+                .map(|(p, _)| p.clone())
+                .collect()
+        }
+    }
+
+    fn make_named_ws_kernel(
+        named: Vec<(std::path::PathBuf, librefang_types::agent::WorkspaceMode)>,
+    ) -> Arc<dyn KernelHandle> {
+        Arc::new(NamedWsKernel { named })
+    }
+
+    #[tokio::test]
+    async fn test_file_read_allows_named_workspace_path() {
+        use librefang_types::agent::WorkspaceMode;
+
+        let primary = tempfile::tempdir().expect("primary");
+        let shared = tempfile::tempdir().expect("shared");
+        let shared_canon = shared.path().canonicalize().unwrap();
+        let target = shared_canon.join("note.txt");
+        std::fs::write(&target, "hello shared").unwrap();
+
+        let kernel = make_named_ws_kernel(vec![(shared_canon.clone(), WorkspaceMode::ReadWrite)]);
+
+        let result = execute_tool(
+            "test-id",
+            "file_read",
+            &serde_json::json!({"path": target.to_str().unwrap()}),
+            Some(&kernel),
+            None,
+            Some("00000000-0000-0000-0000-000000000001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(primary.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert_eq!(result.content, "hello shared");
+    }
+
+    #[tokio::test]
+    async fn test_file_list_allows_named_workspace_path() {
+        use librefang_types::agent::WorkspaceMode;
+
+        let primary = tempfile::tempdir().expect("primary");
+        let shared = tempfile::tempdir().expect("shared");
+        let shared_canon = shared.path().canonicalize().unwrap();
+        std::fs::write(shared_canon.join("a.txt"), "a").unwrap();
+        std::fs::write(shared_canon.join("b.txt"), "b").unwrap();
+
+        let kernel = make_named_ws_kernel(vec![(shared_canon.clone(), WorkspaceMode::ReadOnly)]);
+
+        let result = execute_tool(
+            "test-id",
+            "file_list",
+            &serde_json::json!({"path": shared_canon.to_str().unwrap()}),
+            Some(&kernel),
+            None,
+            Some("00000000-0000-0000-0000-000000000002"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(primary.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!result.is_error, "got error: {}", result.content);
+        assert!(result.content.contains("a.txt"));
+        assert!(result.content.contains("b.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_file_write_allows_rw_named_workspace_path() {
+        use librefang_types::agent::WorkspaceMode;
+
+        let primary = tempfile::tempdir().expect("primary");
+        let shared = tempfile::tempdir().expect("shared");
+        let shared_canon = shared.path().canonicalize().unwrap();
+        let target = shared_canon.join("out.txt");
+
+        let kernel = make_named_ws_kernel(vec![(shared_canon.clone(), WorkspaceMode::ReadWrite)]);
+
+        let result = execute_tool(
+            "test-id",
+            "file_write",
+            &serde_json::json!({
+                "path": target.to_str().unwrap(),
+                "content": "wrote-it",
+            }),
+            Some(&kernel),
+            None,
+            Some("00000000-0000-0000-0000-000000000003"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(primary.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!result.is_error, "got error: {}", result.content);
+        let written = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(written, "wrote-it");
+    }
+
+    #[tokio::test]
+    async fn test_file_write_denies_readonly_named_workspace_path() {
+        use librefang_types::agent::WorkspaceMode;
+
+        let primary = tempfile::tempdir().expect("primary");
+        let shared = tempfile::tempdir().expect("shared");
+        let shared_canon = shared.path().canonicalize().unwrap();
+        let target = shared_canon.join("out.txt");
+
+        let kernel = make_named_ws_kernel(vec![(shared_canon.clone(), WorkspaceMode::ReadOnly)]);
+
+        let result = execute_tool(
+            "test-id",
+            "file_write",
+            &serde_json::json!({
+                "path": target.to_str().unwrap(),
+                "content": "should-not-write",
+            }),
+            Some(&kernel),
+            None,
+            Some("00000000-0000-0000-0000-000000000004"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(primary.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("read-only"),
+            "expected read-only denial, got: {}",
+            result.content
+        );
+        assert!(!target.exists(), "file should not have been written");
+    }
+
+    #[tokio::test]
+    async fn test_file_read_outside_all_workspaces_still_blocked() {
+        use librefang_types::agent::WorkspaceMode;
+
+        let primary = tempfile::tempdir().expect("primary");
+        let shared = tempfile::tempdir().expect("shared");
+        let other = tempfile::tempdir().expect("other");
+        let shared_canon = shared.path().canonicalize().unwrap();
+        let other_path = other.path().canonicalize().unwrap().join("nope.txt");
+        std::fs::write(&other_path, "secret").unwrap();
+
+        let kernel = make_named_ws_kernel(vec![(shared_canon, WorkspaceMode::ReadWrite)]);
+
+        let result = execute_tool(
+            "test-id",
+            "file_read",
+            &serde_json::json!({"path": other_path.to_str().unwrap()}),
+            Some(&kernel),
+            None,
+            Some("00000000-0000-0000-0000-000000000005"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(primary.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("Access denied"),
+            "expected sandbox denial, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_allows_rw_named_workspace_path() {
+        use librefang_types::agent::WorkspaceMode;
+
+        let primary = tempfile::tempdir().expect("primary");
+        let shared = tempfile::tempdir().expect("shared");
+        let shared_canon = shared.path().canonicalize().unwrap();
+        let target = shared_canon.join("added.txt");
+
+        let kernel = make_named_ws_kernel(vec![(shared_canon.clone(), WorkspaceMode::ReadWrite)]);
+
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+hello-from-patch\n*** End Patch\n",
+            target.to_str().unwrap()
+        );
+
+        let result = execute_tool(
+            "test-id",
+            "apply_patch",
+            &serde_json::json!({"patch": patch}),
+            Some(&kernel),
+            None,
+            Some("00000000-0000-0000-0000-000000000006"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(primary.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(!result.is_error, "got error: {}", result.content);
+        let written = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(written, "hello-from-patch");
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_denies_readonly_named_workspace_path() {
+        use librefang_types::agent::WorkspaceMode;
+
+        let primary = tempfile::tempdir().expect("primary");
+        let shared = tempfile::tempdir().expect("shared");
+        let shared_canon = shared.path().canonicalize().unwrap();
+        let target = shared_canon.join("added.txt");
+
+        let kernel = make_named_ws_kernel(vec![(shared_canon.clone(), WorkspaceMode::ReadOnly)]);
+
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+should-not-write\n*** End Patch\n",
+            target.to_str().unwrap()
+        );
+
+        let result = execute_tool(
+            "test-id",
+            "apply_patch",
+            &serde_json::json!({"patch": patch}),
+            Some(&kernel),
+            None,
+            Some("00000000-0000-0000-0000-000000000007"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(primary.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_error, "expected denial, got: {}", result.content);
+        assert!(!target.exists(), "file should not have been written");
+    }
+
+    // ── Bug #3822: shell_exec must respect named workspace read-only mode ────
+
+    /// Regression for #3822: `shell_exec` must be blocked when the command
+    /// string references a path that falls inside a read-only named workspace.
+    /// Previously the shell tool had no such check; a plugin could bypass the
+    /// read-only restriction by issuing a shell command that writes to the
+    /// supposedly read-only workspace path.
+    #[tokio::test]
+    async fn test_shell_exec_blocked_for_readonly_workspace_path() {
+        use librefang_types::agent::WorkspaceMode;
+
+        let primary = tempfile::tempdir().expect("primary");
+        let shared = tempfile::tempdir().expect("shared");
+        let shared_canon = shared.path().canonicalize().unwrap();
+
+        // Configure the shared workspace as read-only.
+        let kernel = make_named_ws_kernel(vec![(shared_canon.clone(), WorkspaceMode::ReadOnly)]);
+
+        // Construct a command string that references the read-only path.
+        let ro_path = shared_canon.to_str().unwrap();
+        let command = format!("touch {ro_path}/evil.txt");
+
+        let result = execute_tool(
+            "test-id",
+            "shell_exec",
+            &serde_json::json!({"command": command}),
+            Some(&kernel),
+            None,
+            Some("00000000-0000-0000-0000-000000000008"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(primary.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_error,
+            "shell_exec referencing a read-only workspace path must be blocked; got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("read-only"),
+            "error must mention read-only; got: {}",
+            result.content
+        );
+        // Verify the file was NOT created.
+        assert!(!shared_canon.join("evil.txt").exists());
+    }
+
+    /// Read-only workspace enforcement must NOT block commands that do not
+    /// reference the read-only workspace path.
+    #[tokio::test]
+    async fn test_shell_exec_allowed_when_not_targeting_readonly_workspace() {
+        use librefang_types::agent::WorkspaceMode;
+
+        let primary = tempfile::tempdir().expect("primary");
+        let shared = tempfile::tempdir().expect("shared");
+        let shared_canon = shared.path().canonicalize().unwrap();
+
+        // Read-only shared workspace — but the command targets the primary workspace.
+        let kernel = make_named_ws_kernel(vec![(shared_canon.clone(), WorkspaceMode::ReadOnly)]);
+
+        // A command that does NOT reference the read-only path should go through
+        // (it may still fail for other reasons — e.g., exec policy — but it must
+        // not be blocked by the workspace read-only check).
+        let result = execute_tool(
+            "test-id",
+            "shell_exec",
+            &serde_json::json!({"command": "echo hello"}),
+            Some(&kernel),
+            None,
+            Some("00000000-0000-0000-0000-000000000009"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(primary.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        // Must NOT be blocked by read-only check. It may be blocked by exec policy
+        // (if one is set) but should not contain "read-only" in the error.
+        if result.is_error {
+            assert!(
+                !result.content.contains("read-only"),
+                "must not be blocked by read-only check; got: {}",
+                result.content
+            );
+        }
     }
 
     #[tokio::test]
@@ -6873,6 +8053,7 @@ mod tests {
         let approval_requests = Arc::new(AtomicUsize::new(0));
         let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
             approval_requests: Arc::clone(&approval_requests),
+            user_gate_override: None,
         });
         let policy = librefang_types::config::ExecPolicy {
             mode: librefang_types::config::ExecSecurityMode::Full,
@@ -6925,6 +8106,7 @@ mod tests {
         let approval_requests = Arc::new(AtomicUsize::new(0));
         let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
             approval_requests: Arc::clone(&approval_requests),
+            user_gate_override: None,
         });
         let policy = librefang_types::config::ExecPolicy {
             mode: librefang_types::config::ExecSecurityMode::Allowlist,
@@ -6978,10 +8160,244 @@ mod tests {
         assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
     }
 
+    // ---- RBAC M3 — per-user tool policy gate (#3054) ----
+
+    #[tokio::test]
+    async fn tool_runner_rbac_user_deny_returns_hard_error() {
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::clone(&approval_requests),
+            user_gate_override: Some(librefang_types::user_policy::UserToolGate::Deny {
+                reason: "user 'Bob' (role: user) is not permitted to invoke 'shell_exec'"
+                    .to_string(),
+            }),
+        });
+
+        let result = execute_tool(
+            "test-id",
+            "shell_exec",
+            &serde_json::json!({"command": "echo ok"}),
+            Some(&kernel),
+            None,
+            Some("agent-1"),
+            None,
+            None,
+            None,
+            None, // allowed_skills
+            None,
+            None,
+            None,
+            None, // media_engine
+            None, // media_drivers
+            None, // exec_policy
+            None,
+            None,
+            None,
+            None,
+            Some("bob"),
+            Some("telegram"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_error, "user-policy deny must produce an error");
+        assert!(
+            result.content.contains("Execution denied"),
+            "content should announce the deny: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("user 'Bob'"),
+            "deny reason must surface to the model: {}",
+            result.content
+        );
+        // No approval was requested — the deny short-circuits.
+        assert_eq!(approval_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn tool_runner_rbac_user_needs_approval_routes_through_approval_queue() {
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::clone(&approval_requests),
+            // file_write is NOT in the default require_approval list (which
+            // would already gate it). The point of this test is to prove the
+            // user gate flips it into approval-required mode regardless of
+            // the global policy.
+            user_gate_override: Some(librefang_types::user_policy::UserToolGate::NeedsApproval {
+                reason: "tool 'file_write' requires admin approval for user 'Bob'".to_string(),
+            }),
+        });
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+
+        let result = execute_tool(
+            "test-id",
+            "file_write",
+            &serde_json::json!({"path": "scratch.txt", "content": "hi"}),
+            Some(&kernel),
+            None,
+            Some("agent-1"),
+            None,
+            None,
+            None,
+            None, // allowed_skills
+            None,
+            None,
+            Some(workspace.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("bob"),
+            Some("telegram"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // User gate forced approval — the tool is deferred (NotBlocked).
+        assert_eq!(
+            result.status,
+            librefang_types::tool::ToolExecutionStatus::WaitingApproval,
+            "expected WaitingApproval status, got content: {}",
+            result.content
+        );
+        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// Regression: shell_exec under `ExecPolicy.mode = Full` MUST still
+    /// route through the approval queue when the per-user gate returned
+    /// `NeedsApproval`. Without the `!force_approval` guard added in B2
+    /// of PR #3205 review, the Full-mode bypass silently dropped the
+    /// user-gate escalation and the call ran without human review.
+    #[tokio::test]
+    async fn tool_runner_rbac_full_mode_does_not_bypass_user_needs_approval() {
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::clone(&approval_requests),
+            user_gate_override: Some(librefang_types::user_policy::UserToolGate::NeedsApproval {
+                reason: "tool 'shell_exec' requires admin approval for user 'Bob'".to_string(),
+            }),
+        });
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let policy = librefang_types::config::ExecPolicy {
+            mode: librefang_types::config::ExecSecurityMode::Full,
+            ..Default::default()
+        };
+
+        let result = execute_tool(
+            "test-id",
+            "shell_exec",
+            &serde_json::json!({"command": "echo ok"}),
+            Some(&kernel),
+            None,
+            Some("agent-1"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(workspace.path()),
+            None,
+            None,
+            Some(&policy), // Full mode!
+            None,
+            None,
+            None,
+            None,
+            Some("bob"),
+            Some("telegram"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result.status,
+            librefang_types::tool::ToolExecutionStatus::WaitingApproval,
+            "Full mode + user NeedsApproval must still demand approval, got content: {}",
+            result.content
+        );
+        assert_eq!(
+            approval_requests.load(Ordering::SeqCst),
+            1,
+            "exactly one approval request should be submitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_runner_rbac_user_allow_falls_through_to_existing_approval_logic() {
+        // user_gate_override = Allow → behaviour matches the pre-RBAC
+        // approval flow. shell_exec is in the default require_approval
+        // list and ApprovalKernel.requires_approval() returns true for it,
+        // so we still expect WaitingApproval — proving Allow is a true
+        // pass-through, not a bypass.
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::clone(&approval_requests),
+            user_gate_override: Some(librefang_types::user_policy::UserToolGate::Allow),
+        });
+
+        let result = execute_tool(
+            "test-id",
+            "shell_exec",
+            &serde_json::json!({"command": "echo ok"}),
+            Some(&kernel),
+            None,
+            Some("agent-1"),
+            None,
+            None,
+            None,
+            None, // allowed_skills
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("alice"),
+            Some("telegram"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result.status,
+            librefang_types::tool::ToolExecutionStatus::WaitingApproval
+        );
+        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn test_shell_exec_uses_exec_policy_allowed_env_vars() {
         let workspace = tempfile::tempdir().expect("tempdir");
         let original = std::env::var("LIBREFANG_TEST_ALLOWED_ENV").ok();
+        // SAFETY: test captures and restores the previous value; unique enough
+        // name to avoid clashing with other tests running in parallel.
         unsafe {
             std::env::set_var("LIBREFANG_TEST_ALLOWED_ENV", "present");
         }

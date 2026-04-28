@@ -2,6 +2,8 @@ import React, { Suspense, lazy, useCallback, useEffect, useMemo, useState } from
 import type { UseQueryResult } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "@tanstack/react-router";
+import { AnimatePresence, motion } from "motion/react";
+import { tabContent } from "../lib/motion";
 import { router } from "../router";
 import {
   type HandDefinitionItem,
@@ -43,6 +45,7 @@ import {
   useHandStatsBatch,
   useHandManifestToml,
 } from "../lib/queries/hands";
+import { StaggerList } from "../components/ui/StaggerList";
 
 const TomlViewer = lazy(() => import("../components/TomlViewer").then(m => ({ default: m.TomlViewer })));
 
@@ -57,6 +60,7 @@ import {
 } from "../lib/mutations/hands";
 import { useCreateSchedule, useUpdateSchedule, useDeleteSchedule } from "../lib/mutations/schedules";
 import { ScheduleModal } from "../components/ui/ScheduleModal";
+import { DrawerPanel } from "../components/ui/DrawerPanel";
 import { useCronJobs } from "../lib/queries/runtime";
 
 
@@ -138,16 +142,11 @@ function HandDetailPanel({
       : "bg-warning/10 text-warning";
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 backdrop-blur-sm"
-      onClick={onClose}
-    >
-      <div
-        className="bg-surface rounded-t-2xl sm:rounded-2xl shadow-2xl border border-border-subtle w-full sm:w-[640px] sm:max-w-[90vw] max-h-[90vh] sm:max-h-[85vh] flex flex-col overflow-hidden animate-fade-in-scale"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Hero header */}
-        <div className="px-6 py-5 border-b border-border-subtle shrink-0">
+    <>
+      <DrawerPanel isOpen onClose={onClose} size="2xl" hideCloseButton>
+        {/* Hero header — sticky inside the drawer's single scroll container
+            so identity + close stay reachable on long detail content. */}
+        <div className="px-6 py-5 border-b border-border-subtle sticky top-0 bg-surface z-10">
           <div className="flex items-start gap-4">
             <div className={`w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 ${heroIconClass}`}>
               <Hand className="w-5 h-5" />
@@ -192,9 +191,10 @@ function HandDetailPanel({
           </div>
         </div>
 
-        {/* Scrollable body */}
-        <div className="flex-1 overflow-y-auto scrollbar-thin">
-          <div className="px-6 py-5 space-y-5">
+        {/* Body — Modal already wraps children in a single overflow-y-auto,
+            so this section just supplies padding/spacing without its own
+            scroll container (nested scroll inside a drawer is annoying). */}
+        <div className="px-6 py-5 space-y-5">
             {/* Description */}
             {hand.description && (
               <p className="text-sm text-text-dim leading-relaxed">{hand.description}</p>
@@ -295,9 +295,8 @@ function HandDetailPanel({
               settings={settings}
               settingsQuery={settingsQuery}
             />
-          </div>
         </div>
-      </div>
+      </DrawerPanel>
       <Suspense fallback={null}>
         <TomlViewer
           isOpen={showManifest}
@@ -312,7 +311,7 @@ function HandDetailPanel({
           }
         />
       </Suspense>
-    </div>
+    </>
   );
 }
 
@@ -422,12 +421,17 @@ function DetailTabs({ hand, instance, isActive, settings, settingsQuery }: {
   return (
     <div>
       {/* Tab bar — all children are text-only so height is determined purely by padding + line-height */}
-      <div className="flex border-b border-border-subtle mb-4 overflow-x-auto scrollbar-thin">
+      <div role="tablist" aria-label="Hand details" className="flex border-b border-border-subtle mb-4 overflow-x-auto scrollbar-thin">
         {visibleTabs.map(tab => {
           const isActive = activeTab === tab.id;
           return (
             <button
               key={tab.id}
+              id={`hands-tab-${tab.id}`}
+              role="tab"
+              aria-selected={isActive}
+              aria-controls={`hands-panel-${tab.id}`}
+              tabIndex={isActive ? 0 : -1}
               onClick={() => setActiveTab(tab.id)}
               className={`shrink-0 flex items-baseline gap-1.5 px-3 py-3 -mb-px border-b-2 text-xs font-bold leading-none whitespace-nowrap transition-colors ${
                 isActive
@@ -447,7 +451,9 @@ function DetailTabs({ hand, instance, isActive, settings, settingsQuery }: {
       </div>
 
       {/* Tab content */}
-      <div>
+      <div id={`hands-panel-${activeTab}`} role="tabpanel" aria-labelledby={`hands-tab-${activeTab}`}>
+        <AnimatePresence mode="wait">
+        <motion.div key={activeTab} variants={tabContent} initial="initial" animate="animate" exit="exit">
 
         {activeTab === "agents" && (
           <div className="space-y-2">
@@ -515,6 +521,8 @@ function DetailTabs({ hand, instance, isActive, settings, settingsQuery }: {
             handName={hand.name || hand.id}
           />
         )}
+        </motion.div>
+        </AnimatePresence>
       </div>
     </div>
   );
@@ -704,6 +712,7 @@ function HandSchedulesTab({ cronJobs, isLoading, onRefresh, agentId, handName }:
   handName: string;
 }) {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const addToast = useUIStore((s) => s.addToast);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const toggleSchedule = useUpdateSchedule();
@@ -865,6 +874,20 @@ function HandSchedulesTab({ cronJobs, isLoading, onRefresh, agentId, handName }:
               <div className="min-w-0 flex-1">
                 <p className="text-xs font-bold truncate">{job.name || "Unnamed"}</p>
                 <p className="text-[10px] font-mono text-text-dim/60 truncate">{schedule}</p>
+                {/*
+                  Cross-link to the full SchedulerPage editor instead of
+                  reimplementing DeliveryTargetsEditor inline. Keeps this
+                  widget compact and the editor lives in exactly one place.
+                */}
+                <button
+                  type="button"
+                  onClick={() => navigate({ to: "/scheduler" })}
+                  className="text-[10px] text-brand hover:underline mt-0.5"
+                >
+                  {t("hands.configure_delivery_targets", {
+                    defaultValue: "Configure delivery targets →",
+                  })}
+                </button>
               </div>
               <button
                 onClick={() => handleToggle(job)}
@@ -1505,7 +1528,7 @@ export function HandsPage() {
           }
         />
       ) : (
-        <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 3xl:grid-cols-6 stagger-children">
+        <StaggerList className="grid gap-3 grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 3xl:grid-cols-6">
           {filtered.map((h) => {
             const isActive = activeHandIds.has(h.id);
             const instance = instanceByHandId.get(h.id);
@@ -1524,7 +1547,7 @@ export function HandsPage() {
               />
             );
           })}
-        </div>
+        </StaggerList>
       )}
 
       {/* Detail side panel */}

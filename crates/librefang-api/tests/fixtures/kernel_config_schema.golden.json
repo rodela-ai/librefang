@@ -207,7 +207,7 @@
       "type": "object"
     },
     "AuditConfig": {
-      "description": "Audit log configuration.\n\nConfigure in config.toml: ```toml [audit] retention_days = 90 # Optional override for the external tip-anchor path. Relative # paths resolve against `data_dir`. Leave unset for the default # `data_dir/audit.anchor`. anchor_path = \"/var/log/librefang/audit.anchor\" ```",
+      "description": "Audit log configuration.\n\nConfigure in config.toml: ```toml [audit] retention_days = 90 # Optional override for the external tip-anchor path. Relative # paths resolve against `data_dir`. Leave unset for the default # `data_dir/audit.anchor`. anchor_path = \"/var/log/librefang/audit.anchor\"\n\n[audit.retention] trim_interval_secs = 3600 max_in_memory_entries = 50000\n\n[audit.retention.retention_days_by_action] ToolInvoke = 14 LlmCompletion = 14 RoleChange = 365 PermissionDenied = 365 BudgetExceeded = 365 ```",
       "properties": {
         "anchor_path": {
           "description": "Optional override for the external Merkle-tip anchor file that `AuditLog::with_db_anchored` uses to detect full rewrites of `audit_entries`. When unset the daemon writes to `data_dir/audit.anchor`, which catches most casual tampering but sits in the same filesystem namespace as the SQLite file it is meant to verify. Operators who want a stronger boundary can point this at a path the daemon can write to but unprivileged code cannot — a chmod-0400 file owned by a dedicated user, a `systemd ReadOnlyPaths=` mount, an NFS share, or a pipe to `logger`. Relative paths are resolved against `data_dir`.",
@@ -216,12 +216,57 @@
             "null"
           ]
         },
+        "retention": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AuditRetentionConfig"
+            }
+          ],
+          "default": {
+            "retention_days_by_action": {}
+          },
+          "description": "Per-`AuditAction` retention policy used by the periodic trim job over the in-memory audit window. Defaults preserve every entry."
+        },
         "retention_days": {
           "default": 90,
-          "description": "How many days to retain audit log entries. Default: 90. Set to 0 for unlimited.",
+          "description": "How many days to retain audit log entries. Default: 90. Set to 0 for unlimited.\n\n**Coarse global retention.** This drives the legacy day-based prune over the SQLite table. For per-category in-memory retention with chain-anchor-preserving trim, see `retention` below.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "AuditRetentionConfig": {
+      "description": "Per-`AuditAction` retention policy for the in-memory audit window.\n\nThe audit log is a Merkle-style hash chain — every entry's hash mixes the previous entry's hash. Naively dropping a prefix would break chain verification of the surviving entries because their `prev_hash` would point at a hash no longer present. The trim implementation solves this by remembering the last-dropped entry's hash as a **chain anchor** so verification of the surviving prefix can validate continuity against the anchor instead of a missing row.\n\nCritical actions (`RoleChange`, `PermissionDenied`, `BudgetExceeded`) should keep long retention windows; noisy actions (`ToolInvoke`) can be pruned far more aggressively. Actions absent from the map are kept forever so operators that don't opt in never silently lose audit history.",
+      "properties": {
+        "max_in_memory_entries": {
+          "description": "Hard cap on the in-memory audit window — protects against runaway growth even when no per-action policy is configured. `None` or 0 means unlimited. When the cap is exceeded the trim job drops the oldest entries down to the cap regardless of their action.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "retention_days_by_action": {
+          "additionalProperties": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "default": {},
+          "description": "Per-`AuditAction` retention windows in days. Key is the `AuditAction` `Display` string (e.g. `\"ToolInvoke\"`). Missing entries mean \"keep forever\".",
+          "type": "object"
+        },
+        "trim_interval_secs": {
+          "description": "How often the trim job runs. `None` (or 0) disables periodic trimming. Reasonable default for production: 3600 (one hour).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -488,11 +533,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -863,6 +910,15 @@
           "default": null,
           "description": "Output format override."
         },
+        "prefix_agent_name": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PrefixStyle"
+            }
+          ],
+          "default": "off",
+          "description": "Prefix outbound messages with the responding agent's name.\n\nDefaults to `PrefixStyle::Off` so enabling this feature is opt-in per channel and existing configs keep their current output byte-for-byte."
+        },
         "rate_limit_per_minute": {
           "default": 0,
           "description": "Global rate limit for this channel (messages per minute, 0 = unlimited).",
@@ -898,6 +954,11 @@
             "null"
           ]
         },
+        "thread_ownership_enabled": {
+          "default": true,
+          "description": "Whether thread-ownership claiming applies to this channel. When set to `false`, every routed agent dispatches even if another agent already replied in the same thread — useful for \"broadcast\" channels where multiple agents are intended to chime in together. Default `true`: a single agent owns each `(channel, thread)` for the configured TTL (and an explicit @-mention re-claims for the new agent). DMs always bypass the registry. See #3334.",
+          "type": "boolean"
+        },
         "threading": {
           "default": false,
           "description": "Enable thread replies.",
@@ -926,6 +987,67 @@
           ],
           "default": null,
           "description": "Usage footer mode override."
+        }
+      },
+      "type": "object"
+    },
+    "ChannelRoleMapping": {
+      "description": "Maps platform-native group/server roles (Telegram admin, Discord guild role, Slack workspace owner, etc.) to LibreFang `UserRole` values.\n\nResolution order in `AuthManager::resolve_role_for_sender` is: 1. Explicit `UserConfig.role` for a registered user — wins outright. 2. Channel-derived role from this mapping — applied when the user is recognised on a platform but has no explicit `UserConfig` role. 3. Default-deny — fall through to `guest`.\n\nAll sub-tables are optional — a missing channel just means \"no channel-derived role\" for that platform. Each per-channel struct keeps platform-shaped fields rather than a single uniform schema because the underlying APIs disagree about role granularity (Telegram has 3 fixed statuses, Discord has named guild roles, Slack collapses to owner/admin/member/guest).",
+      "properties": {
+        "discord": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DiscordRoleMapping"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Discord guild-role → LibreFang role mapping."
+        },
+        "slack": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SlackRoleMapping"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Slack workspace-role → LibreFang role mapping."
+        },
+        "telegram": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TelegramRoleMapping"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Telegram chat-status → LibreFang role mapping."
+        }
+      },
+      "type": "object"
+    },
+    "ChannelToolPolicy": {
+      "description": "Per-user, per-channel allow/deny lists.\n\nThis is a strictly more permissive variant of [`crate::approval::ChannelToolRule`]. The approval channel rule is global to the agent; this one is keyed off the LibreFang user identity resolved from the inbound message's channel binding. It allows statements like \"User Bob may run `shell_*` from his Telegram chat, but only `web_*` from Discord\".\n\nDeny-wins inside one rule (mirrors `ChannelToolRule::check_tool`).",
+      "properties": {
+        "allowed_tools": {
+          "default": [],
+          "description": "Tool patterns explicitly allowed when this user speaks via this channel. Empty = no allow-list (rule is deny-only or no-op).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "denied_tools": {
+          "default": [],
+          "description": "Tool patterns explicitly denied for this user on this channel. Always wins over `allowed_tools`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -1967,11 +2089,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -2127,16 +2251,32 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
           },
           "description": "Per-channel behavior overrides."
+        }
+      },
+      "type": "object"
+    },
+    "DiscordRoleMapping": {
+      "description": "Discord-side mapping. A user may hold any number of guild roles simultaneously; the resolver walks **every** role the user has, looks each one up in `role_map`, and picks the **highest-privilege** match (`Owner` > `Admin` > `User` > `Viewer`). Declaration order in `config.toml` is irrelevant — the privilege ordering on the LibreFang side decides the winner. This protects against Discord- side role ordering (which is outside our control) deciding the effective LibreFang permissions.",
+      "properties": {
+        "role_map": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Discord role name → LibreFang role string (`owner` / `admin` / `user` / `viewer` / `guest`). Iteration order is irrelevant — the translator scans every match the user holds and returns the most privileged. Typo'd LibreFang role strings (e.g. `\"admn\"`) are silently skipped, falling back to default-deny `Viewer`.",
+          "type": "object"
         }
       },
       "type": "object"
@@ -2207,11 +2347,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -2496,11 +2638,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -2742,6 +2886,11 @@
           "description": "Redirect URL for the OAuth2 authorization code flow callback. Defaults to `http://127.0.0.1:4545/api/auth/callback`.",
           "type": "string"
         },
+        "require_email_verified": {
+          "default": true,
+          "description": "Require `email_verified = true` in the OIDC ID token before allowing login. Defaults to `true`. Set to `false` only if your identity provider does not set this claim. When `true`, logins where the claim is absent or false are rejected — prevents `allowed_domains` impersonation via unverified addresses (#3703).",
+          "type": "boolean"
+        },
         "scopes": {
           "default": [
             "openid",
@@ -2856,11 +3005,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -2943,11 +3094,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -3007,11 +3160,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -3074,11 +3229,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -3169,11 +3326,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -3269,11 +3428,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -3604,11 +3765,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -3758,11 +3921,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -3835,11 +4000,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -3941,16 +4108,35 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
           },
           "description": "Per-channel behavior overrides."
+        }
+      },
+      "type": "object"
+    },
+    "LlmConfig": {
+      "description": "Top-level `[llm]` section. Currently only carries `auxiliary` — primary driver configuration still lives in `[default_model]` / `[[fallback_providers]]` so this struct exists purely to namespace future LLM-routing knobs.",
+      "properties": {
+        "auxiliary": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {},
+          "description": "Per-task auxiliary fallback chains. See [`AuxiliaryConfig`].",
+          "type": "object"
         }
       },
       "type": "object"
@@ -4008,11 +4194,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -4102,11 +4290,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -4186,11 +4376,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -4334,7 +4526,7 @@
       "type": "object"
     },
     "McpTaintPathPolicy": {
-      "description": "Taint skip rules for a single argument path within a tool.",
+      "description": "Taint skip rules for a single argument path within a tool.\n\nThe policy key is a minimal JSONPath expression matched by the runtime scanner. Supported wildcard syntax:\n\n- `$.foo`      — exact property at any depth specified literally. - `$.foo.*`    — any direct child of `$.foo` (single segment, non-array). - `$.foo[*]`   — any array element of `$.foo` (e.g. `$.foo[0]`, `$.foo[42]`). - `$.*`        — any top-level property.\n\nWildcards do NOT span multiple segments: `$.foo.*` matches `$.foo.bar` but not `$.foo.bar.baz`. Use exact paths plus rule_sets for deep exemptions across many paths.",
       "properties": {
         "skip_rules": {
           "default": [],
@@ -4348,7 +4540,7 @@
       "type": "object"
     },
     "McpTaintPolicy": {
-      "description": "Per-server taint policy that lets operators disable specific taint rules for known-safe fields rather than turning off all scanning.\n\nExample config.toml: ```toml [mcp_servers.my_firefox.taint_policy.tools.navigate.paths] \"$.tabId\"     = { skip_rules = [\"opaque_token\"] } \"$.sessionId\" = { skip_rules = [\"opaque_token\"] } ```",
+      "description": "Per-server taint policy that lets operators disable specific taint rules for known-safe fields rather than turning off all scanning.\n\nExample config.toml: ```toml [mcp_servers.my_firefox.taint_policy.tools.navigate] default = \"skip\"   # bypass scanning entirely for `navigate`\n\n[mcp_servers.my_firefox.taint_policy.tools.read_file.paths] \"$.content\"   = { skip_rules = [\"opaque_token\"] } \"$.metadata.*\" = { skip_rules = [\"sensitive_key_name\"] } ```",
       "properties": {
         "tools": {
           "additionalProperties": {
@@ -4361,16 +4553,77 @@
       },
       "type": "object"
     },
+    "McpTaintRuleSetAction": {
+      "description": "Severity action for a [`NamedTaintRuleSet`] when one of its rules fires during MCP argument scanning.\n\n**Overlap resolution: most permissive wins.** When a tool's `rule_sets` list references multiple sets that all cover the same `TaintRuleId`, the scanner applies the *most permissive* action — `Log` > `Warn` > `Block`. This is intentional (it lets a narrow `audit_only` set carve out exceptions to a broad `Block` set without rewriting the broad set), but it means **adding an audit-only set with `action = log` will silently neutralise any `block` set that overlaps on the same rule**. The dashboard surfaces a hint next to the `rule_sets` field; operators authoring config by hand should keep this in mind.",
+      "oneOf": [
+        {
+          "description": "Abort the MCP tool call and surface a violation error to the LLM (current scanner default).",
+          "enum": [
+            "block"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Allow the call through, but emit a structured WARN-level tracing event so operators can see exemptions firing.",
+          "enum": [
+            "warn"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Allow the call through and emit at INFO level. Useful for building an exemption baseline before flipping a rule set to `block`.",
+          "enum": [
+            "log"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "McpTaintToolAction": {
+      "description": "What the scanner does for a tool's argument paths NOT matched by any entry in [`McpTaintToolPolicy::paths`].",
+      "oneOf": [
+        {
+          "description": "Apply the full taint rule set to every argument leaf (current behaviour).",
+          "enum": [
+            "scan"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Bypass scanning entirely for this tool. Even sensitive object keys are allowed through. Use as a tool-level kill switch when a tool's arguments are by-design opaque (browser tab handles, DB session IDs, etc.).",
+          "enum": [
+            "skip"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "McpTaintToolPolicy": {
       "description": "Per-tool taint policy for an MCP server.",
       "properties": {
+        "default": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/McpTaintToolAction"
+            }
+          ],
+          "default": "scan",
+          "description": "What to do for argument paths not matched by `paths`. Defaults to [`McpTaintToolAction::Scan`] (current behaviour).\n\nSet to [`McpTaintToolAction::Skip`] to bypass scanning for the whole tool with one line, instead of enumerating every argument path."
+        },
         "paths": {
           "additionalProperties": {
             "$ref": "#/definitions/McpTaintPathPolicy"
           },
           "default": {},
-          "description": "Per-path exemptions.  The key is a minimal JSONPath expression (e.g. `$.tabId`, `$.headers.*`, `$.items[*]`).  Paths not listed here have all rules applied.",
+          "description": "Per-path exemptions.  The key is a minimal JSONPath expression (e.g. `$.tabId`, `$.headers.*`, `$.items[*]`).  Paths not listed here have all rules applied (subject to `default`).",
           "type": "object"
+        },
+        "rule_sets": {
+          "description": "Names of top-level `[[taint_rules]]` rule sets to apply to every argument leaf of this tool. Each referenced set's `action` controls whether the listed rules block, warn, or log when they fire.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -4688,6 +4941,11 @@
             "null"
           ]
         },
+        "app_secret_env": {
+          "default": "",
+          "description": "Env var name holding the Facebook App Secret. Used for HMAC-SHA1 verification of incoming webhook POST requests via `X-Hub-Signature`. If absent or empty, verification is skipped with a warning (backwards compatibility).",
+          "type": "string"
+        },
         "default_agent": {
           "default": null,
           "description": "Default agent name to route messages to.",
@@ -4720,11 +4978,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -4804,11 +5064,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -4833,6 +5095,36 @@
           "type": "string"
         }
       },
+      "type": "object"
+    },
+    "NamedTaintRuleSet": {
+      "description": "A reusable, named group of taint rules with an associated severity action.\n\nDefined as `[[taint_rules]]` in `config.toml` and referenced by [`McpTaintToolPolicy::rule_sets`]:\n\n```toml [[taint_rules]] name = \"browser_handles\" action = \"warn\" rules = [\"opaque_token\"]\n\n[mcp_servers.camofox.taint_policy.tools.navigate] rule_sets = [\"browser_handles\"] ```\n\n`PartialEq + Eq` are derived so the kernel's reload-plan diff can detect `[[taint_rules]]` changes and emit `HotAction::ReloadTaintRules`.",
+      "properties": {
+        "action": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/McpTaintRuleSetAction"
+            }
+          ],
+          "default": "block",
+          "description": "What happens when one of `rules` fires during scanning."
+        },
+        "name": {
+          "description": "Identifier referenced by [`McpTaintToolPolicy::rule_sets`]. Must be unique within a [`KernelConfig`]; duplicate names are resolved by last-wins ordering.",
+          "type": "string"
+        },
+        "rules": {
+          "default": [],
+          "description": "`TaintRuleId` variants this set covers.",
+          "items": {
+            "$ref": "#/definitions/TaintRuleId"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "name"
+      ],
       "type": "object"
     },
     "NetworkConfig": {
@@ -4927,11 +5219,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -4994,11 +5288,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -5120,11 +5416,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -5241,6 +5539,14 @@
           "description": "OAuth2 redirect URI. Defaults to `http://127.0.0.1:4545/api/auth/callback`.",
           "type": "string"
         },
+        "require_email_verified": {
+          "default": null,
+          "description": "Override the global `require_email_verified` setting for this provider. `None` means inherit from `ExternalAuthConfig::require_email_verified`. Set to `false` only if this specific provider does not issue `email_verified` claims (e.g. GitHub's user API does not include the field for OAuth2 flows).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "scopes": {
           "default": [
             "openid",
@@ -5325,11 +5631,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -5412,11 +5720,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -5563,11 +5873,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -5653,11 +5965,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -5748,11 +6062,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -5862,11 +6178,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -5959,11 +6277,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -6033,11 +6353,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -6110,11 +6432,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -6215,11 +6539,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -6292,11 +6618,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -6394,11 +6722,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -6494,11 +6824,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -6581,11 +6913,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -6665,11 +6999,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -6742,11 +7078,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -6846,11 +7184,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -6940,11 +7280,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -6985,6 +7327,11 @@
                 "null"
               ]
             },
+            "app_secret_env": {
+              "default": "",
+              "description": "Env var name holding the Facebook App Secret. Used for HMAC-SHA1 verification of incoming webhook POST requests via `X-Hub-Signature`. If absent or empty, verification is skipped with a warning (backwards compatibility).",
+              "type": "string"
+            },
             "default_agent": {
               "default": null,
               "description": "Default agent name to route messages to.",
@@ -7017,11 +7364,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -7111,11 +7460,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -7203,11 +7554,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -7280,11 +7633,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -7360,11 +7715,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -7447,11 +7804,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -7539,11 +7898,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -7616,11 +7977,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -7669,9 +8032,17 @@
                 "null"
               ]
             },
+            "allowed_channels": {
+              "default": [],
+              "description": "Restrict to specific channel IDs (empty = all channels the bot is in).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "api_url": {
               "default": "https://api.revolt.chat",
-              "description": "Revolt API URL.",
+              "description": "Revolt API URL (set to your self-hosted instance URL if not using revolt.chat).",
               "type": "string"
             },
             "bot_token_env": {
@@ -7711,16 +8082,23 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
               },
               "description": "Per-channel behavior overrides."
+            },
+            "ws_url": {
+              "default": "wss://ws.revolt.chat",
+              "description": "Revolt WebSocket URL (set to your self-hosted instance WS URL if not using revolt.chat).",
+              "type": "string"
             }
           },
           "type": "object"
@@ -7786,11 +8164,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -7881,11 +8261,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -8000,11 +8382,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -8093,16 +8477,23 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
               },
               "description": "Per-channel behavior overrides."
+            },
+            "security_token_env": {
+              "default": "",
+              "description": "Env var name holding the outgoing webhook security token (base64-encoded). Used for HMAC-SHA256 verification of inbound webhook requests. If the env var is absent or empty, verification is skipped with a warning.",
+              "type": "string"
             },
             "webhook_port": {
               "default": 3978,
@@ -8209,11 +8600,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -8291,11 +8684,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -8383,11 +8778,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -8478,11 +8875,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -8550,11 +8949,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -8648,11 +9049,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -8757,11 +9160,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -8846,11 +9251,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -8946,11 +9353,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -9041,11 +9450,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -9138,11 +9549,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -9235,11 +9648,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -9337,11 +9752,13 @@
                 "message_debounce_ms": 0,
                 "model": null,
                 "output_format": null,
+                "prefix_agent_name": "off",
                 "rate_limit_per_minute": 0,
                 "rate_limit_per_user": 0,
                 "reply_precheck": false,
                 "reply_precheck_model": null,
                 "system_prompt": null,
+                "thread_ownership_enabled": true,
                 "threading": false,
                 "typing_mode": null,
                 "usage_footer": null
@@ -9436,6 +9853,14 @@
             "null"
           ]
         },
+        "public_base_url": {
+          "default": null,
+          "description": "Public base URL the QR code points mobile clients at, e.g. `https://librefang.example.com`. When set, takes precedence over the request `Host` header — required for HTTPS reverse-proxy deployments where trusting client-supplied `X-Forwarded-Proto` would let any authenticated dashboard caller forge the scheme. When `None`, the daemon falls back to `Host` + the runtime scheme.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "push_provider": {
           "default": "none",
           "description": "Push notification provider: \"none\", \"ntfy\", \"gotify\".",
@@ -9447,6 +9872,37 @@
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ParallelToolsConfig": {
+      "description": "Configuration for the agent loop's parallel tool dispatcher.\n\nPR-3 ships the schema only; the agent loop still runs tool calls strictly sequentially. PR-4 wires the dispatcher into the runtime and PR-5 flips `enabled` on by default.\n\n```toml [parallel_tools] enabled = false max_concurrent = 4 mcp_default_safety = \"write_shared\"   # or \"read_only\" mcp_readonly_allowlist = [\"mcp__github__list_issues\"] ```\n\nFalls back to fully sequential execution when `enabled = false`.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Master switch. Default `false` so PR-3 ships with no behaviour change. PR-5 will flip the default to `true` after the streaming dispatcher integration lands.",
+          "type": "boolean"
+        },
+        "max_concurrent": {
+          "default": 4,
+          "description": "Cap on concurrent tool calls within a single bucket. `0` = uncapped (use the bucket size). The dispatcher honours this when launching futures via `join_all`.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "mcp_default_safety": {
+          "default": "write_shared",
+          "description": "Default `ParallelSafety` class assigned to MCP tools whose servers don't carry `readOnlyHint` annotations. Conservative default `\"write_shared\"` keeps unannotated MCP tools serialised (one per bucket) instead of optimistically parallelising. Accepted values: `\"read_only\"` | `\"write_shared\"`. PR-4 will promote this to a typed enum once the dispatcher consumes it.",
+          "type": "string"
+        },
+        "mcp_readonly_allowlist": {
+          "default": [],
+          "description": "Explicit allowlist of MCP tool names that should be treated as `ReadOnly` regardless of `mcp_default_safety`. Names match the fully-namespaced form (`mcp__server__name`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -9513,6 +9969,32 @@
           "description": "Deny the tool.",
           "enum": [
             "deny"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PrefixStyle": {
+      "description": "Prefix style applied to outbound agent messages on a channel.\n\nWhen enabled, the channel bridge wraps the responding agent's reply with its name so end-users can tell which agent authored the message when multiple agents share the same channel. Default is `Off` to preserve existing behavior.\n\nPlatform-native identity (e.g. Slack per-message bot username override, Discord embed author field) is intentionally out of scope here.",
+      "oneOf": [
+        {
+          "description": "No prefix — byte-identical to pre-feature behavior.",
+          "enum": [
+            "off"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Plain bracketed name: `[agent-name] text`.",
+          "enum": [
+            "bracket"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Bold bracketed name via markdown: `**[agent-name]** text`. Renders bold on platforms that support markdown (Discord, Telegram markdown mode, Slack mrkdwn treats it as bold too).",
+          "enum": [
+            "bold_bracket"
           ],
           "type": "string"
         }
@@ -9783,11 +10265,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -9865,11 +10349,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -9880,11 +10366,18 @@
       "type": "object"
     },
     "QueueConcurrencyConfig": {
-      "description": "Per-lane concurrency limits for the command queue.\n\nConfigure in config.toml: ```toml [queue.concurrency] main_lane = 3 cron_lane = 2 subagent_lane = 3 ```",
+      "description": "Per-lane concurrency limits for the command queue.\n\nConfigure in config.toml: ```toml [queue.concurrency] main_lane = 3 cron_lane = 2 subagent_lane = 3 trigger_lane = 8 default_per_agent = 1 ```",
       "properties": {
         "cron_lane": {
           "default": 2,
           "description": "Cron lane concurrent limit (scheduled jobs).",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "default_per_agent": {
+          "default": 1,
+          "description": "Default per-agent invocation cap when an agent's manifest does not set `max_concurrent_invocations`. `1` reproduces the legacy per-agent-mutex serialization that pre-existed this knob — change deliberately. `0` is rewritten to `1` by validation. Typed `usize` to match the sibling lane fields and to feed `Semaphore::new` without a cast.",
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
@@ -9899,6 +10392,13 @@
         "subagent_lane": {
           "default": 3,
           "description": "Subagent lane concurrent limit (child agents).",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "trigger_lane": {
+          "default": 8,
+          "description": "Trigger lane concurrent limit — global cap on event-trigger (`TaskPosted`, `MessageReceived`, …) dispatches in flight at the same time, across all agents. Acquired BEFORE the per-agent semaphore so a single hot agent cannot starve the kernel. Default `8`. `0` is rewritten to `1` by validation.",
           "format": "uint",
           "minimum": 0.0,
           "type": "integer"
@@ -9917,8 +10417,10 @@
           ],
           "default": {
             "cron_lane": 2,
+            "default_per_agent": 1,
             "main_lane": 3,
-            "subagent_lane": 3
+            "subagent_lane": 3,
+            "trigger_lane": 8
           },
           "description": "Per-lane concurrency limits."
         },
@@ -10061,11 +10563,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -10177,9 +10681,17 @@
             "null"
           ]
         },
+        "allowed_channels": {
+          "default": [],
+          "description": "Restrict to specific channel IDs (empty = all channels the bot is in).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "api_url": {
           "default": "https://api.revolt.chat",
-          "description": "Revolt API URL.",
+          "description": "Revolt API URL (set to your self-hosted instance URL if not using revolt.chat).",
           "type": "string"
         },
         "bot_token_env": {
@@ -10219,16 +10731,23 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
           },
           "description": "Per-channel behavior overrides."
+        },
+        "ws_url": {
+          "default": "wss://ws.revolt.chat",
+          "description": "Revolt WebSocket URL (set to your self-hosted instance WS URL if not using revolt.chat).",
+          "type": "string"
         }
       },
       "type": "object"
@@ -10284,11 +10803,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -10408,13 +10929,31 @@
           "type": "string"
         },
         {
-          "description": "Auto-select based on available API keys (Tavily → Brave → Jina → Perplexity → DuckDuckGo).",
+          "description": "SearXNG self-hosted search (no API key needed).",
+          "enum": [
+            "searxng"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Auto-select based on available API keys (Tavily → Brave → Jina → Perplexity → Searxng → DuckDuckGo).",
           "enum": [
             "auto"
           ],
           "type": "string"
         }
       ]
+    },
+    "SearxngSearchConfig": {
+      "description": "SearXNG self-hosted search configuration.\n\nRequires only a `url`; SearXNG public instances reject `limit` and the LLM-facing `max_results` is taken from the per-call `tool_args` (the runtime truncates client-side after fetching).",
+      "properties": {
+        "url": {
+          "default": "",
+          "description": "Base URL of the SearXNG instance (e.g., \"https://search.example.com\"). Empty means the provider is disabled.",
+          "type": "string"
+        }
+      },
+      "type": "object"
     },
     "SecondFactor": {
       "description": "Second-factor verification scope.\n\nControls where TOTP verification is enforced: - `Totp` = approvals only (backward-compatible default when TOTP is enabled) - `Login` = dashboard login only - `Both` = approvals + dashboard login",
@@ -10673,11 +11212,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -10709,6 +11250,33 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "env_passthrough_denied_patterns": {
+          "default": [
+            "*_KEY",
+            "*_TOKEN",
+            "*_PASSWORD",
+            "*_SECRET",
+            "*_API_KEY",
+            "AWS_*",
+            "GITHUB_*"
+          ],
+          "description": "Operator-side gate over skill `env_passthrough` requests: glob patterns that block matching env-var names regardless of what the skill manifest declares. Defaults to a deny list covering common credential conventions (`*_KEY`, `*_TOKEN`, `*_PASSWORD`, `*_SECRET`, `*_API_KEY`, `AWS_*`, `GITHUB_*`). Set to an empty list to disable the operator deny check; the built-in `FORBIDDEN_PASSTHROUGH` and kernel-reserved hard blocks still apply.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "env_passthrough_per_skill": {
+          "additionalProperties": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "default": {},
+          "description": "Per-skill explicit allow overrides. Lets the operator grant a specific skill an env var that would otherwise be blocked by `env_passthrough_denied_patterns`. Cannot bypass the built-in `FORBIDDEN_PASSTHROUGH` hard block.\n\nExample: `{ \"gog\" = [\"GOG_KEYRING_PASSWORD\"] }`.",
+          "type": "object"
         },
         "extra_dirs": {
           "default": [],
@@ -10809,11 +11377,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -10825,6 +11395,40 @@
           "description": "Whether to disable link unfurling (preview expansion) in sent messages. When set to `false`, Slack will not expand link previews. When `None` (default), Slack uses its own default behavior.",
           "type": [
             "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SlackRoleMapping": {
+      "description": "Slack-side mapping. Slack's `users.info` exposes `is_owner` / `is_admin` / `is_restricted` / `is_ultra_restricted`. Precedence (owner > admin > guest > member) is collapsed inside the channel adapter (`SlackAdapter::parse_users_info_response`) into a single platform token before this mapping ever sees it; the translator here is a flat lookup, not a precedence ladder. Each step is optional — leave a field unset to fall through to default-deny `Viewer` for that platform tier.",
+      "properties": {
+        "admin_role": {
+          "description": "LibreFang role for `is_admin = true` users.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "guest_role": {
+          "description": "LibreFang role for single/multi-channel guests.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "member_role": {
+          "description": "LibreFang role for regular workspace members.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "owner_role": {
+          "description": "LibreFang role for `is_owner = true` users.",
+          "type": [
+            "string",
             "null"
           ]
         }
@@ -11015,16 +11619,23 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
           },
           "description": "Per-channel behavior overrides."
+        },
+        "security_token_env": {
+          "default": "",
+          "description": "Env var name holding the outgoing webhook security token (base64-encoded). Used for HMAC-SHA256 verification of inbound webhook requests. If the env var is absent or empty, verification is skipped with a warning.",
+          "type": "string"
         },
         "webhook_port": {
           "default": 3978,
@@ -11121,11 +11732,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -11150,9 +11763,41 @@
       },
       "type": "object"
     },
+    "TelegramRoleMapping": {
+      "description": "Telegram-side mapping. Telegram exposes three statuses for a member of a chat: `creator`, `administrator`, `member` (plus `restricted`/`left`/ `kicked` which we collapse into \"no derived role\").",
+      "properties": {
+        "admin_role": {
+          "description": "LibreFang role assigned when Telegram reports `status = \"administrator\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "creator_role": {
+          "description": "LibreFang role assigned when Telegram reports `status = \"creator\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "member_role": {
+          "description": "LibreFang role assigned when Telegram reports `status = \"member\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "TelemetryConfig": {
       "description": "Telemetry / observability configuration.\n\n```toml [telemetry] enabled = true                              # OpenTelemetry OTLP tracing otlp_endpoint = \"http://localhost:4317\" service_name = \"librefang\" sample_rate = 1.0 prometheus_enabled = true                   # Prometheus metrics at /api/metrics ```",
       "properties": {
+        "auto_start_observability_stack": {
+          "default": false,
+          "description": "Auto-start the bundled observability Docker stack (Grafana, Prometheus, Tempo, OTel collector) on daemon boot. Default: `false`.\n\nOff by default because spinning up four containers on every `librefang start` is a strong implicit side-effect — operators usually prefer `librefang start` to leave the host untouched. Existing dashboards / custom OTel collectors keep working as long as `otlp_endpoint` points at them; the stack is only useful for the bundled local view.\n\nIssue #3136.",
+          "type": "boolean"
+        },
         "enabled": {
           "default": true,
           "description": "Enable OpenTelemetry OTLP tracing export.",
@@ -11297,11 +11942,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -11722,11 +12369,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -11807,11 +12456,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -11896,6 +12547,36 @@
         }
       ]
     },
+    "UserBudgetConfig": {
+      "description": "RBAC M5: per-user spending budget.\n\nMirrors the global [`BudgetConfig`] window structure (hourly / daily / monthly) so the same cost-attribution pipeline can enforce both. Set any limit to `0.0` for \"unlimited on that window\". `alert_threshold` is the fraction of any limit at which the metering layer should emit a `BudgetExceeded` audit pre-warning (default 0.8, clamped to 0..=1).",
+      "properties": {
+        "alert_threshold": {
+          "default": 0.8,
+          "description": "Alert threshold (0..=1). Metering surfaces a BudgetExceeded audit when *any* window reaches this fraction of its limit. Defaults to 0.8 — same default as the global budget — for consistency.",
+          "format": "double",
+          "type": "number"
+        },
+        "max_daily_usd": {
+          "default": 0.0,
+          "description": "Maximum cost in USD per day for this user (0.0 = unlimited).",
+          "format": "double",
+          "type": "number"
+        },
+        "max_hourly_usd": {
+          "default": 0.0,
+          "description": "Maximum cost in USD per hour for this user (0.0 = unlimited).",
+          "format": "double",
+          "type": "number"
+        },
+        "max_monthly_usd": {
+          "default": 0.0,
+          "description": "Maximum cost in USD per month for this user (0.0 = unlimited).",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "type": "object"
+    },
     "UserConfig": {
       "description": "User configuration for RBAC multi-user support.",
       "properties": {
@@ -11907,6 +12588,17 @@
             "null"
           ]
         },
+        "budget": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UserBudgetConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "RBAC M5: per-user spend caps. `None` means \"no per-user cap\" — the user is still bounded by global / per-agent / per-provider budgets. See [`UserBudgetConfig`] for the supported windows."
+        },
         "channel_bindings": {
           "additionalProperties": {
             "type": "string"
@@ -11914,6 +12606,24 @@
           "default": {},
           "description": "Channel bindings: maps channel platform IDs to this user. e.g., {\"telegram\": \"123456\", \"discord\": \"987654\"}",
           "type": "object"
+        },
+        "channel_tool_rules": {
+          "additionalProperties": {
+            "$ref": "#/definitions/ChannelToolPolicy"
+          },
+          "description": "Per-channel tool overrides for THIS user. Keyed by channel adapter name (e.g. `\"telegram\"`, `\"discord\"`). Layers on top of the global `ApprovalPolicy.channel_rules` — both must agree to allow.",
+          "type": "object"
+        },
+        "memory_access": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UserMemoryAccess"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Memory namespace ACL — controls reads/writes to memory scopes (`proactive`, `kv:*`, etc.) and PII redaction. `None` means \"use the role default ACL\"."
         },
         "name": {
           "description": "User display name.",
@@ -11923,11 +12633,114 @@
           "default": "user",
           "description": "User role (owner, admin, user, viewer).",
           "type": "string"
+        },
+        "tool_categories": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UserToolCategories"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Bulk allow/deny by `ToolGroup` category (groups are declared in `KernelConfig.tool_policy.groups`). Lets admins say `denied_groups = [\"dangerous\"]` without listing each tool."
+        },
+        "tool_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UserToolPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Per-user tool allow/deny lists. Layered ON TOP of the per-agent `ToolPolicy` and any channel rules in `ApprovalPolicy`. `None` means \"no per-user policy — defer to other layers\"."
         }
       },
       "required": [
         "name"
       ],
+      "type": "object"
+    },
+    "UserMemoryAccess": {
+      "description": "Per-user memory namespace ACL.\n\nMemory in LibreFang is partitioned by *namespace* — typically the agent ID for KV / proactive entries, plus a small set of well-known shared scopes (`shared`, `proactive`, `kv`, …). This ACL gates which of those a given user may read or write through the LLM-facing memory tools.\n\nPII handling: when `pii_access` is `false`, fragments tagged with [`TaintLabel::Pii`](crate::taint::TaintLabel::Pii) MUST be redacted before they reach the user. The redaction itself happens at the memory call site (kernel + memory crate); this struct only declares intent.",
+      "properties": {
+        "delete_allowed": {
+          "default": false,
+          "description": "Whether the user may delete memory entries they can otherwise read.",
+          "type": "boolean"
+        },
+        "export_allowed": {
+          "default": false,
+          "description": "Whether the user may export memory in bulk.",
+          "type": "boolean"
+        },
+        "pii_access": {
+          "default": false,
+          "description": "Whether PII-tagged fragments may be returned to this user. When `false`, PII fields are redacted on read.",
+          "type": "boolean"
+        },
+        "readable_namespaces": {
+          "default": [],
+          "description": "Namespaces this user may read. Empty list with `pii_access=false` is a meaningful \"no-read\" deny-all — see [`Self::can_read`].",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "writable_namespaces": {
+          "default": [],
+          "description": "Namespaces this user may write to. Empty list = no-write (read-only).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "UserToolCategories": {
+      "description": "Bulk allow/deny by tool category — references existing `ToolGroup` definitions by name (e.g. `\"web_tools\"`, `\"code_tools\"`). Group definitions live in [`KernelConfig.tool_policy.groups`](crate::tool_policy::ToolPolicy::groups).\n\nCategories let admins say \"this user only gets read-only categories\" without listing every tool individually.",
+      "properties": {
+        "allowed_groups": {
+          "default": [],
+          "description": "Group names whose tools are allowed for this user. Empty = no category-level allow-list.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "denied_groups": {
+          "default": [],
+          "description": "Group names whose tools are denied for this user. Always wins.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "UserToolPolicy": {
+      "description": "Per-user allow/deny lists for tool invocations.\n\nThese rules layer on top of the per-agent [`ToolPolicy`](crate::tool_policy::ToolPolicy) and the per-agent channel rules in [`ApprovalPolicy`](crate::approval::ApprovalPolicy). All layers must agree (fail-closed AND) for a call to proceed without approval.",
+      "properties": {
+        "allowed_tools": {
+          "default": [],
+          "description": "Tool name patterns this user may invoke. Empty list means \"no allow-list — defer to other layers\". When non-empty, every invocation must match at least one pattern.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "denied_tools": {
+          "default": [],
+          "description": "Tool name patterns this user must never invoke. Always wins.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
       "type": "object"
     },
     "VaultConfig": {
@@ -12027,11 +12840,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -12115,11 +12930,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -12214,11 +13031,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -12293,11 +13112,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -12423,6 +13244,17 @@
           "default": "auto",
           "description": "Which search provider to use."
         },
+        "searxng": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SearxngSearchConfig"
+            }
+          ],
+          "default": {
+            "url": ""
+          },
+          "description": "SearXNG self-hosted search configuration."
+        },
         "tavily": {
           "allOf": [
             {
@@ -12543,11 +13375,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -12628,11 +13462,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -12745,11 +13581,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -12832,11 +13670,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -12924,11 +13764,13 @@
             "message_debounce_ms": 0,
             "model": null,
             "output_format": null,
+            "prefix_agent_name": "off",
             "rate_limit_per_minute": 0,
             "rate_limit_per_user": 0,
             "reply_precheck": false,
             "reply_precheck_model": null,
             "system_prompt": null,
+            "thread_ownership_enabled": true,
             "threading": false,
             "typing_mode": null,
             "usage_footer": null
@@ -12975,6 +13817,13 @@
         "null"
       ]
     },
+    "allowed_mount_roots": {
+      "description": "Host directories under which `agent.toml: [workspaces].<name>.mount` declarations may resolve. Each declared mount is canonicalized at boot and must be a path prefix of one of these (also canonicalized) roots; otherwise it is rejected with a warning. Empty (default) denies all external mounts — the safe default. See issue #3230.\n\nExample: ```toml allowed_mount_roots = [ \"/Users/alice/Documents\", \"/data/shared\", ] ```",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "api_key": {
       "default": "",
       "description": "API authentication key. When set, all API endpoints (except /api/health) require a `Authorization: Bearer <key>` header. If empty, the API is unauthenticated (local development only).",
@@ -13020,6 +13869,9 @@
         }
       ],
       "default": {
+        "retention": {
+          "retention_days_by_action": {}
+        },
         "retention_days": 90
       },
       "description": "Audit log configuration."
@@ -13147,6 +13999,14 @@
         "max_html_bytes": 524288
       },
       "description": "Canvas (A2UI) configuration."
+    },
+    "channel_role_mapping": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ChannelRoleMapping"
+        }
+      ],
+      "description": "Maps platform-native channel roles (Telegram admin, Discord guild roles, Slack workspace roles) to LibreFang `UserRole`. Used by `AuthManager::resolve_role_for_sender` after explicit `UserConfig.role` is consulted (explicit beats channel-derived; both beat default-deny)."
     },
     "channels": {
       "allOf": [
@@ -13523,6 +14383,24 @@
       },
       "description": "Link understanding configuration."
     },
+    "llm": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/LlmConfig"
+        }
+      ],
+      "default": {
+        "auxiliary": {}
+      },
+      "description": "`[llm]` section — currently carries the auxiliary side-task chain configuration. See [`LlmConfig`] / [`AuxiliaryConfig`]."
+    },
+    "local_probe_interval_secs": {
+      "default": 60,
+      "description": "Interval in seconds between reachability probes of local providers (Ollama, vLLM, LM Studio, lemonade).\n\nLower values make the dashboard react faster to `brew services start/stop ollama` at the cost of extra HTTP calls to `/api/tags`. 60 s is the default — it keeps the UI responsive without noticeably loading a local Ollama daemon. Dev machines flipping Ollama on/off frequently can drop to 10; long-lived production boxes can raise to 300+ since the state rarely changes.\n\nZero or values below the probe timeout (2 s) are treated as 60.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
     "log_dir": {
       "default": null,
       "description": "Custom log directory. When set, log files are written here instead of the default `~/.librefang/` directory.",
@@ -13556,6 +14434,15 @@
       "format": "uint",
       "minimum": 0.0,
       "type": "integer"
+    },
+    "max_history_messages": {
+      "description": "Operator override for the agent message-history trim cap. When set, any agent without its own `max_history_messages` uses this value instead of the compiled-in default (`agent_loop::DEFAULT_MAX_HISTORY_MESSAGES`). Lower it to bound per-turn token cost; raise it for long-context models. `None` means \"use the compiled-in default\". Values below 4 are silently clamped at runtime with a warning log.",
+      "format": "uint",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
     },
     "max_request_body_bytes": {
       "default": 1048576,
@@ -13696,10 +14583,25 @@
         "max_devices": 10,
         "ntfy_topic": null,
         "ntfy_url": null,
+        "public_base_url": null,
         "push_provider": "none",
         "token_expiry_secs": 300
       },
       "description": "Device pairing configuration."
+    },
+    "parallel_tools": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ParallelToolsConfig"
+        }
+      ],
+      "default": {
+        "enabled": false,
+        "max_concurrent": 4,
+        "mcp_default_safety": "write_shared",
+        "mcp_readonly_allowlist": []
+      },
+      "description": "Parallel-tool dispatcher configuration. PR-3 schema only — runtime integration lands in PR-4. See [`ParallelToolsConfig`]."
     },
     "plugins": {
       "allOf": [
@@ -13835,8 +14737,10 @@
       "default": {
         "concurrency": {
           "cron_lane": 2,
+          "default_per_agent": 1,
           "main_lane": 3,
-          "subagent_lane": 3
+          "subagent_lane": 3,
+          "trigger_lane": 8
         },
         "max_depth_global": 0,
         "max_depth_per_agent": 0,
@@ -13950,6 +14854,16 @@
       ],
       "default": {
         "disabled": [],
+        "env_passthrough_denied_patterns": [
+          "*_KEY",
+          "*_TOKEN",
+          "*_PASSWORD",
+          "*_SECRET",
+          "*_API_KEY",
+          "AWS_*",
+          "GITHUB_*"
+        ],
+        "env_passthrough_per_skill": {},
         "extra_dirs": [],
         "load_user": true
       },
@@ -13964,6 +14878,13 @@
       "default": false,
       "description": "Strict config mode: when `true`, the daemon refuses to start if the config file contains unknown or unrecognised fields. When `false` (the default), unknown fields are logged as warnings but the daemon boots normally. This is the \"tolerant mode\" toggle.",
       "type": "boolean"
+    },
+    "taint_rules": {
+      "description": "Reusable named taint rule sets referenced by [`McpTaintToolPolicy::rule_sets`]. Each entry defines a group of taint rules with a severity action (block / warn / log) that the MCP scanner applies to every tool that opts in.\n\n**Hot-reload caveat:** the kernel snapshots this list onto each connected MCP server at install / reload time. Edits to `[[taint_rules]]` followed by a config reload do NOT propagate to already-connected MCP servers until the server itself is reloaded (e.g. via `reload_mcp_server_config` or a daemon restart). The snapshot keeps the scanner's view stable for the lifetime of a single tool call.",
+      "items": {
+        "$ref": "#/definitions/NamedTaintRuleSet"
+      },
+      "type": "array"
     },
     "task_board": {
       "allOf": [
@@ -13985,6 +14906,7 @@
         }
       ],
       "default": {
+        "auto_start_observability_stack": false,
         "enabled": true,
         "otlp_endpoint": "http://localhost:4317",
         "prometheus_enabled": true,
@@ -14212,6 +15134,9 @@
           "model": "sonar"
         },
         "search_provider": "auto",
+        "searxng": {
+          "url": ""
+        },
         "tavily": {
           "api_key_env": "TAVILY_API_KEY",
           "include_answer": true,

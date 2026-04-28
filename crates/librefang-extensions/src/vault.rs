@@ -14,18 +14,102 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(test))]
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
-/// Service name for OS keyring storage.
-#[cfg(not(test))]
-const KEYRING_SERVICE: &str = "librefang-vault";
-/// Username for OS keyring (used by platform keyring backends).
-#[allow(dead_code)]
-const KEYRING_USER: &str = "master-key";
 /// Env var fallback for vault key.
 const VAULT_KEY_ENV: &str = "LIBREFANG_VAULT_KEY";
+
+/// Service name used by the legacy v1 XOR-obfuscated keyring file as a salt
+/// in the unmasking hash. Must remain stable across targets so v1 → v2
+/// migrations keep working on every platform we ever ran on. The OS-keyring
+/// backend's own service/user constants live in the `os_keyring` module.
+#[cfg(not(test))]
+const KEYRING_SERVICE: &str = "librefang-vault";
+
+/// OS keyring backend abstraction. The real impl is only compiled on
+/// targets where the `keyring` crate has a usable backend (glibc Linux,
+/// macOS, Windows). On musl Linux, Android, and other targets the crate
+/// itself isn't pulled — see Cargo.toml — so we provide a stub that
+/// always reports unavailability. Callers fall through to the
+/// AES-256-GCM file-based store either way.
+#[cfg(all(
+    not(test),
+    any(
+        all(target_os = "linux", not(target_env = "musl")),
+        target_os = "macos",
+        target_os = "windows",
+    )
+))]
+mod os_keyring {
+    const SERVICE: &str = "librefang-vault";
+    // Each install stores a single master key per host; `Entry` needs a
+    // username field so we use a fixed sentinel.
+    const USER: &str = "master-key";
+
+    /// Returns true if the key was stored in the OS keyring; false means
+    /// the backend was unavailable / refused, and the caller should fall
+    /// through to the file-based store. Backend errors are logged at
+    /// debug and surfaced as `false` — never propagated.
+    pub fn try_store(key_b64: &str) -> bool {
+        match keyring::Entry::new(SERVICE, USER) {
+            Ok(entry) => match entry.set_password(key_b64) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::debug!(
+                        "OS keyring set_password failed ({e}) — falling back to file-based store"
+                    );
+                    false
+                }
+            },
+            Err(e) => {
+                tracing::debug!(
+                    "OS keyring entry initialisation failed ({e}) — falling back to file-based store"
+                );
+                false
+            }
+        }
+    }
+
+    /// Returns Some(key) if found; None means no entry / backend
+    /// unavailable, and the caller should try the file-based store.
+    pub fn try_load() -> Option<String> {
+        match keyring::Entry::new(SERVICE, USER) {
+            Ok(entry) => match entry.get_password() {
+                Ok(s) => Some(s),
+                Err(keyring::Error::NoEntry) => None,
+                Err(e) => {
+                    tracing::debug!(
+                        "OS keyring get_password failed ({e}) — trying file-based fallback"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+    }
+}
+
+#[cfg(all(
+    not(test),
+    not(any(
+        all(target_os = "linux", not(target_env = "musl")),
+        target_os = "macos",
+        target_os = "windows",
+    ))
+))]
+mod os_keyring {
+    pub fn try_store(_key_b64: &str) -> bool {
+        false
+    }
+
+    pub fn try_load() -> Option<String> {
+        None
+    }
+}
 /// Salt length for Argon2.
 const SALT_LEN: usize = 16;
 /// Nonce length for AES-256-GCM.
@@ -312,7 +396,21 @@ impl CredentialVault {
         let mut output = Vec::with_capacity(VAULT_MAGIC.len() + content.len());
         output.extend_from_slice(VAULT_MAGIC);
         output.extend_from_slice(content.as_bytes());
-        std::fs::write(&self.path, output)?;
+
+        // Atomic write: write to a sibling .tmp file (same filesystem guarantees
+        // rename is atomic), fsync to flush to disk, then rename over the target.
+        // A crash mid-write leaves only the .tmp file; the vault is never corrupt.
+        let temp_path = self.path.with_extension("tmp");
+        {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)?;
+            f.write_all(&output)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&temp_path, &self.path)?;
         Ok(())
     }
 
@@ -431,10 +529,21 @@ struct KeyringFile {
     ciphertext: String,
 }
 
-/// Store the master key in the OS keyring (file-based fallback with AES-256-GCM).
+/// Store the master key in the OS keyring (libsecret on Linux, Keychain on
+/// macOS, Credential Manager on Windows). Falls back to a file-based
+/// AES-256-GCM wrapped store only when the OS keyring is genuinely
+/// unavailable (e.g. headless Linux without a Secret Service daemon).
 fn store_keyring_key(key_b64: &str) -> Result<(), String> {
     #[cfg(not(test))]
     {
+        // Try the OS keyring first. The previous behaviour silently dropped
+        // through to the file fallback even on hosts that had a working
+        // keyring — see issue #3178.
+        if os_keyring::try_store(key_b64) {
+            debug!("Stored master key in OS keyring");
+            return Ok(());
+        }
+
         // File-based fallback — wraps the master key with AES-256-GCM using an
         // Argon2id-derived wrapping key from the machine fingerprint.
         let keyring_path = dirs::data_local_dir()
@@ -489,10 +598,20 @@ fn store_keyring_key(key_b64: &str) -> Result<(), String> {
     }
 }
 
-/// Load the master key from the OS keyring (file-based fallback).
+/// Load the master key, preferring the OS keyring and falling back to the
+/// file-based AES-256-GCM wrapped store. Symmetric with `store_keyring_key`.
 fn load_keyring_key() -> Result<Zeroizing<String>, String> {
     #[cfg(not(test))]
     {
+        // OS keyring first (issue #3178). `try_load` returns None for both
+        // "no entry" (normal on a host that previously stored to the file
+        // fallback) and "backend unavailable" — both cases drop through
+        // silently to the file path below.
+        if let Some(s) = os_keyring::try_load() {
+            debug!("Loaded master key from OS keyring");
+            return Ok(Zeroizing::new(s));
+        }
+
         let keyring_path = dirs::data_local_dir()
             .unwrap_or_else(std::env::temp_dir)
             .join("librefang")
@@ -579,20 +698,89 @@ fn load_keyring_key() -> Result<Zeroizing<String>, String> {
     }
 }
 
-/// Generate a machine-specific fingerprint for keyring key wrapping.
+/// Return a stable, unpredictable 32-byte machine secret used as the input
+/// to the Argon2id wrapping-key derivation for the file-based keyring fallback.
+///
+/// # Security design
+/// The old implementation derived this value from `username + hostname`, which
+/// is predictable to any local user and therefore provided no meaningful
+/// protection against a local attacker reading the `.keyring` file.
+///
+/// This version stores a randomly-generated 32-byte value in a 0600-permissioned
+/// file on first call. Subsequent calls read the same value so the wrapping key
+/// is stable across restarts while still being unguessable.
+///
+/// If the file cannot be created (e.g. a read-only filesystem), we fall back to
+/// the predictable username+hostname derivation and emit a warning — the same
+/// degraded security as before, but only as a last resort.
 #[cfg(not(test))]
 fn machine_fingerprint() -> Vec<u8> {
     use sha2::Digest;
-    let mut hasher = Sha256::new();
-    // Mix in username + hostname for basic machine binding
-    if let Ok(user) = std::env::var("USERNAME").or_else(|_| std::env::var("USER")) {
-        hasher.update(user.as_bytes());
+
+    let fingerprint_path = dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("librefang")
+        .join(".machine-id");
+
+    // Try to read an existing random machine-id.
+    if let Ok(bytes) = std::fs::read(&fingerprint_path) {
+        if bytes.len() == 32 {
+            return bytes;
+        }
+        // Length mismatch — stale or corrupt file; regenerate below.
+        warn!(
+            "Unexpected machine-id file length ({} bytes) at {:?} — regenerating",
+            bytes.len(),
+            fingerprint_path
+        );
     }
-    if let Ok(host) = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")) {
-        hasher.update(host.as_bytes());
+
+    // Generate a fresh random 32-byte value.
+    let mut random_id = [0u8; 32];
+    OsRng.fill_bytes(&mut random_id);
+
+    // Persist with restrictive permissions so other local users cannot read it.
+    if let Some(parent) = fingerprint_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
-    hasher.update(b"librefang-vault-v1");
-    hasher.finalize().to_vec()
+    match std::fs::write(&fingerprint_path, &random_id) {
+        Ok(()) => {
+            // Restrict to owner-read/write only on Unix.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &fingerprint_path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
+            warn!(
+                "OS keyring unavailable — generated random machine-id for keyring fallback at {:?}. \
+                 This file must not be deleted; losing it makes the vault unrecoverable.",
+                fingerprint_path
+            );
+        }
+        Err(e) => {
+            // Cannot persist — fall back to the predictable derivation with a
+            // strong warning. This is the same security level as the old code.
+            warn!(
+                "Could not persist machine-id for keyring fallback ({e}): \
+                 falling back to predictable username+hostname derivation. \
+                 Set LIBREFANG_VAULT_KEY for a secure alternative."
+            );
+            let mut hasher = Sha256::new();
+            if let Ok(user) = std::env::var("USERNAME").or_else(|_| std::env::var("USER")) {
+                hasher.update(user.as_bytes());
+            }
+            if let Ok(host) = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")) {
+                hasher.update(host.as_bytes());
+            }
+            hasher.update(b"librefang-vault-v1");
+            return hasher.finalize().to_vec();
+        }
+    }
+
+    random_id.to_vec()
 }
 
 /// Derive a 256-bit wrapping key from a machine fingerprint + salt using Argon2id.

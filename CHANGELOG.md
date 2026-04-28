@@ -5,6 +5,299 @@ All notable changes to LibreFang will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Calendar Versioning](https://calver.org/) (YYYY.M.DD).
 
+## [2026.4.28] - 2026-04-28
+
+_67 PRs from 4 contributors since v2026.4.27-beta6._
+
+### Highlights
+
+- **Auxiliary LLM client** — a dedicated cheap-tier model now handles background side tasks, reducing cost on main-agent calls
+- **BytePlus, Microsoft (GitHub Models), and Z.ai providers** — three new LLM provider families added, each with their own dedicated API key env vars
+- **Thread ownership** — prevents multiple agents from sending duplicate replies to the same thread; paired with a pause/resume foundation for resumable multi-step workflows
+- **Redesigned Users surface and dashboard UI** — compact card grid layout, push-style adaptive drawer, unified animations, and richer markdown help drawers across all pages; empty states now land on the marketplace tab automatically
+- **Auto-fill channel replies and approval notifications** — channel replies now auto-populate the recipient from the sender, and approval notifications include the agent name for clarity
+
+### Added
+
+- Add env_passthrough allowlist to skill manifest (#3219) (@neo-wanderer)
+- Include agent name in approval notifications (#3247) (@neo-wanderer)
+- Auto-Highlights + collapse boilerplate + contributor roll-up (#3257) (@houko)
+- Add per_call_cost billing for video/music modalities (#3270) (@houko)
+- Add byteplus + byteplus_coding providers (#3271) (@houko)
+- Split _coding provider env vars onto dedicated names (#3279) (@houko)
+- Add microsoft provider entry with own env var (#3281) (@houko)
+- Split zai api_key_env from zhipu (#3285) (@houko)
+- Stream plugin / python stderr per-line to tracing (#3256) (#3287) (@houko)
+- Backfill providers missing from TUI first-run setup (#3291) (@houko)
+- Aux LLM client for cheap-tier side tasks (#3314) (#3321) (@houko)
+- Add file-backed cross-process rate-limit guard (#3322) (@houko)
+- Auto-fill channel_send recipient from sender_id for replies (#3323) (@leszek3737)
+- Internationalize Users surface (en + zh) (#3324) (@houko)
+- Redesign as compact card grid (#3336) (@houko)
+- Polish UI/UX across users surface (#3341) (@houko)
+- Push-style drawer that adapts main content width (#3356) (@houko)
+- BeforePromptBuild hook can contribute prompt sections (#3358) (@houko)
+- Unify all custom animations on motion (#3365) (@houko)
+- Land on marketplace tab when no servers configured (#3411) (@houko)
+- Land on marketplace tab when no workflows (#3412) (@houko)
+- Land on marketplace tab when nothing installed (#3413) (@houko)
+- Thread ownership prevents multi-agent duplicate replies (#3414) (@houko)
+- Pause/resume foundation for resumable workflows (#3418) (@houko)
+- Honest card cursor + detail drawers for plugins / MCP / FangHub skills (#3422) (@houko)
+- I18n keys + surface plugin / MCP catalog [i18n.<lang>] blocks via Accept-Language (#3424) (@houko)
+- Regroup metrics, surface unused per-agent data, collapse endpoints (#3427) (@houko)
+- Click anywhere on a channel card to open the drawer (#3434) (@houko)
+- Rich markdown help drawer + page coverage + UserBudget redesign (#3435) (@houko)
+
+### Fixed
+
+- Unbreak main — namespace traversal substring + openapi.json bump (#3258) (@houko)
+- Add dbus to buildInputs to fix failing build (#3263) (@FrantaNautilus)
+- Install libdbus-1 so image builds and starts (closes #3259) (#3265) (@houko)
+- Keyring is target-conditional so musl/android cross builds compile (#3267) (@houko)
+- Copy deploy/ into builder so include_str! observability assets resolve (closes #3259) (#3268) (@houko)
+- Show declared tools in editor and persist to **disk** (#3269) (@leszek3737)
+- Recognize BYTEPLUS_API_KEY in provider key checks (#3274) (@houko)
+- Silence three sources of routine WARN log spam (#3275) (@houko)
+- Skip OTLP exporter when no collector is reachable (#3276) (@houko)
+- Point at recovery commands when boot integrity check fails (#3277) (@houko)
+- Align model_catalog/routing tests with current registry (#3280) (@houko)
+- Refresh provider list after Test button so latency shows (#3288) (@houko)
+- Wire missing applyDatePreset for quick-pick buttons (#3289) (@houko)
+- Align useDeleteWorkflow test with removeQueries semantics (#3290) (@houko)
+- Use correct path + auth for Anthropic-protocol providers (#3292) (@houko)
+- Add missing librefang-llm-drivers dep to unbreak main (#3294) (@houko)
+- Stop bypassing needs-changes via comment inference / push (#3312) (@houko)
+- Treat Anthropic 401/403 as reachable, not auth-failed (#3316) (@houko)
+- Decouple model-id assertions from registry catalog state (#3317) (@houko)
+- Enforce deterministic ordering for LLM-bound registries (#3325) (@houko)
+- Install libdbus-1-dev for glibc Linux CLI builds (#3357) (@houko)
+- Drop layout/AnimatePresence from StaggerList to unblock clicks (#3415) (@houko)
+- Regenerate kernel config schema golden after thread-ownership field (#3417) (@houko)
+- Drawer not opening on hands page (DrawerPanel mount race) (#3421) (@houko)
+- Add /api/auto-dream/status to dashboard read allowlist (#3426) (@houko)
+- Scale Top Endpoints status bar with call volume (#3428) (@houko)
+- Exempt loopback + cheaper cost for dashboard polls (#3430) (@houko)
+
+### Changed
+
+- Tidy env_passthrough nits from #3219 review (#3273) (@houko)
+
+<details>
+<summary>Documentation, maintenance, and other internal changes</summary>
+
+### Documentation
+
+- Align display name with registry rename (#3284) (@houko)
+- Align Z.ai env + add Microsoft (GitHub Models) section (#3286) (@houko)
+- Expand every page-header help drawer to a real explanation (#3433) (@houko)
+
+### Maintenance
+
+- Add Nix build workflow to catch flake breakage on PR (#3264) (@houko)
+- Add Docker build + boot smoke test on PR (#3266) (@houko)
+- Regenerate Cargo.lock for librefang-llm-drivers dep (#3318) (@houko)
+- Shorten MCP nav label to 'MCP' (#3410) (@houko)
+- Remove Settings from left sidebar nav (#3423) (@houko)
+- Expand .dockerignore for security + smaller build context (#3431) (@houko)
+- Minimal rustup profile + sync mise rust to MSRV (#3432) (@houko)
+
+</details>
+
+
+## [2026.4.27] - 2026-04-27
+
+### Added
+
+- TUI setup wizard now offers `microsoft`, `zai`, `zai_coding`, `volcengine`, `volcengine_coding`, `byteplus`, `byteplus_coding` alongside the existing first-run options. The wizard's PROVIDERS list had drifted from `PROVIDER_REGISTRY` and silently hid these from new installs; a unit test now pins these entries against future regressions. (@houko)
+- Treat CLI logins as first-class default providers (#3061) (@houko)
+- Grafana Tempo + business-level span instrumentation (#3064) (@houko)
+- /new creates a new session instead of resetting the current one (#3071) (@neo-wanderer)
+- Support image-generation models (registry modality field) (#3074) (@houko)
+- Wire chat attachment uploads in ChatPage (#3075) (@houko)
+- Add Novita AI as OpenAI-compatible provider (#3076) (@houko)
+- Agent name prefix on outbound + Signal plain-text default (#3077) (@houko)
+- SSE attach endpoint for multi-client session co-watching (#3078) (@houko)
+- Add SearXNG self-hosted search provider (#3079) (@houko)
+- Add AWS Bedrock provider with Bearer token auth (#3080) (@houko)
+- AuditCheck framework + first 3 CLAUDE.md gotcha checks (#3082) (@houko)
+- Add LlmFamily enum + LlmDriver::family() (#3083) (@houko)
+- SSE attach hook for multi-client session co-watching (#3087) (@houko)
+- Add ToolApprovalClass + tool_classifier (no behavior change yet) (#3092) (@houko)
+- Session lifecycle event bus (additive, no subscribers yet) (#3093) (@houko)
+- Support PDF and text/code file attachments end-to-end (#3094) (@houko)
+- Trajectory export endpoint with privacy redaction (#3097) (@houko)
+- Extend detect_embedding_provider with vLLM + LM Studio fallback (#3099) (@houko)
+- Cron multi-destination delivery with failure isolation (#3102) (@houko)
+- UI for cron multi-destination delivery targets (#3103) (@houko)
+- Cache /config + reject pageno=0 + annotate truncation (#3108) (@houko)
+- Re-read agent context.md per turn (#3115) (@houko)
+- Central slash command registry (PR-1/3) (#3122) (@houko)
+- Slash command registry — CLI/TUI surface (PR-2/3) (#3123) (@houko)
+- Configurable max history messages (per-agent + global override) (#3125) (@neo-wanderer)
+- System_and_3 prompt cache stamping for Anthropic (M1) (#3126) (@houko)
+- ParallelSafety projection for batch tool dispatch (PR-1/6) (#3127) (@houko)
+- Plan_batch + path-overlap planner for tool dispatch (PR-2/6) (#3129) (@houko)
+- Model metadata lookup pipeline (PR-1/3, layers 1+2+5) (#3133) (@houko)
+- Model metadata L3 cache + L4 Ollama probe (PR-2/3) (#3134) (@houko)
+- Model metadata L4 Anthropic + OpenAI-compat probes (PR-2.5/3) (#3140) (@houko)
+- KernelConfig.parallel_tools section (PR-3/6) (#3144) (@houko)
+- Cron pre_script + silent_marker schema (PR-1/3) (#3145) (@houko)
+- Cache_hit_ratio metric + trajectory field (M2/2) (#3149) (@houko)
+- Agent detail drawer + filter pill i18n (#3159) (@houko)
+- Right-side drawer pattern for inspect-detail surfaces (#3166) (@houko)
+- Convert hand detail panel to drawer variant (#3168) (@houko)
+- Roll out drawer/panel pattern across all page modals (#3175) (@houko)
+- Add Jaeger as second trace backend alongside Tempo (#3176) (@houko)
+- Granular MCP taint policy + dashboard tree editor (closes #3050) (#3193) (@houko)
+- Jaeger trace backend + Loki/Alloy logs + CLI wiring (#3194) (@houko)
+- Per-(agent, session) liveness tracking and session-scoped stop (#3195) (@houko)
+- RBAC M2 — audit user/channel attribution + stable UserId (#3054) (#3196) (@houko)
+- Hot-reload log_level via dashboard without daemon restart (#3200) (@houko)
+- RBAC M4 — channel-native role mapping (Telegram/Discord/Slack) (#3054) (#3202) (@houko)
+- RBAC M5 — audit query/export + per-user budget API (#3054) (#3203) (@houko)
+- RBAC M3 — per-user tool policy + memory namespace ACL (#3054) (#3205) (@houko)
+- RBAC M6 — dashboard (users, identity linking, simulator, CSV import + stubs) (#3054) (#3209) (@houko)
+- Per-agent + global lane caps for trigger dispatch (#3210) (@neo-wanderer)
+- Auto-download voice messages mirroring file path (#3212) (@neo-wanderer)
+- Wip (#3213) (@houko)
+- Hand agent runtime overrides with restart persistence (#3216) (@leszek3737)
+- Deliver HealthCheckFailed to notification.alert_channels (#3218) (@neo-wanderer)
+- Per-user budget write/clear endpoints + dashboard editor (#3224) (@houko)
+- Activate AuditPage now that M5 audit endpoints shipped (#3225) (@houko)
+- Per-action retention policy with chain-anchor trim (#3227) (@houko)
+- RBAC effective-permissions snapshot — wire simulator (#3054) (#3228) (@houko)
+- RBAC M3 — per-user policy GET/PUT + dashboard editor (#3229) (@houko)
+- RBAC — single-decision authz/check endpoint (#3054) (#3231) (@houko)
+- User-list summary flags + custom channel rule editor (#3229 follow-up) (#3232) (@houko)
+- Owner-only API key rotation with live session kill (#3233) (@houko)
+- External mount points in agent.toml (#3230) (#3234) (@houko)
+- Channel field as dynamic dropdown with custom fallback (#3248) (@houko)
+- URL-synced filters, JSON export, row detail modal (#3252) (@houko)
+- Move filters into right-docked drawer (#3254) (@houko)
+- BeforePromptBuild hook can contribute labeled DynamicSection injected into the system prompt, with 8KiB per-section / 32KiB total caps (closes #3326) (#3358) (@houko)
+
+### Fixed
+
+- Reconnect WhatsApp gateway after transient disconnects (#21) (@houko)
+- Render connection screen via custom URI scheme (closes #3052) (#3056) (@houko)
+- Create log dir + open log before stdout redirect (#3057) (@houko)
+- Surface CLI logins as their own providers, not API-provider fallbacks (#3059) (@houko)
+- Pre-create logs dir in entrypoint (defense for #3058) (#3060) (@houko)
+- Bundle compose stack in-binary, add OTLP collector (#3062) (@houko)
+- Create HTTP trace spans at INFO so OTel exporter sees them (#3063) (@houko)
+- Move env_filter to fmt layer so OTel sees INFO spans (#3065) (@houko)
+- Drop ingester/compactor from Tempo config (#3067) (@houko)
+- Boot-time TOML drift detection now reaches hand agents (#3068) (@neo-wanderer)
+- Reprobe local providers every 60s + refresh on test (#3069) (@houko)
+- Add missing files to src to fix librefang-cli build (#3073) (@FrantaNautilus)
+- Honor session_mode=new with per-fire isolated sessions (#3081) (@houko)
+- Copilot streaming empty tool calls + Claude assistant strip (#3084) (@houko)
+- Gemini array-items default + first-message-must-be-user (#3085) (@houko)
+- Safe UTF-8 boundary in three remaining truncation sites (#3086) (@houko)
+- PowerShell sandbox bypass + agent-config persistence + WS race + Revolt self-host (#3088) (@houko)
+- Cron preservation across hand reactivation + telegram startup timeout + token estimation includes ToolUse (#3090) (@houko)
+- Capture text from intermediate tool_use iterations (#3091) (@houko)
+- Percent-decode WS auth token to preserve base64 characters (#3095) (@houko)
+- Skip heartbeat timeout for agents in their idle grace window (#3096) (@houko)
+- Handle BrokenPipe gracefully in doctor --json (#3100) (@houko)
+- UTF-8-safe error truncation + 502/504 retry + response classify tests (#3104) (@houko)
+- Cap accumulated_text + document streaming non-redelivery contract (#3106) (@houko)
+- Cron dedupe + next_run + token_length annotation (#3109) (@houko)
+- Sticky has_processed_message replaces time-based grace (#3111) (@houko)
+- Use 127.0.0.1 instead of localhost for local LLM URLs (#3112) (@houko)
+- Pass agents_dir to hand route candidate scan to silence WARN flood (#3113) (@houko)
+- Close non-loopback auth bypass when api_key is empty (#3114) (@houko)
+- Downgrade pure-normalization to debug, keep WARN for real repair (#3117) (@houko)
+- Use "default" provider/model in custom-agent template (#3121) (@houko)
+- Forward api_key as Bearer in local provider probe (#3128) (@houko)
+- Degrade Memory page gracefully when proactive memory is disabled (#3131) (@houko)
+- Allow named workspaces in read-side path resolution (#3137) (@neo-wanderer)
+- Unbreak cron_delivery tests + move guards to input validation (#3139) (@houko)
+- Unbreak local provider config in GUI (#3141) (@houko)
+- Re-render hand [[settings]] tail after boot-time TOML drift (#3142) (@neo-wanderer)
+- Relax probe timeout for remote local-provider URLs (#3146) (@houko)
+- Preserve tool annotations for parallel safety classification (PR-6/6) (#3147) (@houko)
+- Include SearXNG in web_search_available check (#3152) (@houko)
+- Drop redundant runtime SSRF check in deliver_webhook (#3155) (@houko)
+- Add .desktop entry and install icon (#3157) (@FrantaNautilus)
+- Seed [[settings]] defaults into hand instance config on activation (#3160) (@houko)
+- Skip empty Blocks when stamping prompt cache markers (review fix for #3126) (#3161) (@houko)
+- Expose vLLM + LM Studio in embedding provider dropdown (refs #3138) (#3162) (@houko)
+- Re-render Reference Knowledge + Your Team tails after TOML drift (#3164) (@houko)
+- Provide .desktop entry and icon for librefang-desktop (#3156) (#3165) (@houko)
+- Regenerate config_schema golden after parallel_tools addition (#3167) (@houko)
+- Stop drawer scroll chaining into the page (#3169) (@houko)
+- Observability auto-start opt-in + home_dir isolation + RAII cleanup (#3170) (@houko)
+- Surface provider model list above the fold (#3179) (@houko)
+- Wire OS keyring (libsecret/Keychain/Credential Manager) (#3180) (@houko)
+- Wrap with wrapGAppsHook3 so tray icon resolves on NixOS (#3197) (@houko)
+- Probe OpenAI fallback for ollama-slot servers, hide non-discovered local models (#3204) (@houko)
+- Correct max_level_hint test assertions (#3206) (@houko)
+- Correct max_level_hint test assertions (#3207) (@houko)
+- Set sender_user_id metadata so RBAC works in groups (#3215) (@neo-wanderer)
+- Serialize channel config writes via toml_edit + lock (#3183) (#3223) (@houko)
+- Attribute loopback callers to user_api_keys when token provided (#3236) (@houko)
+- Invalidate effective-permissions on policy/budget mutations (#3228 follow-up) (#3237) (@houko)
+- Prefix sender_chat ids so they can't collide with user namespace (#3215 follow-up) (#3238) (@houko)
+- RBAC M3 follow-up — memory ACL fail-closed for anonymous callers (#3239) (@houko)
+- Include prev_hash so verifiers can replay the chain (#3203 follow-up) (#3240) (@houko)
+- RBAC M4 follow-up — role_cache reload + Telegram DM owner-escalation (#3241) (@houko)
+- Mark scope as user_policy_only to match implementation (#3231 follow-up) (#3242) (@houko)
+- Attribute admin actions to caller + log old->new diffs (#21 follow-up) (#3245) (@houko)
+- Harden CSV import + flag identity-link risk (#3209 follow-up) (#3246) (@houko)
+- RBAC M3 follow-up — namespace traversal + case-insensitive deny + memory audit emit (#3205) (#3249) (@houko)
+- Autonomous-loop tool calls bypass user gate (closes #3243) (#3251) (@houko)
+- Channel dropdown uses /api/channels for full 44-adapter list (#3253) (@houko)
+- Enforce deterministic ordering for LLM-bound MCP server / skill registries to stabilize provider prompt cache (closes #3298) (#3325) (@houko)
+
+### Changed
+
+- Derive JSON Schema from KernelConfig via schemars (#3055) (@houko)
+- Extract SessionStore trait alongside SQLite substrate (#3089) (@houko)
+- Make bridge helpers crate-private (#3181) (@houko)
+- Remove unused public helpers (#3182) (@houko)
+- Tighten visibility of internal request structs (#3184) (@houko)
+- Merge duplicate type definitions across crates (#3185) (@houko)
+- Rename Action enums to disambiguate from domain types (#3188) (@houko)
+- **BREAKING**: Split coding-provider API keys onto dedicated env vars — `byteplus_coding` now reads `BYTEPLUS_CODING_API_KEY` (was `BYTEPLUS_API_KEY`), `volcengine_coding` reads `VOLCENGINE_CODING_API_KEY` (was `VOLCENGINE_API_KEY`), `zai_coding` reads `ZAI_CODING_API_KEY` (was `ZHIPU_API_KEY`), `zhipu_coding` reads `ZHIPU_CODING_API_KEY` (was `ZHIPU_API_KEY`). Per-token siblings (`byteplus`, `volcengine`, `zai`, `zhipu`) keep their original env vars. Set the new env var if you use any `_coding` provider. (#3279) (@houko)
+- **BREAKING**: Register `microsoft` (GitHub Models / Azure AI Inference) as an explicit driver-registry entry with its own `GITHUB_MODELS_TOKEN` env var, distinct from `github-copilot`'s `GITHUB_TOKEN`. Same PAT works for both, but the env vars are now separate so configuring one product no longer auto-activates the other in the model picker. Set `GITHUB_MODELS_TOKEN` if you use the `microsoft` provider. (#3281) (@houko)
+- **BREAKING**: Split `zai` from sharing `ZHIPU_API_KEY` with `zhipu` — `zai` (api.z.ai) now reads `ZAI_API_KEY` while `zhipu` (open.bigmodel.cn) keeps `ZHIPU_API_KEY`. Same Zhipu credential value works for both, but the env vars are now separate so configuring one no longer auto-activates the other. Set `ZAI_API_KEY` if you use the `zai` provider. (#3285) (@houko)
+
+### Documentation
+
+- Add tool_timeouts configuration documentation (#3098) (@leszek3737)
+- Backfill reference for cron / config / providers / channels / api / observability (#3189) (@houko)
+- Clarify worktree continuation drives to PR (#3190) (@houko)
+- Align left nav with file tree (#3199) (@houko)
+- Backfill source-vs-doc gaps (providers / channels — config / API / CLI to follow) (#3201) (@houko)
+- Drop HTML comment that broke Deploy Docs on main (#3208) (@houko)
+- Align Chinese translations with English source (#3220) (@houko)
+
+### Maintenance
+
+- Rename normalize_schema_recursive + warn on items fallback (#3105) (@houko)
+- Document apply_agent_prefix idempotency caveats (#3107) (@houko)
+- Timing-side-channel mitigation in percent_decode (#3110) (@houko)
+- Align localhost test expectations with #3112 default change (#3118) (@houko)
+- Ignore local .plans/ working notes directory (#3130) (@houko)
+- Sync librefang-types tracing dep into Cargo.lock (#3132) (@houko)
+- Unbreak main — cargo fmt for model_metadata.rs (#3150) (@houko)
+- Unbreak main — fix clippy manual_pattern_char_comparison (#3153) (@houko)
+- Hand-level skills propagation regression for #3135 (#3163) (@houko)
+- Pull librefang-api into selective lane on librefang-types changes (#3171) (@houko)
+- Drop LEGACY_TEAM_TAIL_MARKER fallback (#3177) (@houko)
+- Install libdbus-1-dev for OpenAPI Drift job (#3186) (@houko)
+- Remove unused dependencies across workspace (#3187) (@houko)
+- Pin push_notification routing for health_check_failed (#3222) (@houko)
+- Unbreak typecheck on sessions-stream test (#3235) (@houko)
+- Unbreak typecheck on UserBudgetPage + duplicate type export (#3244) (@houko)
+
+### Other
+
+- Unbreak main — use local user_api_keys snapshot (#3250) (@houko)
+
+
 ## [2026.4.24] - 2026-04-24
 
 ### Added
@@ -242,6 +535,15 @@ _No notable changes._
 ### Changed
 
 - Default `api_listen` flipped from `0.0.0.0:4545` to `127.0.0.1:4545` (loopback-only). New installs are local-only by default; set `api_listen = "0.0.0.0:4545"` to expose on LAN/remote. Affects `librefang init`, the dashboard's init endpoint, and `librefang.toml.example`. `librefang start` with an explicit `--config <path>` that doesn't exist now prints a clear `librefang init` hint instead of failing obscurely. (#2766)
+- **iOS minimum supported version raised from 14.0 to 16.0.** Required by the Tauri 2 mobile toolchain that the new mobile CI builds against. Devices on iOS 14 or 15 (iPhone 6s, original iPhone SE, iPad Air 2 and similar) will no longer be able to install the LibreFang mobile app once mobile bundles ship. Affects only the iOS app — the desktop and Android builds are unchanged. (#3970)
+
+### Security
+
+- **Channel webhook HMAC verification is now mandatory** for Messenger, LINE, Teams, Viber, and DingTalk. Previously, missing signature headers were silently bypassed; they now return `400 Bad Request`, and signature mismatches return `401 Unauthorized`. **Action required if you operate any of these channels:**
+  - **Messenger** — set `MESSENGER_APP_SECRET` to your Facebook App Secret (the new `app_secret_env` field in `[channels.messenger]` defaults to this). If unset, signatures are skipped with a startup warning and the endpoint stays unauthenticated — production should always set it.
+  - **Teams** — set `TEAMS_SECURITY_TOKEN` to the base64 outgoing-webhook security token from the Teams portal (the new `security_token_env` field in `[channels.teams]`). Same fallback semantics as Messenger.
+  - **LINE / Viber / DingTalk** — no new env vars, but probes that don't carry the platform's signature header (curl, monitoring health checks pointed at the webhook path) will now return 4xx instead of 200.
+- **Outbound `[channels.webhook] callback_url` is SSRF-guarded.** Adapters refuse to start if the URL resolves to a private (`10/8`, `172.16/12`, `192.168/16`), CGN (`100.64/10`), loopback (`127/8`, `::1`), link-local, multicast, or cloud-metadata range. Catches IPv6 short forms like `[::]`, IPv4-mapped (`[::ffff:127.0.0.1]`), NAT64, and trailing-dot FQDNs. **Action required**: local dev setups using `callback_url = "http://127.0.0.1/..."` must switch to a public tunnel (ngrok, cloudflared) or omit `callback_url`. (#3942)
 
 ## [2026.4.18] - 2026-04-18
 

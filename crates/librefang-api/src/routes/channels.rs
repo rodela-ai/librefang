@@ -1377,14 +1377,21 @@ pub async fn configure_channel(
             if let Err(msg) = validate_env_var(env_var, value) {
                 return ApiErrorResponse::bad_request(msg).into_json_tuple();
             }
-            // Secret field — write to secrets.env and set in process
+            // Secret field — write to secrets.env and set in process.
             if let Err(e) = write_secret_env(&secrets_path, env_var, value) {
                 return ApiErrorResponse::internal(format!("Failed to write secret: {e}"))
                     .into_json_tuple();
             }
-            // SAFETY: We are the only writer; this is a single-threaded config operation
-            unsafe {
-                std::env::set_var(env_var, value);
+            // `std::env::set_var` is not thread-safe in an async context; delegate
+            // to a blocking thread to avoid UB in the multithreaded tokio runtime.
+            {
+                let env_var_owned = env_var.to_string();
+                let value_owned = value.to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    // SAFETY: single mutation on a dedicated blocking thread.
+                    unsafe { std::env::set_var(&env_var_owned, &value_owned) };
+                })
+                .await;
             }
             // Also write the env var NAME to config.toml so the channel section
             // is not empty and the kernel knows which env var to read.
@@ -1401,10 +1408,18 @@ pub async fn configure_channel(
         }
     }
 
-    // Write config.toml section
-    if let Err(e) = upsert_channel_config(&config_path, &name, &config_fields) {
-        return ApiErrorResponse::internal(format!("Failed to write config: {e}"))
-            .into_json_tuple();
+    // Write config.toml section. Hold `config_write_lock` so we serialize
+    // against `POST /api/config/set` (which holds the same mutex). Without
+    // the lock, an interleaved provider write could be silently overwritten
+    // when this path's read-modify-write completes — see issue #3183. The
+    // guard is dropped at end of scope, before the hot-reload await below,
+    // so it does not gate channel reloads.
+    {
+        let _config_guard = state.config_write_lock.lock().await;
+        if let Err(e) = upsert_channel_config(&config_path, &name, &config_fields) {
+            return ApiErrorResponse::internal(format!("Failed to write config: {e}"))
+                .into_json_tuple();
+        }
     }
 
     // Hot-reload: activate the channel immediately
@@ -1480,33 +1495,22 @@ pub async fn remove_channel(
         }
     }
 
-    // Remove config section
-    if let Err(e) = remove_channel_config(&config_path, &name) {
-        return ApiErrorResponse::internal(format!("Failed to remove config: {e}"))
-            .into_json_tuple();
+    // Remove config section. Same locking discipline as `configure_channel`
+    // — see issue #3183 for the race scenario.
+    {
+        let _config_guard = state.config_write_lock.lock().await;
+        if let Err(e) = remove_channel_config(&config_path, &name) {
+            return ApiErrorResponse::internal(format!("Failed to remove config: {e}"))
+                .into_json_tuple();
+        }
     }
 
     // Hot-reload: deactivate the channel immediately
     match crate::channel_bridge::reload_channels_from_disk(&state).await {
-        Ok(started) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "removed",
-                "channel": name,
-                "remaining_channels": started,
-                "note": format!("{} deactivated.", name)
-            })),
-        ),
+        Ok(_started) => (StatusCode::NO_CONTENT, Json(serde_json::json!(null))),
         Err(e) => {
             tracing::warn!(error = %e, "Channel hot-reload failed after remove");
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "removed",
-                    "channel": name,
-                    "note": format!("Removed, but hot-reload failed: {e}. Restart daemon to fully deactivate.")
-                })),
-            )
+            (StatusCode::NO_CONTENT, Json(serde_json::json!(null)))
         }
     }
 }

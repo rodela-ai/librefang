@@ -1323,8 +1323,11 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                         model_override: None,
                         timeout_secs: None,
                         pre_check_script: None,
+                        pre_script: None,
+                        silent_marker: None,
                     },
                     delivery: librefang_types::scheduler::CronDelivery::None,
+                    delivery_targets: Vec::new(),
                     peer_id: None,
                     session_mode: None,
                     created_at: chrono::Utc::now(),
@@ -1530,7 +1533,10 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                                             true
                                         }
                                         Ok((false, _)) => {
-                                            self.kernel.approvals().record_totp_failure(sender_id);
+                                            let _ = self
+                                                .kernel
+                                                .approvals()
+                                                .record_totp_failure(sender_id);
                                             return "Invalid recovery code.".into();
                                         }
                                         Err(e) => return format!("Recovery code error: {e}"),
@@ -1553,7 +1559,10 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                             ) {
                                 Ok(true) => true,
                                 Ok(false) => {
-                                    self.kernel.approvals().record_totp_failure(sender_id);
+                                    let _ = self
+                                        .kernel
+                                        .approvals()
+                                        .record_totp_failure(sender_id);
                                     return "Invalid TOTP code.".into();
                                 }
                                 Err(e) => return format!("TOTP error: {e}"),
@@ -2461,10 +2470,14 @@ pub async fn start_channel_bridge_with_config(
     #[cfg(feature = "channel-teams")]
     for tm_config in config.teams.iter() {
         if let Some(password) = read_token(&tm_config.app_password_env, "Teams") {
+            let security_token =
+                read_token(&tm_config.security_token_env, "Teams (security_token)")
+                    .unwrap_or_default();
             let adapter = Arc::new(
                 TeamsAdapter::new(
                     tm_config.app_id.clone(),
                     password,
+                    security_token,
                     tm_config.webhook_port,
                     tm_config.allowed_tenants.clone(),
                 )
@@ -2682,8 +2695,10 @@ pub async fn start_channel_bridge_with_config(
         if let Some(page_token) = read_token(&ms_config.page_token_env, "Messenger (page)") {
             let verify_token =
                 read_token(&ms_config.verify_token_env, "Messenger (verify)").unwrap_or_default();
+            let app_secret =
+                read_token(&ms_config.app_secret_env, "Messenger (app_secret)").unwrap_or_default();
             let adapter = Arc::new(
-                MessengerAdapter::new(page_token, verify_token, ms_config.webhook_port)
+                MessengerAdapter::new(page_token, verify_token, app_secret, ms_config.webhook_port)
                     .with_account_id(ms_config.account_id.clone()),
             );
             adapters.push((
@@ -2789,10 +2804,17 @@ pub async fn start_channel_bridge_with_config(
     #[cfg(feature = "channel-revolt")]
     for rv_config in config.revolt.iter() {
         if let Some(token) = read_token(&rv_config.bot_token_env, "Revolt") {
-            let adapter =
-                Arc::new(RevoltAdapter::new(token).with_account_id(rv_config.account_id.clone()));
+            let mut adapter = RevoltAdapter::with_urls(
+                token,
+                rv_config.api_url.clone(),
+                rv_config.ws_url.clone(),
+            )
+            .with_account_id(rv_config.account_id.clone());
+            if !rv_config.allowed_channels.is_empty() {
+                adapter.set_allowed_channels(rv_config.allowed_channels.clone());
+            }
             adapters.push((
-                adapter,
+                Arc::new(adapter),
                 rv_config.default_agent.clone(),
                 rv_config.account_id.clone(),
             ));
@@ -3186,20 +3208,26 @@ pub async fn start_channel_bridge_with_config(
     #[cfg(feature = "channel-webhook")]
     for wh_config in config.webhook.iter() {
         if let Some(secret) = read_token(&wh_config.secret_env, "Webhook") {
-            let adapter = Arc::new(
-                WebhookAdapter::new(
-                    secret,
-                    wh_config.listen_port,
-                    wh_config.callback_url.clone(),
-                )
-                .with_account_id(wh_config.account_id.clone())
-                .with_deliver_only(wh_config.deliver_only, wh_config.deliver.clone()),
-            );
-            adapters.push((
-                adapter,
-                wh_config.default_agent.clone(),
-                wh_config.account_id.clone(),
-            ));
+            match WebhookAdapter::new(
+                secret,
+                wh_config.listen_port,
+                wh_config.callback_url.clone(),
+            ) {
+                Ok(wa) => {
+                    let adapter = Arc::new(
+                        wa.with_account_id(wh_config.account_id.clone())
+                            .with_deliver_only(wh_config.deliver_only, wh_config.deliver.clone()),
+                    );
+                    adapters.push((
+                        adapter,
+                        wh_config.default_agent.clone(),
+                        wh_config.account_id.clone(),
+                    ));
+                }
+                Err(e) => {
+                    tracing::error!("Webhook adapter rejected by SSRF guard: {e}");
+                }
+            }
         }
     }
 
@@ -3545,32 +3573,49 @@ pub async fn reload_channels_from_disk(
         *guard = None;
     }
 
-    // Re-read secrets.env so new API tokens are available in std::env
+    // Re-read secrets.env so new API tokens are available in std::env.
+    // `std::env::set_var` is not thread-safe inside an async context; push the
+    // mutation onto a blocking thread where no other tokio worker is racing.
     let secrets_path = state.kernel.home_dir().join("secrets.env");
     if secrets_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&secrets_path) {
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with('#') {
-                    continue;
-                }
-                if let Some(eq_pos) = trimmed.find('=') {
-                    let key = trimmed[..eq_pos].trim();
-                    let mut value = trimmed[eq_pos + 1..].trim().to_string();
-                    if !key.is_empty() {
-                        // Strip matching quotes
-                        if ((value.starts_with('"') && value.ends_with('"'))
-                            || (value.starts_with('\'') && value.ends_with('\'')))
-                            && value.len() >= 2
-                        {
-                            value = value[1..value.len() - 1].to_string();
+        let secrets_path_clone = secrets_path.clone();
+        let set_result = tokio::task::spawn_blocking(move || {
+            if let Ok(content) = std::fs::read_to_string(&secrets_path_clone) {
+                let mut count = 0usize;
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    if let Some(eq_pos) = trimmed.find('=') {
+                        let key = trimmed[..eq_pos].trim();
+                        let mut value = trimmed[eq_pos + 1..].trim().to_string();
+                        if !key.is_empty() {
+                            // Strip matching quotes
+                            if ((value.starts_with('"') && value.ends_with('"'))
+                                || (value.starts_with('\'') && value.ends_with('\'')))
+                                && value.len() >= 2
+                            {
+                                value = value[1..value.len() - 1].to_string();
+                            }
+                            // Always overwrite — the file is the source of truth after dashboard edits
+                            // SAFETY: running on a dedicated blocking thread; no concurrent env
+                            // reads happen here because spawn_blocking serialises the mutation.
+                            unsafe { std::env::set_var(key, &value) };
+                            count += 1;
                         }
-                        // Always overwrite — the file is the source of truth after dashboard edits
-                        std::env::set_var(key, &value);
                     }
                 }
+                count
+            } else {
+                0
             }
-            info!("Reloaded secrets.env for channel hot-reload");
+        })
+        .await;
+        match set_result {
+            Ok(n) if n > 0 => info!("Reloaded secrets.env for channel hot-reload ({n} vars)"),
+            Ok(_) => {}
+            Err(e) => warn!("spawn_blocking for secrets.env reload failed: {e}"),
         }
     }
 

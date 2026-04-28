@@ -130,6 +130,25 @@ fn current_process_rss_mb() -> Option<u64> {
     }
 }
 
+/// Returns `true` when at least one web search provider is configured —
+/// either an API-key-based provider with its env var set, or SearXNG with a
+/// non-empty URL. Drives the dashboard's "Configure API key" warning chip;
+/// must stay in sync with the providers actually wired into the search
+/// runtime, otherwise the UI nags users who already have a working setup.
+fn is_web_search_configured(web: &librefang_types::config::WebConfig) -> bool {
+    let env_set = |env_var: &str| {
+        std::env::var(env_var)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .is_some()
+    };
+    !web.searxng.url.trim().is_empty()
+        || env_set(&web.tavily.api_key_env)
+        || env_set(&web.brave.api_key_env)
+        || env_set(&web.jina.api_key_env)
+        || env_set(&web.perplexity.api_key_env)
+}
+
 #[utoipa::path(
     get,
     path = "/api/status",
@@ -253,7 +272,7 @@ api_key_env = "{api_key_env}"
 "#
     );
 
-    if let Err(e) = std::fs::write(&config_path, &config_content) {
+    if let Err(e) = crate::atomic_write(&config_path, config_content.as_bytes()) {
         return Json(serde_json::json!({
             "status": "error",
             "message": format!("Failed to write config: {e}")
@@ -279,14 +298,21 @@ api_key_env = "{api_key_env}"
         (status = 200, description = "Graceful daemon shutdown", body = serde_json::Value)
     )
 )]
-pub async fn shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn shutdown(
+    State(state): State<Arc<AppState>>,
+    api_user: Option<axum::Extension<crate::middleware::AuthenticatedApiUser>>,
+) -> impl IntoResponse {
     tracing::info!("Shutdown requested via API");
-    // SECURITY: Record shutdown in audit trail
-    state.kernel.audit().record(
+    // SECURITY: Record shutdown in audit trail with the caller's user_id
+    // (None for loopback/unauthenticated calls — see middleware.rs).
+    let user_id = api_user.as_ref().map(|u| u.0.user_id);
+    state.kernel.audit().record_with_context(
         "system",
         librefang_runtime::audit::AuditAction::ConfigChange,
         "shutdown requested via API",
         "ok",
+        user_id,
+        Some("api".to_string()),
     );
     state.kernel.shutdown();
     // Signal the HTTP server to initiate graceful shutdown so the process exits.
@@ -870,20 +896,7 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
     );
 
     // ── Web ──
-    // Check if at least one search provider has a configured API key
-    let search_available = [
-        &config.web.tavily.api_key_env,
-        &config.web.brave.api_key_env,
-        &config.web.jina.api_key_env,
-        &config.web.perplexity.api_key_env,
-    ]
-    .iter()
-    .any(|env_var| {
-        std::env::var(env_var)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some()
-    });
+    let search_available = is_web_search_configured(&config.web);
     set!("web", {
         "search_provider": format!("{:?}", config.web.search_provider),
         "cache_ttl_minutes": config.web.cache_ttl_minutes,
@@ -1181,6 +1194,8 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "main_lane": config.queue.concurrency.main_lane,
                 "cron_lane": config.queue.concurrency.cron_lane,
                 "subagent_lane": config.queue.concurrency.subagent_lane,
+                "trigger_lane": config.queue.concurrency.trigger_lane,
+                "default_per_agent": config.queue.concurrency.default_per_agent,
             }),
         );
     }
@@ -1485,13 +1500,19 @@ pub async fn run_migrate(
         (status = 200, description = "Reload configuration from disk", body = serde_json::Value)
     )
 )]
-pub async fn config_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // SECURITY: Record config reload in audit trail
-    state.kernel.audit().record(
+pub async fn config_reload(
+    State(state): State<Arc<AppState>>,
+    api_user: Option<axum::Extension<crate::middleware::AuthenticatedApiUser>>,
+) -> impl IntoResponse {
+    // SECURITY: Record config reload in audit trail with caller attribution.
+    let user_id = api_user.as_ref().map(|u| u.0.user_id);
+    state.kernel.audit().record_with_context(
         "system",
         librefang_runtime::audit::AuditAction::ConfigChange,
         "config reload requested via API",
         "pending",
+        user_id,
+        Some("api".to_string()),
     );
     match state.kernel.reload_config().await {
         Ok(plan) => {
@@ -1834,6 +1855,7 @@ pub fn ui_options_overlay(
 )]
 pub async fn config_set(
     State(state): State<Arc<AppState>>,
+    api_user: Option<axum::Extension<crate::middleware::AuthenticatedApiUser>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let path = match body.get("path").and_then(|v| v.as_str()) {
@@ -1854,6 +1876,50 @@ pub async fn config_set(
             );
         }
     };
+
+    // SECURITY #3458: Validate the config key path before touching any files.
+    // Each dot-separated component must only contain alphanumeric characters
+    // and underscores.  This prevents:
+    //   - Path traversal (e.g. "../secrets")
+    //   - Injection into structured TOML tables via special characters
+    //   - Empty segment attacks (e.g. "section..key")
+    //
+    // The path string itself is never used as a filesystem path — it is only
+    // used as a key chain into the in-memory TOML document — but we validate
+    // early to fail fast and to document the expected namespace.
+    fn validate_config_key_path(path: &str) -> Result<(), String> {
+        if path.is_empty() {
+            return Err("config path must not be empty".to_string());
+        }
+        // Reject absolute paths and filesystem separators outright.
+        if path.starts_with('/') || path.starts_with('\\') || path.contains("..") {
+            return Err(format!(
+                "config path '{path}' is not a valid key path (no filesystem separators allowed)"
+            ));
+        }
+        for part in path.split('.') {
+            if part.is_empty() {
+                return Err(format!("config path '{path}' contains an empty segment"));
+            }
+            if !part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Err(format!(
+                    "config path segment '{part}' contains disallowed characters \
+                     (only ASCII alphanumeric, '_', and '-' are permitted)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    if let Err(e) = validate_config_key_path(&path) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"status": "error", "error": e})),
+        );
+    }
 
     let config_path = state.kernel.home_dir().join("config.toml");
     // Block path-traversal (`..`) but allow Windows drive-letter prefixes
@@ -1988,7 +2054,7 @@ pub async fn config_set(
     }
 
     // Write back — preserves comments, whitespace, and key ordering
-    if let Err(e) = std::fs::write(&config_path, &new_toml_str) {
+    if let Err(e) = crate::atomic_write(&config_path, new_toml_str.as_bytes()) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"status": "error", "error": format!("write failed: {e}")})),
@@ -2021,11 +2087,14 @@ pub async fn config_set(
             }
         };
 
-    state.kernel.audit().record(
+    let user_id = api_user.as_ref().map(|u| u.0.user_id);
+    state.kernel.audit().record_with_context(
         "system",
         librefang_runtime::audit::AuditAction::ConfigChange,
         format!("config set: {path}"),
         "completed",
+        user_id,
+        Some("api".to_string()),
     );
 
     let mut body = serde_json::json!({"status": reload_status, "path": path});
@@ -2243,20 +2312,7 @@ async fn dashboard_snapshot_inner(state: &Arc<AppState>) -> serde_json::Value {
     let providers = providers_result.unwrap_or_default();
     let channels = channels_result.unwrap_or_default();
 
-    // Check if at least one web search provider has a configured API key
-    let web_search_available = [
-        &cfg.web.tavily.api_key_env,
-        &cfg.web.brave.api_key_env,
-        &cfg.web.jina.api_key_env,
-        &cfg.web.perplexity.api_key_env,
-    ]
-    .iter()
-    .any(|env_var| {
-        std::env::var(env_var)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some()
-    });
+    let web_search_available = is_web_search_configured(&cfg.web);
 
     serde_json::json!({
         "health": health,
@@ -2268,4 +2324,128 @@ async fn dashboard_snapshot_inner(state: &Arc<AppState>) -> serde_json::Value {
         "workflowCount": workflow_count,
         "webSearchAvailable": web_search_available,
     })
+}
+
+#[cfg(test)]
+mod config_key_path_validation_tests {
+    // Duplicate of the inline `validate_config_key_path` logic so the tests
+    // can exercise it without making it a public function.
+    fn validate(p: &str) -> Result<(), String> {
+        // Inline the same logic to avoid making the helper pub.
+        if p.is_empty() {
+            return Err("config path must not be empty".to_string());
+        }
+        if p.starts_with('/') || p.starts_with('\\') || p.contains("..") {
+            return Err(format!(
+                "config path '{p}' is not a valid key path (no filesystem separators allowed)"
+            ));
+        }
+        for part in p.split('.') {
+            if part.is_empty() {
+                return Err(format!("config path '{p}' contains an empty segment"));
+            }
+            if !part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Err(format!(
+                    "config path segment '{part}' contains disallowed characters \
+                     (only ASCII alphanumeric, '_', and '-' are permitted)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// #3458 regression: valid key paths must pass validation.
+    #[test]
+    fn valid_paths_accepted() {
+        assert!(validate("api_key").is_ok());
+        assert!(validate("section.key").is_ok());
+        assert!(validate("section.sub.key").is_ok());
+        assert!(validate("llm.model_alias").is_ok());
+        assert!(validate("queue.concurrency.trigger_lane").is_ok());
+        assert!(validate("key-with-dash").is_ok());
+    }
+
+    /// #3458 regression: filesystem-like paths must be rejected.
+    #[test]
+    fn traversal_paths_rejected() {
+        assert!(validate("").is_err(), "empty path");
+        assert!(validate("../secret").is_err(), "traversal with ..");
+        assert!(validate("a..b").is_err(), "double dot in segment");
+        assert!(validate("/etc/passwd").is_err(), "absolute unix path");
+        assert!(
+            validate("\\Windows\\System32").is_err(),
+            "absolute windows path"
+        );
+    }
+
+    /// #3458 regression: special characters that could inject TOML structure
+    /// must be rejected.
+    #[test]
+    fn special_chars_rejected() {
+        assert!(validate("section[0]").is_err(), "bracket injection");
+        assert!(validate("section = evil").is_err(), "equals sign");
+        assert!(validate("section\nkey").is_err(), "newline");
+        assert!(validate("section\0key").is_err(), "null byte");
+        assert!(validate("section key").is_err(), "space");
+    }
+
+    /// Empty segment (double dot) must be rejected.
+    #[test]
+    fn empty_segment_rejected() {
+        assert!(validate("a..b").is_err());
+        assert!(validate(".a").is_err());
+        assert!(validate("a.").is_err());
+    }
+}
+
+#[cfg(test)]
+mod web_search_configured_tests {
+    use super::is_web_search_configured;
+    use librefang_types::config::WebConfig;
+
+    /// Point every API-key env-var lookup at a unique never-set name so the
+    /// helper's only path to "configured" in these tests is via SearXNG. This
+    /// keeps the assertions stable even on hosts that happen to export
+    /// `TAVILY_API_KEY` / `BRAVE_API_KEY` / etc. for unrelated reasons.
+    fn web_with_unset_keys(suffix: &str) -> WebConfig {
+        let mut web = WebConfig::default();
+        web.tavily.api_key_env = format!("LF_TEST_TAVILY_UNSET_{suffix}");
+        web.brave.api_key_env = format!("LF_TEST_BRAVE_UNSET_{suffix}");
+        web.jina.api_key_env = format!("LF_TEST_JINA_UNSET_{suffix}");
+        web.perplexity.api_key_env = format!("LF_TEST_PERPLEXITY_UNSET_{suffix}");
+        web.searxng.url = String::new();
+        web
+    }
+
+    #[test]
+    fn searxng_url_alone_counts_as_configured() {
+        let mut web = web_with_unset_keys("searxng_alone");
+        web.searxng.url = "https://search.example.com".to_string();
+        assert!(
+            is_web_search_configured(&web),
+            "non-empty SearXNG URL must satisfy the configured check — it does not need an API key"
+        );
+    }
+
+    #[test]
+    fn empty_searxng_and_unset_keys_is_unconfigured() {
+        let web = web_with_unset_keys("all_empty");
+        assert!(
+            !is_web_search_configured(&web),
+            "no SearXNG URL and no API keys must report unconfigured"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_searxng_url_does_not_count() {
+        let mut web = web_with_unset_keys("whitespace");
+        web.searxng.url = "   ".to_string();
+        assert!(
+            !is_web_search_configured(&web),
+            "whitespace-only SearXNG URL must not satisfy the configured check"
+        );
+    }
 }

@@ -2,16 +2,18 @@
 
 use crate::{KernelState, PortState};
 use librefang_kernel::config::librefang_home;
-use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
 use tracing::info;
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+use tauri_plugin_autostart::ManagerExt;
 
 /// Get the port the embedded server is listening on.
 #[tauri::command]
 pub fn get_port(port: tauri::State<'_, PortState>) -> Result<u16, String> {
     port.0
         .read()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .ok_or_else(|| "No local server running".to_string())
 }
 
@@ -24,9 +26,9 @@ pub fn get_status(
     let p = port
         .0
         .read()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .ok_or_else(|| "No local server running".to_string())?;
-    let guard = kernel_state.0.read().unwrap();
+    let guard = kernel_state.0.read().unwrap_or_else(|p| p.into_inner());
     let inner = guard
         .as_ref()
         .ok_or_else(|| "No local server running".to_string())?;
@@ -44,7 +46,7 @@ pub fn get_status(
 /// Get the number of registered agents.
 #[tauri::command]
 pub fn get_agent_count(kernel_state: tauri::State<'_, KernelState>) -> Result<usize, String> {
-    let guard = kernel_state.0.read().unwrap();
+    let guard = kernel_state.0.read().unwrap_or_else(|p| p.into_inner());
     let inner = guard
         .as_ref()
         .ok_or_else(|| "No local server running".to_string())?;
@@ -89,7 +91,7 @@ pub fn import_agent_toml(
     let dest = agent_dir.join("agent.toml");
     std::fs::write(&dest, &content).map_err(|e| format!("Failed to write manifest: {e}"))?;
 
-    let guard = kernel_state.0.read().unwrap();
+    let guard = kernel_state.0.read().unwrap_or_else(|p| p.into_inner());
     let inner = guard
         .as_ref()
         .ok_or_else(|| "No local server running".to_string())?;
@@ -137,7 +139,7 @@ pub fn import_skill_file(
     let dest = skills_dir.join(&file_name);
     std::fs::copy(src, &dest).map_err(|e| format!("Failed to copy skill file: {e}"))?;
 
-    let guard = kernel_state.0.read().unwrap();
+    let guard = kernel_state.0.read().unwrap_or_else(|p| p.into_inner());
     let inner = guard
         .as_ref()
         .ok_or_else(|| "No local server running".to_string())?;
@@ -148,12 +150,14 @@ pub fn import_skill_file(
 }
 
 /// Check whether auto-start on login is enabled.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 #[tauri::command]
 pub fn get_autostart(app: tauri::AppHandle) -> Result<bool, String> {
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
 }
 
 /// Enable or disable auto-start on login.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 #[tauri::command]
 pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
     let manager = app.autolaunch();
@@ -166,6 +170,7 @@ pub fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, Strin
 }
 
 /// Perform an on-demand update check.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 #[tauri::command]
 pub async fn check_for_updates(
     app: tauri::AppHandle,
@@ -176,9 +181,62 @@ pub async fn check_for_updates(
 /// Download and install the latest update, then restart the app.
 /// Returns Ok(()) which triggers an app restart — the command will not return
 /// if the update succeeds (the app restarts). On error, returns Err(message).
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 #[tauri::command]
 pub async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
     crate::updater::download_and_install_update(&app).await
+}
+
+// ── Credential storage (mobile only — keyring) ───────────────────────────
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+const KEYRING_SERVICE: &str = "librefang-mobile";
+#[cfg(any(target_os = "ios", target_os = "android"))]
+const KEYRING_ACCOUNT: &str = "daemon-credentials";
+
+/// Store daemon credentials in the OS keyring.
+///
+/// JSON-encodes `{"base_url": ..., "api_key": ...}` as the secret.
+/// Falls back gracefully on platforms where keyring is unavailable.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+#[tauri::command]
+pub fn store_credentials(base_url: String, api_key: String) -> Result<(), String> {
+    let creds = serde_json::json!({ "base_url": base_url, "api_key": api_key }).to_string();
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        .map_err(|e| format!("Keyring init failed: {e}"))?
+        .set_password(&creds)
+        .map_err(|e| format!("Failed to store credentials: {e}"))
+}
+
+/// Retrieve daemon credentials from the OS keyring.
+///
+/// Returns `null` if no credentials are stored.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+#[tauri::command]
+pub fn get_credentials() -> Result<Option<serde_json::Value>, String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        .map_err(|e| format!("Keyring init failed: {e}"))?;
+    match entry.get_password() {
+        Ok(secret) => {
+            let val: serde_json::Value =
+                serde_json::from_str(&secret).map_err(|e| format!("Invalid stored creds: {e}"))?;
+            Ok(Some(val))
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("Failed to read credentials: {e}")),
+    }
+}
+
+/// Remove daemon credentials from the OS keyring.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+#[tauri::command]
+pub fn clear_credentials() -> Result<(), String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        .map_err(|e| format!("Keyring init failed: {e}"))?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("Failed to clear credentials: {e}")),
+    }
 }
 
 /// Open the LibreFang config directory (`~/.librefang/`) in the OS file manager.
@@ -288,5 +346,11 @@ pub async fn uninstall_app(app: tauri::AppHandle) -> Result<(), String> {
             "use your distro's package manager to remove librefang"
         };
         Err(format!("To uninstall, run in a terminal: {hint}"))
+    }
+
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    {
+        // Mobile: uninstall through the platform app store / system settings.
+        Err("Uninstall via the platform app store or system settings.".to_string())
     }
 }

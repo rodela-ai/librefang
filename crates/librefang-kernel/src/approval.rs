@@ -8,6 +8,7 @@ use librefang_types::approval::{
 };
 use librefang_types::capability::glob_matches;
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -914,7 +915,13 @@ impl ApprovalManager {
     }
 
     /// Record a TOTP verification failure.
-    pub fn record_totp_failure(&self, sender_id: &str) {
+    ///
+    /// Returns `Ok(())` if the failure was recorded and persisted to the
+    /// database, or `Err(())` if the database write failed. Callers MUST
+    /// treat `Err(())` as a rejection — if we cannot persist the counter we
+    /// cannot enforce the brute-force cap across restarts, so the safest
+    /// course is to deny the request (fail-secure, fix for #3372 / #3584).
+    pub fn record_totp_failure(&self, sender_id: &str) -> Result<(), ()> {
         let mut failures = self.totp_failures.lock().unwrap_or_else(|e| e.into_inner());
         let entry = failures.entry(sender_id.to_string()).or_insert((0, None));
         // Reset counter if lockout window expired
@@ -938,7 +945,8 @@ impl ApprovalManager {
         }
         let (count, locked_at_instant) = *entry;
         drop(failures);
-        // Persist lockout state so it survives a daemon restart
+        // Persist lockout state so it survives a daemon restart.
+        // If the DB write fails, return Err so callers can reject fail-secure.
         let locked_at_unix = locked_at_instant.map(|t| {
             let elapsed = t.elapsed().as_secs();
             std::time::SystemTime::now()
@@ -947,13 +955,27 @@ impl ApprovalManager {
                 .as_secs()
                 .saturating_sub(elapsed) as i64
         });
-        self.persist_totp_lockout_save(sender_id, count, locked_at_unix);
+        self.persist_totp_lockout_save(sender_id, count, locked_at_unix)
     }
 
-    fn persist_totp_lockout_save(&self, sender_id: &str, failures: u32, locked_at: Option<i64>) {
-        let Some(db) = &self.audit_db else { return };
-        let Ok(conn) = db.lock() else { return };
-        let _ = conn.execute(
+    fn persist_totp_lockout_save(
+        &self,
+        sender_id: &str,
+        failures: u32,
+        locked_at: Option<i64>,
+    ) -> Result<(), ()> {
+        let Some(db) = &self.audit_db else {
+            // No DB configured — in-memory only, accept the failure record.
+            return Ok(());
+        };
+        let Ok(conn) = db.lock() else {
+            warn!(
+                sender_id,
+                "TOTP lockout DB unavailable; rejecting attempt fail-secure"
+            );
+            return Err(());
+        };
+        let result = conn.execute(
             "INSERT INTO totp_lockout (sender_id, failures, locked_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(sender_id) DO UPDATE SET
@@ -961,6 +983,14 @@ impl ApprovalManager {
                  locked_at = excluded.locked_at",
             rusqlite::params![sender_id, failures as i64, locked_at],
         );
+        if let Err(e) = result {
+            warn!(
+                sender_id,
+                "Failed to persist TOTP failure counter to DB: {e}; rejecting attempt fail-secure"
+            );
+            return Err(());
+        }
+        Ok(())
     }
 
     fn persist_totp_lockout_clear(&self, sender_id: &str) {
@@ -969,6 +999,69 @@ impl ApprovalManager {
         let _ = conn.execute(
             "DELETE FROM totp_lockout WHERE sender_id = ?1",
             rusqlite::params![sender_id],
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TOTP replay prevention (issue #3359)
+    // -----------------------------------------------------------------------
+
+    /// Hash a TOTP code for replay-prevention storage.
+    ///
+    /// Stores `sha256(code)` in hex so the raw digit string is never persisted.
+    fn totp_code_hash(code: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(code.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    /// Check whether a TOTP code has already been used within the replay window.
+    ///
+    /// The window is 60 seconds (two 30-second TOTP steps) to cover both the
+    /// current step and the immediately preceding one.
+    pub fn is_totp_code_used(&self, code: &str) -> bool {
+        let Some(db) = &self.audit_db else {
+            return false;
+        };
+        let Ok(conn) = db.lock() else { return false };
+        let hash = Self::totp_code_hash(code);
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let window_start = now_unix - 60;
+        conn.query_row(
+            "SELECT COUNT(*) FROM totp_used_codes WHERE code_hash = ?1 AND used_at >= ?2",
+            rusqlite::params![hash, window_start],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            > 0
+    }
+
+    /// Record a successfully-verified TOTP code to prevent replay.
+    ///
+    /// Also prunes entries older than 120 seconds from the table to keep it small.
+    pub fn record_totp_code_used(&self, code: &str) {
+        let Some(db) = &self.audit_db else { return };
+        let Ok(conn) = db.lock() else { return };
+        let hash = Self::totp_code_hash(code);
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        // Upsert the used-code entry.
+        let _ = conn.execute(
+            "INSERT INTO totp_used_codes (code_hash, used_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(code_hash) DO UPDATE SET used_at = excluded.used_at",
+            rusqlite::params![hash, now_unix],
+        );
+        // Prune entries older than 120 seconds.
+        let prune_before = now_unix - 120;
+        let _ = conn.execute(
+            "DELETE FROM totp_used_codes WHERE used_at < ?1",
+            rusqlite::params![prune_before],
         );
     }
 
@@ -1607,6 +1700,7 @@ mod tests {
             sender_id: None,
             channel: None,
             workspace_root: None,
+            force_human: false,
         };
 
         let result = mgr.submit_request(req, deferred);
@@ -1636,6 +1730,7 @@ mod tests {
             sender_id: Some("user-123".to_string()),
             channel: Some("telegram".to_string()),
             workspace_root: Some(std::path::PathBuf::from("/tmp")),
+            force_human: false,
         };
 
         let id = mgr.submit_request(req, deferred.clone()).unwrap();
@@ -1677,6 +1772,7 @@ mod tests {
             sender_id: None,
             channel: None,
             workspace_root: None,
+            force_human: false,
         };
 
         let id = mgr.submit_request(req, deferred.clone()).unwrap();
@@ -1716,6 +1812,7 @@ mod tests {
             sender_id: None,
             channel: None,
             workspace_root: None,
+            force_human: false,
         };
         mgr.submit_request(req, deferred).unwrap();
         mgr.pending.get_mut(&id).unwrap().submitted_at = Utc::now() - chrono::Duration::seconds(5);
@@ -1749,6 +1846,7 @@ mod tests {
             sender_id: None,
             channel: None,
             workspace_root: None,
+            force_human: false,
         };
         mgr.submit_request(req, deferred).unwrap();
 
@@ -1786,6 +1884,7 @@ mod tests {
             sender_id: None,
             channel: None,
             workspace_root: None,
+            force_human: false,
         };
 
         let id1 = mgr.submit_request(req1, deferred1).unwrap();
@@ -1803,6 +1902,7 @@ mod tests {
             sender_id: None,
             channel: None,
             workspace_root: None,
+            force_human: false,
         };
 
         let result = mgr.submit_request(req2, deferred2);
@@ -1828,6 +1928,7 @@ mod tests {
             sender_id: None,
             channel: None,
             workspace_root: None,
+            force_human: false,
         };
         let id1 = mgr.submit_request(req1, deferred1).unwrap();
 
@@ -1843,6 +1944,7 @@ mod tests {
             sender_id: None,
             channel: None,
             workspace_root: None,
+            force_human: false,
         };
 
         let id2 = mgr.submit_request(req2, deferred2).unwrap();
@@ -1870,6 +1972,7 @@ mod tests {
                 sender_id: None,
                 channel: None,
                 workspace_root: None,
+                force_human: false,
             };
             let id = mgr.submit_request(req, deferred).unwrap();
             ids.push(id);
@@ -1888,6 +1991,7 @@ mod tests {
             sender_id: None,
             channel: None,
             workspace_root: None,
+            force_human: false,
         };
         let result = mgr.submit_request(req, deferred);
         assert!(result.is_err());
@@ -1906,6 +2010,7 @@ mod tests {
             sender_id: None,
             channel: None,
             workspace_root: None,
+            force_human: false,
         };
         let result = mgr.submit_request(req, deferred);
         assert!(result.is_ok());
@@ -1938,6 +2043,7 @@ mod tests {
                     sender_id: None,
                     channel: None,
                     workspace_root: None,
+                    force_human: false,
                 }),
                 submitted_at: Utc::now() - chrono::Duration::seconds(120),
             },
@@ -1979,6 +2085,7 @@ mod tests {
                     sender_id: None,
                     channel: None,
                     workspace_root: None,
+                    force_human: false,
                 }),
                 submitted_at: Utc::now() - chrono::Duration::seconds(120),
             },
@@ -2261,7 +2368,7 @@ mod tests {
 
         // Record failures up to threshold
         for _ in 0..5 {
-            mgr.record_totp_failure("user1");
+            let _ = mgr.record_totp_failure("user1");
         }
         assert!(mgr.is_totp_locked_out("user1"));
 
@@ -2289,6 +2396,50 @@ mod tests {
         assert!(policy2.tool_requires_totp("shell_exec"));
         assert!(policy2.tool_requires_totp("file_write"));
         assert!(policy2.tool_requires_totp("anything"));
+    }
+
+    // -----------------------------------------------------------------------
+    // TOTP replay prevention (#3359)
+    // -----------------------------------------------------------------------
+
+    fn make_manager_with_db() -> ApprovalManager {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        librefang_memory::migration::run_migrations(&conn).unwrap();
+        let conn = Arc::new(StdMutex::new(conn));
+        ApprovalManager::new_with_db(ApprovalPolicy::default(), conn)
+    }
+
+    #[test]
+    fn test_totp_replay_prevention_code_not_used_initially() {
+        let mgr = make_manager_with_db();
+        // A fresh code should not be marked as used.
+        assert!(!mgr.is_totp_code_used("123456"));
+    }
+
+    #[test]
+    fn test_totp_replay_prevention_code_rejected_after_use() {
+        let mgr = make_manager_with_db();
+        mgr.record_totp_code_used("123456");
+        // The same code must now be detected as already used.
+        assert!(mgr.is_totp_code_used("123456"));
+    }
+
+    #[test]
+    fn test_totp_replay_prevention_different_code_not_blocked() {
+        let mgr = make_manager_with_db();
+        mgr.record_totp_code_used("123456");
+        // A different code must not be blocked.
+        assert!(!mgr.is_totp_code_used("654321"));
+    }
+
+    #[test]
+    fn test_totp_code_hash_does_not_store_plaintext() {
+        // The hash of "123456" must not equal "123456".
+        let hash = ApprovalManager::totp_code_hash("123456");
+        assert_ne!(hash, "123456");
+        // It must be a 64-character hex string (SHA-256 output).
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     // -----------------------------------------------------------------------
@@ -2510,6 +2661,7 @@ mod tests {
             sender_id: None,
             channel: None,
             workspace_root: None,
+            force_human: false,
         };
 
         let req1 = make_session_request("agent-1", "sess-dedup");
@@ -2533,6 +2685,7 @@ mod tests {
             sender_id: None,
             channel: None,
             workspace_root: None,
+            force_human: false,
         };
         let req3 = make_session_request("agent-1", "sess-dedup");
         let id3 = mgr.submit_request(req3, deferred2).unwrap();

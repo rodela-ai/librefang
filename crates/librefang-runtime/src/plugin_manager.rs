@@ -10,7 +10,8 @@
 //! - **Local path**: copy from a local directory
 //! - **Git URL**: clone a git repo into the plugins directory
 
-use librefang_types::config::{PluginManifest, PluginSystemRequirement};
+use librefang_types::config::{PluginI18n, PluginManifest, PluginSystemRequirement};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -18,9 +19,16 @@ use tracing::{debug, info, warn};
 ///
 /// This is an Ed25519 public key (32 bytes, base64url-encoded).
 /// Override via `LIBREFANG_REGISTRY_PUBKEY` env var for custom registries.
-/// Set to `LIBREFANG_REGISTRY_VERIFY=0` to skip verification entirely.
+/// Set to `LIBREFANG_REGISTRY_VERIFY=0` to skip verification entirely (development only).
+///
+/// # Security note
+/// The placeholder value below (all-zero bytes once decoded) is intentionally
+/// detected at runtime. Any install attempt while this placeholder is in effect
+/// is rejected with a hard error — no plugin is accepted without a real key.
+/// To configure a real key, set the `LIBREFANG_REGISTRY_PUBKEY` environment
+/// variable to the base64-encoded 32-byte Ed25519 public key of your registry.
 const OFFICIAL_REGISTRY_PUBKEY_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-// ^ placeholder — real key would be the registry operator's public key
+// ^ all-zero placeholder — triggers hard error at runtime (see is_placeholder check)
 
 /// Verify an Ed25519 signature over registry index JSON bytes.
 ///
@@ -246,29 +254,41 @@ pub async fn fetch_verified_index(
         let pubkey = std::env::var("LIBREFANG_REGISTRY_PUBKEY")
             .unwrap_or_else(|_| OFFICIAL_REGISTRY_PUBKEY_B64.to_string());
 
-        // Only verify if the key is not the all-zero placeholder.
+        // Detect the all-zero placeholder key.  A placeholder means no real
+        // registry key has been configured, so we REFUSE rather than silently
+        // skip — accepting an unverified index would let a compromised or
+        // man-in-the-middle registry serve arbitrary plugin lists.
         let key_bytes = base64::engine::general_purpose::STANDARD
             .decode(pubkey.trim())
             .unwrap_or_default();
         let is_placeholder = key_bytes.iter().all(|&b| b == 0) || key_bytes.len() != 32;
 
-        if !is_placeholder {
-            // Try to fetch the signature file.
-            match client.get(&sig_url).send().await {
-                Ok(sig_resp) if sig_resp.status().is_success() => {
-                    let sig_text = sig_resp
-                        .text()
-                        .await
-                        .map_err(|e| format!("Failed to read signature: {e}"))?;
-                    verify_registry_index(&index_bytes, sig_text.trim(), &pubkey)?;
-                    info!(registry, "Registry index signature verified OK");
-                }
-                _ => {
-                    warn!(
-                        registry,
-                        "No index.json.sig found — registry index not signature-verified"
-                    );
-                }
+        if is_placeholder {
+            return Err(
+                "Plugin registry public key is not configured — refusing to fetch registry \
+                 index without signature verification. \
+                 Set LIBREFANG_REGISTRY_PUBKEY to the base64-encoded Ed25519 public key of \
+                 your registry, or set LIBREFANG_REGISTRY_VERIFY=0 to disable verification \
+                 (development use only)."
+                    .to_string(),
+            );
+        }
+
+        // Key is present and non-placeholder — try to verify the signature.
+        match client.get(&sig_url).send().await {
+            Ok(sig_resp) if sig_resp.status().is_success() => {
+                let sig_text = sig_resp
+                    .text()
+                    .await
+                    .map_err(|e| format!("Failed to read signature: {e}"))?;
+                verify_registry_index(&index_bytes, sig_text.trim(), &pubkey)?;
+                info!(registry, "Registry index signature verified OK");
+            }
+            _ => {
+                warn!(
+                    registry,
+                    "No index.json.sig found — registry index not signature-verified"
+                );
             }
         }
     }
@@ -848,13 +868,33 @@ async fn install_from_registry(
         }
     }
 
-    // Verify Ed25519 archive signature (optional — absent sig is OK, wrong sig is fatal).
+    // Verify Ed25519 archive signature.
+    // A placeholder (all-zero) public key means no real key is configured —
+    // refuse installation rather than silently skip.  An attacker who knows the
+    // key is all-zero bytes can trivially craft valid signatures, so accepting
+    // plugins while the placeholder is active is equivalent to no verification.
     let archive_bytes = std::fs::read(target_dir.join("plugin.toml")).unwrap_or_default();
     if std::env::var("LIBREFANG_ARCHIVE_VERIFY").as_deref() == Ok("0") {
         debug!("Archive signature verification disabled via LIBREFANG_ARCHIVE_VERIFY=0");
     } else {
+        use base64::Engine as _;
         let pubkey = std::env::var("LIBREFANG_REGISTRY_PUBKEY")
             .unwrap_or_else(|_| OFFICIAL_REGISTRY_PUBKEY_B64.to_string());
+        let key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(pubkey.trim())
+            .unwrap_or_default();
+        let is_placeholder = key_bytes.iter().all(|&b| b == 0) || key_bytes.len() != 32;
+        if is_placeholder {
+            let _ = std::fs::remove_dir_all(&target_dir);
+            return Err(
+                "Plugin registry public key is not configured — refusing to install plugin \
+                 without signature verification. \
+                 Set LIBREFANG_REGISTRY_PUBKEY to the base64-encoded Ed25519 public key of \
+                 your registry, or set LIBREFANG_ARCHIVE_VERIFY=0 to disable verification \
+                 (development use only)."
+                    .to_string(),
+            );
+        }
         if let Err(e) =
             verify_archive_signature(&client, &listing_url, &archive_bytes, &pubkey).await
         {
@@ -863,9 +903,78 @@ async fn install_from_registry(
         }
     }
 
+    // Bug #3804 — verify hook script integrity after install.
+    //
+    // The checksum above only covers plugin.toml (the manifest).  Hook scripts
+    // that are referenced in the manifest but NOT listed in its [integrity]
+    // section bypass all content verification — an attacker who controls the
+    // download can serve a legitimate manifest with a valid checksum while
+    // substituting malicious hook scripts.
+    //
+    // If the manifest declares hook scripts, every one of them MUST have a
+    // corresponding entry in [integrity].  Missing entries are a hard error
+    // for registry-installed plugins; authors who intentionally omit integrity
+    // hashes (e.g. during development) can install via Local or Git sources.
+    {
+        let manifest_path = target_dir.join("plugin.toml");
+        match std::fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|s| toml::from_str::<PluginManifest>(&s).ok())
+        {
+            Some(manifest) => {
+                // Collect every hook script path declared in [hooks].
+                let declared_hooks: Vec<&str> = [
+                    manifest.hooks.ingest.as_deref(),
+                    manifest.hooks.after_turn.as_deref(),
+                    manifest.hooks.bootstrap.as_deref(),
+                    manifest.hooks.assemble.as_deref(),
+                    manifest.hooks.compact.as_deref(),
+                    manifest.hooks.prepare_subagent.as_deref(),
+                    manifest.hooks.merge_subagent.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+
+                if !declared_hooks.is_empty() {
+                    let missing_integrity: Vec<&str> = declared_hooks
+                        .iter()
+                        .copied()
+                        .filter(|hook| !manifest.integrity.contains_key(*hook))
+                        .collect();
+
+                    if !missing_integrity.is_empty() {
+                        // Hard error: registry plugins must declare integrity hashes for
+                        // every hook script.  Without them, the hook content is unverified
+                        // and could have been substituted after the manifest was signed.
+                        let _ = std::fs::remove_dir_all(&target_dir);
+                        return Err(format!(
+                            "Plugin '{}' is missing [integrity] hashes for hook script(s): {}. \
+                             Registry-installed plugins must provide SHA-256 checksums for every \
+                             hook script declared in [hooks] so that tampered scripts are detected \
+                             at load time. Add an [integrity] section to plugin.toml with \
+                             \"hooks/<script>\" = \"<sha256hex>\" entries, or install via a local \
+                             path (PluginSource::Local) to bypass this requirement.",
+                            manifest.name,
+                            missing_integrity.join(", ")
+                        ));
+                    }
+                }
+            }
+            None => {
+                // Manifest could not be re-read after install — treat as integrity failure.
+                let _ = std::fs::remove_dir_all(&target_dir);
+                return Err(format!(
+                    "Plugin '{name}': failed to re-read plugin.toml after install \
+                     — cannot verify hook script integrity"
+                ));
+            }
+        }
+    }
+
     info!(
         plugin = name,
-        "Plugin installed successfully (integrity verified)"
+        "Plugin installed successfully (manifest + hook script integrity verified)"
     );
 
     // Bust the registry cache so subsequent searches see an up-to-date index.
@@ -893,6 +1002,11 @@ pub struct RegistryPluginEntry {
     /// Hook names declared by the plugin (e.g. `ingest`, `after_turn`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hooks: Vec<String>,
+    /// Per-language overrides for `name` / `description`. Keyed by BCP-47
+    /// tag (`zh`, `zh-TW`, …). API routes resolve `Accept-Language` against
+    /// this and fall back to the English values above.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub i18n: HashMap<String, PluginI18n>,
 }
 
 /// Disk cache file for an enriched registry listing.
@@ -956,7 +1070,38 @@ async fn fetch_registry_plugin_meta(
         entry.hooks = hooks.keys().cloned().collect();
         entry.hooks.sort();
     }
+    entry.i18n = parse_plugin_i18n_blocks(&value);
     entry
+}
+
+/// Pull `[i18n.<lang>]` tables off a parsed plugin TOML, keeping only the
+/// `name` and `description` overrides. Empty entries (neither field set)
+/// are dropped to keep the map tight.
+///
+/// Exposed as `pub(crate)` so it can be unit-tested without a network
+/// round-trip; the production caller is `fetch_registry_plugin_meta`.
+pub(crate) fn parse_plugin_i18n_blocks(value: &toml::Value) -> HashMap<String, PluginI18n> {
+    let mut out: HashMap<String, PluginI18n> = HashMap::new();
+    let Some(i18n) = value.get("i18n").and_then(|v| v.as_table()) else {
+        return out;
+    };
+    for (lang, body) in i18n {
+        let Some(tbl) = body.as_table() else { continue };
+        let pi = PluginI18n {
+            name: tbl
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            description: tbl
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        };
+        if pi.name.is_some() || pi.description.is_some() {
+            out.insert(lang.clone(), pi);
+        }
+    }
+    out
 }
 
 /// List available plugins in a GitHub registry, enriched with manifest metadata.
@@ -4140,7 +4285,9 @@ after_turn = "hooks/after_turn.py"
     async fn test_list_registry_plugins_enriched() {
         // Skip disk cache so a cached name-only listing from a previous run
         // cannot mask a regression.
-        std::env::set_var("LIBREFANG_REGISTRY_NO_CACHE", "1");
+        // SAFETY: this test is marked #[ignore] and only runs explicitly (not
+        // in parallel); no other test thread races on this env var.
+        unsafe { std::env::set_var("LIBREFANG_REGISTRY_NO_CACHE", "1") };
         let entries = list_registry_plugins("librefang/librefang-registry")
             .await
             .expect("registry listing should succeed");
@@ -4208,5 +4355,285 @@ after_turn = "hooks/after_turn.py"
         // 4. Remove
         remove_plugin("echo-memory").expect("remove failed");
         assert!(get_plugin_info("echo-memory").is_err());
+    }
+
+    /// Sanity: a manifest with no `[i18n.*]` tables yields an empty map,
+    /// not a serialization error or panic.
+    #[test]
+    fn parse_plugin_i18n_no_block() {
+        let toml_str = r#"
+name = "test-plugin"
+version = "0.1.0"
+description = "English description"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let i18n = parse_plugin_i18n_blocks(&value);
+        assert!(i18n.is_empty());
+    }
+
+    /// Multiple `[i18n.<lang>]` blocks with both fields populate cleanly.
+    #[test]
+    fn parse_plugin_i18n_multi_lang() {
+        let toml_str = r#"
+name = "auto-summarizer"
+version = "0.1.0"
+description = "English description"
+
+[i18n.zh]
+name = "自动摘要"
+description = "持续维护会话摘要。"
+
+[i18n.zh-TW]
+name = "自動摘要"
+description = "持續維護會話摘要。"
+
+[i18n.fr]
+name = "Auto-résumé"
+description = "Maintient un résumé continu."
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let i18n = parse_plugin_i18n_blocks(&value);
+        assert_eq!(i18n.len(), 3);
+        assert_eq!(i18n["zh"].name.as_deref(), Some("自动摘要"));
+        assert_eq!(i18n["zh-TW"].name.as_deref(), Some("自動摘要"));
+        assert_eq!(
+            i18n["fr"].description.as_deref(),
+            Some("Maintient un résumé continu.")
+        );
+    }
+
+    /// A block that only sets `name` (no description) survives, with
+    /// description left as `None` so callers know to fall back.
+    #[test]
+    fn parse_plugin_i18n_partial_entry() {
+        let toml_str = r#"
+[i18n.de]
+name = "Beispiel"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let i18n = parse_plugin_i18n_blocks(&value);
+        assert_eq!(i18n.len(), 1);
+        assert_eq!(i18n["de"].name.as_deref(), Some("Beispiel"));
+        assert!(i18n["de"].description.is_none());
+    }
+
+    /// A `[i18n.<lang>]` block that sets neither field is dropped — keeping
+    /// it would just take memory for no observable effect at the API
+    /// boundary.
+    #[test]
+    fn parse_plugin_i18n_empty_entry_dropped() {
+        let toml_str = r#"
+[i18n.ja]
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let i18n = parse_plugin_i18n_blocks(&value);
+        assert!(i18n.is_empty(), "empty i18n.ja entry should not be kept");
+    }
+
+    /// Non-string `name` / `description` values (e.g. someone wrote a
+    /// number by mistake) are silently ignored rather than panicking.
+    #[test]
+    fn parse_plugin_i18n_non_string_values_ignored() {
+        let toml_str = r#"
+[i18n.es]
+name = 42
+description = "Spanish description"
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let i18n = parse_plugin_i18n_blocks(&value);
+        assert_eq!(i18n.len(), 1);
+        assert!(i18n["es"].name.is_none(), "non-string name dropped");
+        assert_eq!(
+            i18n["es"].description.as_deref(),
+            Some("Spanish description")
+        );
+    }
+
+    // ── Bug #3799 — placeholder public key must be refused, not silently skipped ──
+
+    /// Decoding the built-in `OFFICIAL_REGISTRY_PUBKEY_B64` constant must
+    /// produce an all-zero 32-byte slice.  If someone replaces the placeholder
+    /// with a real key this test will fail, signalling that the is_placeholder
+    /// gate should also be re-evaluated.
+    #[test]
+    fn official_registry_pubkey_is_placeholder_all_zeros() {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(OFFICIAL_REGISTRY_PUBKEY_B64)
+            .expect("OFFICIAL_REGISTRY_PUBKEY_B64 must be valid base64");
+        assert_eq!(
+            bytes.len(),
+            32,
+            "placeholder key must decode to exactly 32 bytes"
+        );
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "placeholder key must be all zeros"
+        );
+    }
+
+    /// The is_placeholder detection used in fetch_verified_index and
+    /// install_from_registry must flag the built-in constant as a placeholder.
+    #[test]
+    fn is_placeholder_detects_built_in_constant() {
+        use base64::Engine as _;
+        let key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(OFFICIAL_REGISTRY_PUBKEY_B64)
+            .unwrap_or_default();
+        let is_placeholder = key_bytes.iter().all(|&b| b == 0) || key_bytes.len() != 32;
+        assert!(
+            is_placeholder,
+            "the built-in registry pubkey must be detected as a placeholder \
+             so installs fail loudly instead of silently skipping verification"
+        );
+    }
+
+    /// A non-zero 32-byte key must NOT be treated as a placeholder.
+    #[test]
+    fn is_placeholder_passes_real_key() {
+        use base64::Engine as _;
+        // Synthesise a fake non-zero key (not a real Ed25519 key — just for the
+        // placeholder-detection logic which only checks bytes, not curve validity).
+        let real_key = [0xABu8; 32];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(real_key);
+        let key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .unwrap_or_default();
+        let is_placeholder = key_bytes.iter().all(|&b| b == 0) || key_bytes.len() != 32;
+        assert!(
+            !is_placeholder,
+            "a non-zero 32-byte key must not be treated as a placeholder"
+        );
+    }
+
+    // ── Bug #3804 — hook script integrity check logic ────────────────────────
+
+    /// Helper: build a minimal PluginManifest with the given hook paths and
+    /// integrity entries so we can exercise the detection logic without
+    /// spinning up an HTTP server.
+    fn make_manifest_with_hooks(
+        hooks: &[(&str, &str)],     // (field_name, script_path)
+        integrity: &[(&str, &str)], // (script_path, sha256hex)
+    ) -> PluginManifest {
+        let mut m = PluginManifest {
+            name: "test-plugin".to_string(),
+            version: "0.1.0".to_string(),
+            ..Default::default()
+        };
+        for &(field, path) in hooks {
+            match field {
+                "ingest" => m.hooks.ingest = Some(path.to_string()),
+                "after_turn" => m.hooks.after_turn = Some(path.to_string()),
+                "bootstrap" => m.hooks.bootstrap = Some(path.to_string()),
+                "assemble" => m.hooks.assemble = Some(path.to_string()),
+                "compact" => m.hooks.compact = Some(path.to_string()),
+                "prepare_subagent" => m.hooks.prepare_subagent = Some(path.to_string()),
+                "merge_subagent" => m.hooks.merge_subagent = Some(path.to_string()),
+                _ => {}
+            }
+        }
+        for &(path, hash) in integrity {
+            m.integrity.insert(path.to_string(), hash.to_string());
+        }
+        m
+    }
+
+    /// Extracts the list of hook script paths that are declared in a manifest
+    /// but missing from its integrity map.  This mirrors the logic in
+    /// `install_from_registry` so changes there won't silently regress.
+    fn missing_integrity_hooks(manifest: &PluginManifest) -> Vec<String> {
+        let declared: Vec<&str> = [
+            manifest.hooks.ingest.as_deref(),
+            manifest.hooks.after_turn.as_deref(),
+            manifest.hooks.bootstrap.as_deref(),
+            manifest.hooks.assemble.as_deref(),
+            manifest.hooks.compact.as_deref(),
+            manifest.hooks.prepare_subagent.as_deref(),
+            manifest.hooks.merge_subagent.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        declared
+            .into_iter()
+            .filter(|h| !manifest.integrity.contains_key(*h))
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// A plugin with no hooks declared requires no integrity entries.
+    #[test]
+    fn hook_integrity_no_hooks_no_requirement() {
+        let m = make_manifest_with_hooks(&[], &[]);
+        assert!(
+            missing_integrity_hooks(&m).is_empty(),
+            "no hooks → no integrity entries required"
+        );
+    }
+
+    /// Every declared hook must appear in [integrity]; any missing entry is flagged.
+    #[test]
+    fn hook_integrity_missing_entries_detected() {
+        let m = make_manifest_with_hooks(
+            &[
+                ("ingest", "hooks/ingest.py"),
+                ("after_turn", "hooks/after_turn.py"),
+            ],
+            &[
+                // after_turn is covered, but ingest is not
+                ("hooks/after_turn.py", "abc123"),
+            ],
+        );
+        let missing = missing_integrity_hooks(&m);
+        assert_eq!(missing, vec!["hooks/ingest.py"]);
+    }
+
+    /// When all declared hooks have integrity entries, no missing entries are reported.
+    #[test]
+    fn hook_integrity_all_covered_passes() {
+        let m = make_manifest_with_hooks(
+            &[
+                ("ingest", "hooks/ingest.py"),
+                ("after_turn", "hooks/after_turn.py"),
+            ],
+            &[
+                ("hooks/ingest.py", "deadbeef"),
+                ("hooks/after_turn.py", "cafebabe"),
+            ],
+        );
+        assert!(
+            missing_integrity_hooks(&m).is_empty(),
+            "all hooks covered → no missing integrity entries"
+        );
+    }
+
+    /// All seven hook fields are checked, not just ingest/after_turn.
+    #[test]
+    fn hook_integrity_all_hook_fields_checked() {
+        let all_hooks = [
+            ("ingest", "hooks/ingest.py"),
+            ("after_turn", "hooks/after_turn.py"),
+            ("bootstrap", "hooks/bootstrap.py"),
+            ("assemble", "hooks/assemble.py"),
+            ("compact", "hooks/compact.py"),
+            ("prepare_subagent", "hooks/prepare_subagent.py"),
+            ("merge_subagent", "hooks/merge_subagent.py"),
+        ];
+        // Provide integrity for all but compact and merge_subagent.
+        let integrity_provided = [
+            ("hooks/ingest.py", "h1"),
+            ("hooks/after_turn.py", "h2"),
+            ("hooks/bootstrap.py", "h3"),
+            ("hooks/assemble.py", "h4"),
+            ("hooks/prepare_subagent.py", "h6"),
+        ];
+        let m = make_manifest_with_hooks(&all_hooks, &integrity_provided);
+        let mut missing = missing_integrity_hooks(&m);
+        missing.sort();
+        assert_eq!(
+            missing,
+            vec!["hooks/compact.py", "hooks/merge_subagent.py"],
+            "compact and merge_subagent must be flagged"
+        );
     }
 }

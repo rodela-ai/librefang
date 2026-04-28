@@ -29,7 +29,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2026.4.24-beta5"
+version = "2026.4.28-beta7"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/librefang/librefang"
@@ -98,6 +98,9 @@ async-trait = "0.1"
 # Base64
 base64 = "0.22"
 
+# Bitflags
+bitflags = "2"
+
 # Bytes
 bytes = "1"
 
@@ -122,6 +125,11 @@ tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip",
 # Home directory resolution
 dirs = "6"
 
+# OS keyring access — libsecret on Linux, Keychain on macOS, Credential Manager
+# on Windows. Falls back to the file-based AES-256-GCM keyring in vault.rs if
+# the OS keyring is genuinely unavailable.
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+
 # YAML parsing
 serde_yaml = "0.9"
 
@@ -133,7 +141,9 @@ walkdir = "2"
 
 # Security
 sha2 = { version = "0.10", features = ["oid"] }
-sha1 = "0.11"
+# sha1 0.10 is paired with hmac 0.12 via digest 0.10. sha1 0.11+ moved to
+# digest 0.11 and is incompatible with our hmac version.
+sha1 = "0.10"
 aes = "0.9"
 cbc = "0.2"
 hmac = "0.12"

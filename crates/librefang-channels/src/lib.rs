@@ -8,6 +8,7 @@
 
 // Core infrastructure — always compiled
 pub mod bridge;
+pub mod commands;
 pub mod formatter;
 pub(crate) mod http_client;
 pub mod message_journal;
@@ -17,6 +18,7 @@ pub mod roster;
 pub mod router;
 pub mod sanitizer;
 pub mod sidecar;
+pub mod thread_ownership;
 pub mod types;
 
 pub use message_truncator::{

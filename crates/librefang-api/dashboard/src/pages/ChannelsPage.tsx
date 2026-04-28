@@ -13,6 +13,7 @@ import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { Badge } from "../components/ui/Badge";
 import { Input } from "../components/ui/Input";
+import { DrawerPanel } from "../components/ui/DrawerPanel";
 import {
   Network, Search, CheckCircle2, XCircle, ChevronRight, X, Grid3X3, List,
   Settings, Key, Clock, AlertCircle, CheckSquare, Square,
@@ -56,9 +57,36 @@ interface ChannelCardProps {
 }
 
 function ChannelCard({ channel: c, isSelected, viewMode, onSelect, onConfigure, onViewDetails, t }: ChannelCardProps) {
+  // Whole-card click opens the details drawer. Inner controls
+  // (checkbox, Configure button) call e.stopPropagation() so the
+  // card-level handler doesn't fire when the user clicks them.
+  // Keyboard: Enter / Space on the focused card mirrors the click —
+  // `role="button" + tabIndex={0}` makes the card itself focusable.
+  // The trailing chevron is now decorative (`aria-hidden`) since the
+  // entire surface is the activator.
+  const openDetails = () => onViewDetails(c);
+  const cardKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      openDetails();
+    }
+  };
+  const cardA11y = {
+    onClick: openDetails,
+    onKeyDown: cardKeyDown,
+    role: "button" as const,
+    tabIndex: 0,
+    "aria-label": c.display_name || c.name,
+  };
+
   if (viewMode === "list") {
     return (
-      <Card hover padding="sm" className={`flex items-center gap-4 group transition-all ${isSelected ? "ring-2 ring-brand" : ""}`}>
+      <Card
+        hover
+        padding="sm"
+        className={`flex items-center gap-4 group transition-all focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:outline-none ${isSelected ? "ring-2 ring-brand" : ""}`}
+        {...cardA11y}
+      >
         <button
           onClick={(e) => { e.stopPropagation(); onSelect(c.name, !isSelected); }}
           className="shrink-0 text-text-dim hover:text-brand transition-colors"
@@ -92,13 +120,16 @@ function ChannelCard({ channel: c, isSelected, viewMode, onSelect, onConfigure, 
           )}
         </div>
 
-        <div className="flex items-center gap-1 shrink-0">
-          <Button variant="secondary" size="sm" onClick={() => onConfigure(c)} leftIcon={<Settings className="w-3 h-3" />}>
+        <div className="flex items-center gap-2 shrink-0">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={(e) => { e.stopPropagation(); onConfigure(c); }}
+            leftIcon={<Settings className="w-3 h-3" />}
+          >
             {t("channels.config")}
           </Button>
-          <Button variant="ghost" size="sm" onClick={() => onViewDetails(c)}>
-            <ChevronRight className="w-4 h-4" />
-          </Button>
+          <ChevronRight className="w-4 h-4 text-text-dim/60" aria-hidden="true" />
         </div>
       </Card>
     );
@@ -106,7 +137,12 @@ function ChannelCard({ channel: c, isSelected, viewMode, onSelect, onConfigure, 
 
   // Grid view
   return (
-    <Card hover padding="none" className={`flex flex-col overflow-hidden group transition-all ${isSelected ? "ring-2 ring-brand" : ""}`}>
+    <Card
+      hover
+      padding="none"
+      className={`flex flex-col overflow-hidden group transition-all focus-visible:ring-2 focus-visible:ring-brand/40 focus-visible:outline-none ${isSelected ? "ring-2 ring-brand" : ""}`}
+      {...cardA11y}
+    >
       <div className={`h-1.5 bg-linear-to-r ${c.configured ? "from-success via-success/60 to-success/30" : "from-brand via-brand/60 to-brand/30"}`} />
       <div className="p-5 flex-1 flex flex-col">
         {/* Header */}
@@ -154,13 +190,17 @@ function ChannelCard({ channel: c, isSelected, viewMode, onSelect, onConfigure, 
         </div>
 
         {/* Actions */}
-        <div className="flex gap-2 mt-auto">
-          <Button variant="secondary" size="sm" className="flex-1" onClick={() => onConfigure(c)} leftIcon={<Settings className="w-3 h-3" />}>
+        <div className="flex gap-2 mt-auto items-center">
+          <Button
+            variant="secondary"
+            size="sm"
+            className="flex-1"
+            onClick={(e) => { e.stopPropagation(); onConfigure(c); }}
+            leftIcon={<Settings className="w-3 h-3" />}
+          >
             {t("channels.config")}
           </Button>
-          <Button variant="ghost" size="sm" onClick={() => onViewDetails(c)}>
-            <ChevronRight className="w-4 h-4" />
-          </Button>
+          <ChevronRight className="w-4 h-4 text-text-dim/60 shrink-0" aria-hidden="true" />
         </div>
       </div>
     </Card>
@@ -176,10 +216,10 @@ function DetailsModal({ channel, onClose, onConfigure, onTest, t }: {
   t: (key: string) => string
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-black/50 backdrop-blur-sm" onClick={onClose}>
-      <div className="bg-surface rounded-2xl border border-border-subtle w-full sm:max-w-lg shadow-2xl rounded-t-2xl sm:rounded-2xl max-h-[90vh] overflow-y-auto animate-fade-in-scale" onClick={e => e.stopPropagation()}>
-        {/* Header */}
-        <div className={`h-2 bg-linear-to-r ${channel.configured ? "from-success via-success/60 to-success/30" : "from-brand via-brand/60 to-brand/30"} rounded-t-2xl`} />
+    <DrawerPanel isOpen onClose={onClose} size="lg" hideCloseButton>
+        {/* Coloured strip + custom header are kept inline so the
+            configured/unconfigured stripe still renders. */}
+        <div className={`h-2 bg-linear-to-r ${channel.configured ? "from-success via-success/60 to-success/30" : "from-brand via-brand/60 to-brand/30"}`} />
         <div className="p-6 border-b border-border-subtle">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
@@ -309,8 +349,7 @@ function DetailsModal({ channel, onClose, onConfigure, onTest, t }: {
         <div className="p-4 border-t border-border-subtle flex justify-end">
           <Button variant="ghost" onClick={onClose}>{t("common.close")}</Button>
         </div>
-      </div>
-    </div>
+    </DrawerPanel>
   );
 }
 
@@ -369,8 +408,7 @@ function ConfigDialog({ channel, onClose, t }: { channel: Channel; onClose: () =
   };
 
   return (
-    <div className="fixed inset-0 bg-black/40 flex items-end sm:items-center justify-center z-50 backdrop-blur-sm" onClick={onClose}>
-      <div className="bg-surface border border-border-subtle rounded-2xl w-full sm:max-w-md shadow-2xl rounded-t-2xl sm:rounded-2xl animate-fade-in-scale" onClick={e => e.stopPropagation()}>
+    <DrawerPanel isOpen onClose={onClose} size="md" hideCloseButton>
         <div className="px-6 py-5 border-b border-border-subtle">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
@@ -451,8 +489,7 @@ function ConfigDialog({ channel, onClose, t }: { channel: Channel; onClose: () =
           </Button>
         </div>
         </div>
-      </div>
-    </div>
+    </DrawerPanel>
   );
 }
 
@@ -541,8 +578,7 @@ function QrLoginDialog({ channel, onClose, t }: { channel: Channel; onClose: () 
   useEffect(() => { startQr(); }, [startQr]);
 
   return (
-    <div className="fixed inset-0 bg-black/40 flex items-end sm:items-center justify-center z-50 backdrop-blur-xl backdrop-saturate-150" onClick={onClose}>
-      <div className="bg-surface border border-border-subtle rounded-2xl w-full sm:max-w-md shadow-2xl rounded-t-2xl sm:rounded-2xl animate-fade-in-scale" onClick={e => e.stopPropagation()}>
+    <DrawerPanel isOpen onClose={onClose} size="md" hideCloseButton>
         <div className="px-6 py-5 border-b border-border-subtle">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
@@ -590,8 +626,7 @@ function QrLoginDialog({ channel, onClose, t }: { channel: Channel; onClose: () 
         <div className="p-4 border-t border-border-subtle flex justify-end">
           <Button variant="ghost" onClick={onClose}>{t("common.close")}</Button>
         </div>
-      </div>
-    </div>
+    </DrawerPanel>
   );
 }
 
@@ -769,8 +804,13 @@ export function ChannelsPage() {
 
       {/* Tabs */}
       <div className="flex items-center gap-4 flex-wrap overflow-x-auto">
-        <div className="flex gap-1 p-1 bg-main/30 rounded-xl w-fit">
+        <div role="tablist" aria-label={t("nav.channels", { defaultValue: "Channels" })} className="flex gap-1 p-1 bg-main/30 rounded-xl w-fit">
           <button
+            id="channels-tab-configured"
+            role="tab"
+            aria-selected={activeTab === "configured"}
+            aria-controls="channels-panel"
+            tabIndex={activeTab === "configured" ? 0 : -1}
             onClick={() => handleTabChange("configured")}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-colors ${
               activeTab === "configured" ? "bg-surface text-success shadow-sm" : "text-text-dim hover:text-text-main"
@@ -783,6 +823,11 @@ export function ChannelsPage() {
             </span>
           </button>
           <button
+            id="channels-tab-unconfigured"
+            role="tab"
+            aria-selected={activeTab === "unconfigured"}
+            aria-controls="channels-panel"
+            tabIndex={activeTab === "unconfigured" ? 0 : -1}
             onClick={() => handleTabChange("unconfigured")}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-colors ${
               activeTab === "unconfigured" ? "bg-surface text-brand shadow-sm" : "text-text-dim hover:text-text-main"
@@ -797,6 +842,7 @@ export function ChannelsPage() {
         </div>
       </div>
 
+      <div id="channels-panel" role="tabpanel" aria-labelledby={`channels-tab-${activeTab}`}>
       {channelsQuery.isLoading ? (
         <div className={viewMode === "grid" ? "grid gap-4 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 3xl:grid-cols-5 4xl:grid-cols-6" : "flex flex-col gap-2"}>
           {[1, 2, 3].map((i) => <CardSkeleton key={i} />)}
@@ -837,6 +883,7 @@ export function ChannelsPage() {
           </div>
         </>
       )}
+      </div>
 
       {/* Details Modal */}
       {detailsChannel && (

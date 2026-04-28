@@ -164,6 +164,10 @@ pub fn router() -> axum::Router<std::sync::Arc<super::AppState>> {
             "/mcp/servers/{name}/reconnect",
             axum::routing::post(reconnect_mcp_server_handler),
         )
+        .route(
+            "/mcp/servers/{name}/taint",
+            axum::routing::patch(patch_mcp_server_taint),
+        )
         // MCP OAuth auth endpoints (existing, unchanged)
         .route(
             "/mcp/servers/{name}/auth/status",
@@ -190,6 +194,10 @@ pub fn router() -> axum::Router<std::sync::Arc<super::AppState>> {
         // Health + reload (covers all configured servers)
         .route("/mcp/health", axum::routing::get(mcp_health_handler))
         .route("/mcp/reload", axum::routing::post(reload_mcp_handler))
+        // Read-only registry of named `[[taint_rules]]` for dashboard
+        // validation (issue #3050 follow-up — typo'd rule_set names
+        // would otherwise be silent no-ops in scanner).
+        .route("/mcp/taint-rules", axum::routing::get(list_mcp_taint_rules))
         // Extensions — kept as dashboard-friendly aliases over the unified store.
         .route("/extensions", axum::routing::get(list_extensions))
         .route(
@@ -1240,21 +1248,51 @@ pub async fn clawhub_cn_install(
 
     match client.install(&req.slug, &skills_dir).await {
         Ok(result) => {
-            // Patch source provenance to ClawHubCn
+            // Patch source provenance to ClawHubCn so the skill registry knows
+            // this skill was installed from ClawHub and can surface update/version info.
             let skill_dir = skills_dir.join(&req.slug);
             let manifest_path = skill_dir.join("skill.toml");
             if manifest_path.exists() {
-                if let Ok(toml_str) = std::fs::read_to_string(&manifest_path) {
-                    if let Ok(mut manifest) =
-                        toml::from_str::<librefang_skills::SkillManifest>(&toml_str)
-                    {
-                        manifest.source = Some(librefang_skills::SkillSource::ClawHubCn {
-                            slug: req.slug.clone(),
-                            version: result.version.clone(),
-                        });
-                        if let Ok(updated) = toml::to_string_pretty(&manifest) {
-                            let _ = std::fs::write(&manifest_path, updated);
+                match std::fs::read_to_string(&manifest_path) {
+                    Ok(toml_str) => {
+                        match toml::from_str::<librefang_skills::SkillManifest>(&toml_str) {
+                            Ok(mut manifest) => {
+                                manifest.source = Some(librefang_skills::SkillSource::ClawHubCn {
+                                    slug: req.slug.clone(),
+                                    version: result.version.clone(),
+                                });
+                                match toml::to_string_pretty(&manifest) {
+                                    Ok(updated) => {
+                                        if let Err(e) = std::fs::write(&manifest_path, updated) {
+                                            tracing::warn!(
+                                                slug = %req.slug,
+                                                path = %manifest_path.display(),
+                                                "Failed to write provenance to skill.toml: {e}"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            slug = %req.slug,
+                                            "Failed to serialize skill manifest for provenance patch: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    slug = %req.slug,
+                                    "Failed to parse skill.toml for provenance patch: {e}"
+                                );
+                            }
                         }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            slug = %req.slug,
+                            path = %manifest_path.display(),
+                            "Failed to read skill.toml for provenance patch: {e}"
+                        );
                     }
                 }
             }
@@ -2163,13 +2201,6 @@ pub async fn install_hand_deps(
             }
         };
 
-        // Execute the install command
-        let (shell, flag) = if cfg!(windows) {
-            ("cmd", "/C")
-        } else {
-            ("sh", "-c")
-        };
-
         // For winget on Windows, add --accept flags to avoid interactive prompts
         let final_cmd = if cfg!(windows) && cmd.starts_with("winget ") {
             format!("{cmd} --accept-source-agreements --accept-package-agreements")
@@ -2177,13 +2208,45 @@ pub async fn install_hand_deps(
             cmd.to_string()
         };
 
+        // Guard against shell injection: reject commands that contain shell
+        // metacharacters that are never needed in legitimate package-manager
+        // install strings (semicolons, pipes, backticks, redirects, etc.).
+        if final_cmd.contains(|c: char| {
+            matches!(
+                c,
+                ';' | '|' | '&' | '$' | '`' | '>' | '<' | '(' | ')' | '{' | '}' | '\n' | '\r'
+            )
+        }) {
+            results.push(serde_json::json!({
+                "key": req.key,
+                "status": "error",
+                "command": final_cmd,
+                "message": "Install command contains disallowed shell metacharacters and was rejected for security reasons",
+            }));
+            continue;
+        }
+
+        // Split into program + arguments and exec directly — no shell involved.
+        // This eliminates the sh -c / cmd /C injection vector entirely.
+        let parts: Vec<&str> = final_cmd.split_whitespace().collect();
+        if parts.is_empty() {
+            results.push(serde_json::json!({
+                "key": req.key,
+                "status": "error",
+                "command": final_cmd,
+                "message": "Install command is empty",
+            }));
+            continue;
+        }
+        let program = parts[0];
+        let args = &parts[1..];
+
         tracing::info!(hand = %hand_id, dep = %req.key, cmd = %final_cmd, "Auto-installing dependency");
 
         let output = match tokio::time::timeout(
             std::time::Duration::from_secs(300),
-            tokio::process::Command::new(shell)
-                .arg(flag)
-                .arg(&final_cmd)
+            tokio::process::Command::new(program)
+                .args(args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .stdin(std::process::Stdio::null())
@@ -2294,7 +2357,14 @@ pub async fn install_hand_deps(
                 if !extra_paths.is_empty() {
                     let current_path = std::env::var("PATH").unwrap_or_default();
                     let new_path = format!("{};{}", extra_paths.join(";"), current_path);
-                    std::env::set_var("PATH", &new_path);
+                    // `std::env::set_var` is not thread-safe in an async context;
+                    // push to a blocking thread to avoid UB in the tokio runtime.
+                    let new_path_clone = new_path.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        // SAFETY: single mutation on a dedicated blocking thread.
+                        unsafe { std::env::set_var("PATH", &new_path_clone) };
+                    })
+                    .await;
                     tracing::info!(
                         added = extra_paths.len(),
                         "Refreshed PATH with winget/pip directories"
@@ -2613,10 +2683,17 @@ pub async fn set_hand_secret(
             .into_json_tuple();
     }
 
-    // Set in current process
-    // SAFETY: single-threaded secret writes during user-initiated config
-    unsafe {
-        std::env::set_var(&env_key, &value);
+    // Set in current process.
+    // `std::env::set_var` is not thread-safe in an async context; delegate to
+    // a blocking thread to avoid UB in the multithreaded tokio runtime.
+    {
+        let env_key_clone = env_key.clone();
+        let value_clone = value.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            // SAFETY: single mutation on a dedicated blocking thread.
+            unsafe { std::env::set_var(&env_key_clone, &value_clone) };
+        })
+        .await;
     }
 
     (
@@ -3302,6 +3379,41 @@ fn serialize_mcp_transport(
     }
 }
 
+/// GET /api/mcp/taint-rules — List configured `[[taint_rules]]`.
+///
+/// Issue #3050 follow-up: the dashboard `TaintPolicyEditor` references
+/// rule-set names by free-form string. Without this read-only endpoint,
+/// the editor cannot tell the operator that a typed name doesn't match
+/// any registered set — and the scanner silently treats unknown names
+/// as no-ops (one-shot WARN in
+/// `librefang_runtime_mcp::warn_unknown_rule_set_once`). The dashboard
+/// uses this list to render an inline validation hint next to the
+/// `rule_sets` field.
+#[utoipa::path(
+    get,
+    path = "/api/mcp/taint-rules",
+    tag = "mcp",
+    responses(
+        (status = 200, description = "List configured named taint rule sets", body = serde_json::Value)
+    )
+)]
+pub async fn list_mcp_taint_rules(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let payload: Vec<serde_json::Value> = state
+        .kernel
+        .config_ref()
+        .taint_rules
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "name": r.name,
+                "action": r.action,
+                "rule_count": r.rules.len(),
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(payload))
+}
+
 /// GET /api/mcp/servers — List configured MCP servers and their tools.
 #[utoipa::path(
     get,
@@ -3344,6 +3456,10 @@ pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoRe
                 "timeout_secs": s.timeout_secs,
                 "env": s.env,
                 "auth_state": auth_state,
+                // Issue #3050: surface taint config so the dashboard tree
+                // editor can hydrate without a separate fetch.
+                "taint_scanning": s.taint_scanning,
+                "taint_policy": s.taint_policy,
             })
         })
         .collect();
@@ -3441,6 +3557,10 @@ pub async fn get_mcp_server(
         "timeout_secs": entry.timeout_secs,
         "env": entry.env,
         "connected": false,
+        // Issue #3050: surface taint config so the dashboard tree editor
+        // can hydrate without a separate fetch.
+        "taint_scanning": entry.taint_scanning,
+        "taint_policy": entry.taint_policy,
     });
 
     // Check live connection status
@@ -3741,6 +3861,123 @@ pub async fn update_mcp_server(
         "system",
         librefang_runtime::audit::AuditAction::ConfigChange,
         format!("mcp_server updated: {name}"),
+        "completed",
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "updated",
+            "name": name,
+            "reload": reload_status,
+        })),
+    )
+}
+
+/// PATCH /api/mcp/servers/{name}/taint — Partial update of taint settings.
+///
+/// Accepts a body of `{ "taint_scanning"?: bool, "taint_policy"?: McpTaintPolicy }`
+/// and merges it into the existing entry. Unlike PUT this does NOT require
+/// the caller to round-trip every other server field (transport, env, etc.) —
+/// the dashboard taint editor in particular needs only these two fields and
+/// shouldn't risk silently dropping unrelated fields it doesn't render.
+// `McpTaintPolicy` (in `librefang-types`) doesn't carry `utoipa::ToSchema`,
+// so deriving `ToSchema` here would fail. The OpenAPI annotation uses
+// `serde_json::Value` for the body schema, which keeps the spec accurate
+// without forcing a downstream derive.
+#[derive(serde::Deserialize)]
+pub(crate) struct PatchMcpTaintRequest {
+    /// When supplied, replaces `taint_scanning` on the existing entry.
+    #[serde(default)]
+    pub taint_scanning: Option<bool>,
+    /// When supplied, replaces `taint_policy` on the existing entry.
+    /// Pass `{}` (empty object) to clear all per-tool policies; pass `null`
+    /// (or omit) to leave existing policies untouched.
+    #[serde(default)]
+    pub taint_policy: Option<librefang_types::config::McpTaintPolicy>,
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/mcp/servers/{name}/taint",
+    tag = "mcp",
+    params(("name" = String, Path, description = "Server name")),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Taint settings updated", body = serde_json::Value),
+        (status = 404, description = "Server not found", body = serde_json::Value),
+    )
+)]
+#[allow(private_interfaces)]
+pub async fn patch_mcp_server_taint(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    lang: Option<axum::Extension<RequestLanguage>>,
+    Json(body): Json<PatchMcpTaintRequest>,
+) -> impl IntoResponse {
+    let t = ErrorTranslator::new(super::resolve_lang(lang.as_ref()));
+
+    // Locate and clone the existing entry so we mutate a fresh copy that's
+    // safe to pass to upsert_mcp_server_config without touching the live
+    // config until persistence succeeds.
+    let mut entry = match state
+        .kernel
+        .config_ref()
+        .mcp_servers
+        .iter()
+        .find(|s| s.name == name)
+        .cloned()
+    {
+        Some(e) => e,
+        None => {
+            return ApiErrorResponse::not_found(
+                t.t_args("api-error-mcp-not-found", &[("name", &name)]),
+            )
+            .into_json_tuple();
+        }
+    };
+
+    if let Some(scanning) = body.taint_scanning {
+        entry.taint_scanning = scanning;
+    }
+    if let Some(policy) = body.taint_policy {
+        entry.taint_policy = Some(policy);
+    }
+
+    let config_path = state.kernel.home_dir().join("config.toml");
+    if let Err(e) = upsert_mcp_server_config(&config_path, &entry) {
+        return ApiErrorResponse::internal(t.t_args(
+            "api-error-config-write-failed",
+            &[("error", &e.to_string())],
+        ))
+        .into_json_tuple();
+    }
+    // Drop ErrorTranslator before .await — FluentBundle is !Send and cannot
+    // be held across an async suspension point.
+    drop(t);
+
+    let reload_status = match state.kernel.reload_config().await {
+        Ok(plan) => {
+            if plan.restart_required {
+                "applied_partial"
+            } else {
+                "applied"
+            }
+        }
+        Err(_) => "saved_reload_failed",
+    };
+
+    // Reconnect so the new taint_policy snapshot reaches the live
+    // `McpServerConfig.taint_policy` field. The shared `taint_rules_swap`
+    // already updates via `reload_config` without a reconnect.
+    state.kernel.disconnect_mcp_server(&name).await;
+    let kernel = std::sync::Arc::clone(&state.kernel);
+    tokio::spawn(async move { kernel.connect_mcp_servers().await });
+
+    state.kernel.audit().record(
+        "system",
+        librefang_runtime::audit::AuditAction::ConfigChange,
+        format!("mcp_server taint updated: {name}"),
         "completed",
     );
 
@@ -4642,8 +4879,22 @@ pub(crate) fn validate_env_var(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Escape a value for safe storage in a `.env` file.
+///
+/// If a value contains literal newlines the raw `KEY=value\nEXTRA=junk` text
+/// would be parsed as two separate keys by every dotenv reader. Backslashes
+/// must be doubled so they are not misread as escape sequences on read-back.
+fn escape_env_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\") // must come first to avoid double-escaping
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
 /// Write or update a key in the secrets.env file.
 /// File format: one `KEY=value` per line. Existing keys are overwritten.
+/// Values containing newlines or backslashes are escaped so they stay on a
+/// single line and round-trip correctly through dotenv parsers.
 pub(crate) fn write_secret_env(
     path: &std::path::Path,
     key: &str,
@@ -4651,6 +4902,18 @@ pub(crate) fn write_secret_env(
 ) -> Result<(), std::io::Error> {
     validate_static_file_path(path, "secrets.env")
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if key.contains('\n') || key.contains('\r') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "secret key must not contain newline characters",
+        ));
+    }
+    if value.contains('\n') || value.contains('\r') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "secret value must not contain newline characters",
+        ));
+    }
     let mut lines: Vec<String> = if path.exists() {
         std::fs::read_to_string(path)?
             .lines()
@@ -4663,8 +4926,10 @@ pub(crate) fn write_secret_env(
     // Remove existing line for this key
     lines.retain(|l| !l.starts_with(&format!("{key}=")));
 
-    // Add new line
-    lines.push(format!("{key}={value}"));
+    // Add new line — escape the value so embedded newlines/backslashes cannot
+    // corrupt the file structure.
+    let escaped = escape_env_value(value);
+    lines.push(format!("{key}={escaped}"));
 
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
@@ -4707,6 +4972,13 @@ pub(crate) fn remove_secret_env(path: &std::path::Path, key: &str) -> Result<(),
 // ── Config.toml channel management helpers ──────────────────────────
 
 /// Upsert a `[channels.<name>]` section in config.toml with the given non-secret fields.
+///
+/// Uses `toml_edit::DocumentMut` to preserve comments, key ordering, and
+/// formatting of unrelated sections (providers, agents, etc.). The previous
+/// `toml::Value` round-trip silently rewrote the entire file on every
+/// channel write — see issue #3183. Callers must hold
+/// `AppState::config_write_lock` to serialize against `POST /api/config/set`,
+/// which performs an asymmetric read-modify-write on the same file.
 pub(crate) fn upsert_channel_config(
     config_path: &std::path::Path,
     channel_name: &str,
@@ -4720,65 +4992,60 @@ pub(crate) fn upsert_channel_config(
         String::new()
     };
 
-    let mut doc: toml::Value = if content.trim().is_empty() {
-        toml::Value::Table(toml::map::Map::new())
+    let mut doc: toml_edit::DocumentMut = if content.trim().is_empty() {
+        toml_edit::DocumentMut::new()
     } else {
-        toml::from_str(&content)?
+        content.parse()?
     };
 
-    let root = doc.as_table_mut().ok_or("Config is not a TOML table")?;
-
     // Ensure [channels] table exists
-    if !root.contains_key("channels") {
-        root.insert(
-            "channels".to_string(),
-            toml::Value::Table(toml::map::Map::new()),
-        );
+    if !doc.contains_table("channels") {
+        doc["channels"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
-    let channels_table = root
-        .get_mut("channels")
-        .and_then(|v| v.as_table_mut())
+    let channels_table = doc["channels"]
+        .as_table_mut()
         .ok_or("channels is not a table")?;
 
     // Build channel sub-table with correct TOML types
-    let mut ch_table = toml::map::Map::new();
+    let mut ch_table = toml_edit::Table::new();
     for (k, (v, ft)) in fields {
-        let toml_val = match ft {
+        let item = match ft {
             FieldType::Number => {
                 if let Ok(n) = v.parse::<i64>() {
-                    toml::Value::Integer(n)
+                    toml_edit::value(n)
                 } else {
-                    toml::Value::String(v.clone())
+                    toml_edit::value(v.clone())
                 }
             }
             FieldType::List => {
                 // Always store list items as strings so that numeric IDs
                 // (e.g. Discord guild snowflakes, Telegram user IDs) are
                 // deserialized correctly into Vec<String> config fields.
-                let items: Vec<toml::Value> = v
-                    .split(',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| toml::Value::String(s.to_string()))
-                    .collect();
-                toml::Value::Array(items)
+                let mut arr = toml_edit::Array::new();
+                for s in v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    arr.push(s);
+                }
+                toml_edit::value(arr)
             }
-            _ => toml::Value::String(v.clone()),
+            _ => toml_edit::value(v.clone()),
         };
-        ch_table.insert(k.clone(), toml_val);
+        ch_table.insert(k, item);
     }
-    channels_table.insert(channel_name.to_string(), toml::Value::Table(ch_table));
+    channels_table.insert(channel_name, toml_edit::Item::Table(ch_table));
 
     // Ensure parent directory exists
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
+    std::fs::write(config_path, doc.to_string())?;
     Ok(())
 }
 
 /// Remove a `[channels.<name>]` section from config.toml.
+///
+/// Mirrors `upsert_channel_config`: format-preserving via `toml_edit`, and
+/// callers must hold `AppState::config_write_lock`.
 pub(crate) fn remove_channel_config(
     config_path: &std::path::Path,
     channel_name: &str,
@@ -4794,17 +5061,13 @@ pub(crate) fn remove_channel_config(
         return Ok(());
     }
 
-    let mut doc: toml::Value = toml::from_str(&content)?;
+    let mut doc: toml_edit::DocumentMut = content.parse()?;
 
-    if let Some(channels) = doc
-        .as_table_mut()
-        .and_then(|r| r.get_mut("channels"))
-        .and_then(|c| c.as_table_mut())
-    {
+    if let Some(channels) = doc.get_mut("channels").and_then(|i| i.as_table_mut()) {
         channels.remove(channel_name);
     }
 
-    std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
+    std::fs::write(config_path, doc.to_string())?;
     Ok(())
 }
 
@@ -4847,11 +5110,29 @@ fn collect_installed_catalog_ids(state: &Arc<AppState>) -> std::collections::Has
 fn render_catalog_entry(
     entry: &librefang_extensions::McpCatalogEntry,
     installed_template_ids: &std::collections::HashSet<String>,
+    lang: &str,
 ) -> serde_json::Value {
+    // Pick the localized override (with `zh-TW` → `zh` soft fallback) and
+    // fall back to the English fields per-string when no entry / field is
+    // present.
+    let i18n_entry = entry.i18n.get(lang).or_else(|| {
+        lang.split_once('-')
+            .and_then(|(base, _)| entry.i18n.get(base))
+    });
+    let name = i18n_entry
+        .and_then(|e| e.name.as_deref())
+        .unwrap_or(&entry.name);
+    let description = i18n_entry
+        .and_then(|e| e.description.as_deref())
+        .unwrap_or(&entry.description);
+    let setup_instructions = i18n_entry
+        .and_then(|e| e.setup_instructions.as_deref())
+        .unwrap_or(&entry.setup_instructions);
+
     serde_json::json!({
         "id": entry.id,
-        "name": entry.name,
-        "description": entry.description,
+        "name": name,
+        "description": description,
         "icon": entry.icon,
         "category": entry.category.to_string(),
         "installed": installed_template_ids.contains(&entry.id),
@@ -4865,7 +5146,7 @@ fn render_catalog_entry(
             "get_url": e.get_url,
         })).collect::<Vec<_>>(),
         "has_oauth": entry.oauth.is_some(),
-        "setup_instructions": entry.setup_instructions,
+        "setup_instructions": setup_instructions,
     })
 }
 
@@ -4878,7 +5159,11 @@ fn render_catalog_entry(
         (status = 200, description = "MCP catalog entries", body = serde_json::Value)
     )
 )]
-pub async fn list_mcp_catalog(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn list_mcp_catalog(
+    State(state): State<Arc<AppState>>,
+    lang: Option<axum::Extension<RequestLanguage>>,
+) -> impl IntoResponse {
+    let lang = super::resolve_lang(lang.as_ref());
     let installed_ids = collect_installed_catalog_ids(&state);
 
     let catalog = state
@@ -4889,7 +5174,7 @@ pub async fn list_mcp_catalog(State(state): State<Arc<AppState>>) -> impl IntoRe
     let entries: Vec<serde_json::Value> = catalog
         .list()
         .iter()
-        .map(|e| render_catalog_entry(e, &installed_ids))
+        .map(|e| render_catalog_entry(e, &installed_ids, lang))
         .collect();
     Json(serde_json::json!({
         "entries": entries,
@@ -4911,7 +5196,9 @@ pub async fn list_mcp_catalog(State(state): State<Arc<AppState>>) -> impl IntoRe
 pub async fn get_mcp_catalog_entry(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    lang: Option<axum::Extension<RequestLanguage>>,
 ) -> impl IntoResponse {
+    let lang = super::resolve_lang(lang.as_ref());
     let installed_ids = collect_installed_catalog_ids(&state);
 
     let catalog = state
@@ -4922,7 +5209,7 @@ pub async fn get_mcp_catalog_entry(
     match catalog.get(&id) {
         Some(entry) => (
             StatusCode::OK,
-            Json(render_catalog_entry(entry, &installed_ids)),
+            Json(render_catalog_entry(entry, &installed_ids, lang)),
         ),
         None => ApiErrorResponse::not_found(format!("MCP catalog entry '{}' not found", id))
             .into_json_tuple(),
@@ -5502,5 +5789,182 @@ mod tests {
             Some(McpTransportEntry::Http { url }) => assert_eq!(url, "http://new:9090/mcp"),
             other => panic!("expected http transport, got {other:?}"),
         }
+    }
+
+    /// Regression for #3183: writing a channel section must not destroy
+    /// unrelated provider settings (or the user's comments and key order)
+    /// in `config.toml`. The previous `toml::Value` round-trip rebuilt the
+    /// entire document on every channel write, which dropped comments and
+    /// — combined with the missing `config_write_lock` — could clobber a
+    /// concurrent provider write from `POST /api/config/set`.
+    #[test]
+    fn upsert_channel_config_preserves_unrelated_sections_and_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let original = "\
+# Top-of-file comment that must survive channel writes
+api_port = 4545
+
+[providers.nim]
+# NVIDIA NIM provider — issue #3183 repro
+kind = \"openai-compat\"
+base_url = \"https://integrate.api.nvidia.com/v1\"
+api_key_env = \"NIM_API_KEY\"
+
+[channels.discord]
+bot_token_env = \"OLD_DISCORD_TOKEN\"
+";
+        std::fs::write(&config_path, original).unwrap();
+
+        let mut fields: HashMap<String, (String, FieldType)> = HashMap::new();
+        fields.insert(
+            "bot_token_env".to_string(),
+            ("DISCORD_BOT_TOKEN".to_string(), FieldType::Text),
+        );
+        fields.insert(
+            "guild_ids".to_string(),
+            ("123, 456".to_string(), FieldType::List),
+        );
+
+        upsert_channel_config(&config_path, "discord", &fields).expect("upsert should succeed");
+
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+
+        // Provider section must be intact — this is the original bug.
+        assert!(
+            raw.contains("[providers.nim]"),
+            "[providers.nim] section was dropped — got:\n{raw}"
+        );
+        assert!(
+            raw.contains("base_url = \"https://integrate.api.nvidia.com/v1\""),
+            "NIM base_url was dropped — got:\n{raw}"
+        );
+
+        // Comments and the top-level scalar must survive the rewrite.
+        assert!(
+            raw.contains("# Top-of-file comment that must survive channel writes"),
+            "top-level comment was dropped — got:\n{raw}"
+        );
+        assert!(
+            raw.contains("# NVIDIA NIM provider"),
+            "in-section comment was dropped — got:\n{raw}"
+        );
+        assert!(
+            raw.contains("api_port = 4545"),
+            "top-level scalar was dropped — got:\n{raw}"
+        );
+
+        // The new channel fields must be written with correct TOML types
+        // (list of strings, not list of integers — see the FieldType::List
+        // comment about Discord guild snowflakes).
+        #[derive(serde::Deserialize)]
+        struct Discord {
+            bot_token_env: String,
+            guild_ids: Vec<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Channels {
+            discord: Discord,
+        }
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            channels: Channels,
+        }
+        let parsed: Wrapper = toml::from_str(&raw).expect("config must round-trip");
+        assert_eq!(parsed.channels.discord.bot_token_env, "DISCORD_BOT_TOKEN");
+        assert_eq!(parsed.channels.discord.guild_ids, vec!["123", "456"]);
+    }
+
+    /// Companion to the upsert test: removing a channel must also leave
+    /// every other section untouched.
+    #[test]
+    fn remove_channel_config_preserves_unrelated_sections_and_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let original = "\
+# keep me
+[providers.nim]
+kind = \"openai-compat\"
+base_url = \"https://integrate.api.nvidia.com/v1\"
+
+[channels.discord]
+bot_token_env = \"DISCORD_BOT_TOKEN\"
+";
+        std::fs::write(&config_path, original).unwrap();
+
+        remove_channel_config(&config_path, "discord").expect("remove should succeed");
+
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            raw.contains("[providers.nim]"),
+            "[providers.nim] was dropped — got:\n{raw}"
+        );
+        assert!(
+            raw.contains("# keep me"),
+            "top-level comment was dropped — got:\n{raw}"
+        );
+        assert!(
+            !raw.contains("[channels.discord]"),
+            "channel section should have been removed — got:\n{raw}"
+        );
+    }
+
+    // ── escape_env_value tests (Bug #3790) ─────────────────────────────────
+
+    #[test]
+    fn escape_env_value_plain_value_unchanged() {
+        assert_eq!(escape_env_value("hello"), "hello");
+        assert_eq!(escape_env_value("sk-abc123"), "sk-abc123");
+    }
+
+    #[test]
+    fn escape_env_value_newline_becomes_backslash_n() {
+        let raw = "line1\nline2";
+        let escaped = escape_env_value(raw);
+        assert_eq!(escaped, "line1\\nline2");
+        // Must not contain a literal newline character.
+        assert!(!escaped.contains('\n'));
+    }
+
+    #[test]
+    fn escape_env_value_carriage_return_becomes_backslash_r() {
+        let raw = "val\r\nend";
+        let escaped = escape_env_value(raw);
+        assert_eq!(escaped, "val\\r\\nend");
+        assert!(!escaped.contains('\r'));
+        assert!(!escaped.contains('\n'));
+    }
+
+    #[test]
+    fn escape_env_value_backslash_is_doubled() {
+        let raw = r"C:\Users\secret";
+        let escaped = escape_env_value(raw);
+        assert_eq!(escaped, r"C:\\Users\\secret");
+    }
+
+    #[test]
+    fn escape_env_value_backslash_before_newline_double_escapes_correctly() {
+        // "\\\n" → the backslash must be doubled before the newline is escaped,
+        // producing "\\\\n" (a literal backslash-backslash-n), not "\\n".
+        let raw = "\\\n";
+        let escaped = escape_env_value(raw);
+        assert_eq!(escaped, "\\\\\\n");
+        assert!(!escaped.contains('\n'));
+    }
+
+    #[test]
+    fn write_secret_env_value_with_newline_stays_single_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("secrets.env");
+        write_secret_env(&path, "API_KEY", "val\nwith\nnewlines").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        // Must not inject additional key-looking lines.
+        let key_lines: Vec<&str> = content.lines().filter(|l| l.contains('=')).collect();
+        assert_eq!(key_lines.len(), 1, "expected 1 key line, got: {content:?}");
+        assert!(
+            key_lines[0].starts_with("API_KEY="),
+            "wrong key line: {}",
+            key_lines[0]
+        );
     }
 }

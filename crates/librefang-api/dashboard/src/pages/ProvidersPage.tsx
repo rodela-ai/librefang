@@ -2,6 +2,8 @@ import { useMutation } from "@tanstack/react-query";
 import { formatTime, formatDateTime } from "../lib/datetime";
 import { useMemo, useState, useCallback } from "react";
 import { useTranslation } from "react-i18next";
+import { AnimatePresence, motion } from "motion/react";
+import { tabContent } from "../lib/motion";
 import { createRegistryContent } from "../api";
 import type { ApiActionResponse, ProviderItem } from "../api";
 import { isProviderAvailable } from "../lib/status";
@@ -17,6 +19,7 @@ import { Badge, type BadgeVariant } from "../components/ui/Badge";
 import { Input } from "../components/ui/Input";
 import { Select } from "../components/ui/Select";
 import { Modal } from "../components/ui/Modal";
+import { DrawerPanel } from "../components/ui/DrawerPanel";
 import { useUIStore } from "../lib/store";
 import { useCreateShortcut } from "../lib/useCreateShortcut";
 import {
@@ -308,7 +311,7 @@ function ProviderCard({ provider: p, isSelected, isDefault, pendingId, viewMode,
 
   if (viewMode === "list") {
     return (
-      <Card hover padding="sm" className={`flex flex-col sm:flex-row items-start sm:items-center gap-3 sm:gap-4 group transition-all ${isSelected ? "ring-2 ring-brand" : ""}`}>
+      <Card hover padding="sm" onClick={() => onViewDetails(p)} className={`flex flex-col sm:flex-row items-start sm:items-center gap-3 sm:gap-4 group transition-all ${isSelected ? "ring-2 ring-brand" : ""}`}>
         <div className="flex items-center gap-3 w-full sm:w-auto">
           <button
             onClick={(e) => { e.stopPropagation(); onSelect(p.id, !isSelected); }}
@@ -372,19 +375,19 @@ function ProviderCard({ provider: p, isSelected, isDefault, pendingId, viewMode,
           {isConfigured ? (
             <>
               {!isDefault && (
-                <Button variant="ghost" size="sm" onClick={() => onSetDefault(p.id)} leftIcon={<Star className="w-3 h-3" />}>
+                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onSetDefault(p.id); }} leftIcon={<Star className="w-3 h-3" />}>
                   <span className="hidden sm:inline">{t("providers.set_as_default")}</span>
                 </Button>
               )}
-              <Button variant="ghost" size="sm" onClick={() => onConfigure(p)} leftIcon={<Pencil className="w-3 h-3" />}>
+              <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onConfigure(p); }} leftIcon={<Pencil className="w-3 h-3" />}>
                 <span className="hidden sm:inline">{t("common.edit")}</span>
               </Button>
-              <Button variant="ghost" size="sm" onClick={() => onDelete(p)} leftIcon={<Trash2 className="w-3 h-3 text-error" />}>
+              <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onDelete(p); }} leftIcon={<Trash2 className="w-3 h-3 text-error" />}>
                 <span className="hidden sm:inline text-error">{p.is_custom ? t("common.delete") : t("providers.remove_key")}</span>
               </Button>
               <Button
                 variant="secondary" size="sm"
-                onClick={() => onTest(p.id)}
+                onClick={(e) => { e.stopPropagation(); onTest(p.id); }}
                 disabled={pendingId === p.id}
                 leftIcon={pendingId === p.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
                 className="whitespace-nowrap"
@@ -393,11 +396,11 @@ function ProviderCard({ provider: p, isSelected, isDefault, pendingId, viewMode,
               </Button>
             </>
           ) : (
-            <Button variant="ghost" size="sm" onClick={() => onConfigure(p)} leftIcon={<Key className="w-3 h-3" />}>
+            <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onConfigure(p); }} leftIcon={<Key className="w-3 h-3" />}>
               <span className="hidden sm:inline">{t("providers.config")}</span>
             </Button>
           )}
-          <Button variant="ghost" size="sm" onClick={() => onViewDetails(p)}>
+          <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onViewDetails(p); }}>
             <ChevronRight className="w-4 h-4" />
           </Button>
         </div>
@@ -407,7 +410,7 @@ function ProviderCard({ provider: p, isSelected, isDefault, pendingId, viewMode,
 
   // Grid view
   return (
-    <Card hover padding="none" className={`relative flex flex-col overflow-hidden group transition-all ${isSelected ? "ring-2 ring-brand" : ""}`}>
+    <Card hover padding="none" onClick={() => onViewDetails(p)} className={`relative flex flex-col overflow-hidden group transition-all ${isSelected ? "ring-2 ring-brand" : ""}`}>
       {isCli && (
         <div className="absolute top-1.5 left-0 z-10 overflow-hidden w-20 h-20 pointer-events-none">
           <div className="absolute top-[12px] left-[-18px] w-[90px] text-center text-[9px] font-black uppercase tracking-wider text-text-dim bg-surface/80 border-y border-border-subtle rotate-[-45deg] py-px">
@@ -533,7 +536,7 @@ function ProviderCard({ provider: p, isSelected, isDefault, pendingId, viewMode,
               <Star className="w-3 h-3 mr-1 inline" />{t("providers.is_default")}
             </Badge>
           ) : isConfigured ? (
-            <button onClick={() => onSetDefault(p.id)} className="inline-flex items-center gap-1 text-[10px] font-bold text-brand/70 hover:text-brand cursor-pointer transition-colors">
+            <button onClick={(e) => { e.stopPropagation(); onSetDefault(p.id); }} className="inline-flex items-center gap-1 text-[10px] font-bold text-brand/70 hover:text-brand cursor-pointer transition-colors">
               <Star className="w-3 h-3" />{t("providers.set_as_default")}
             </button>
           ) : null}
@@ -543,15 +546,15 @@ function ProviderCard({ provider: p, isSelected, isDefault, pendingId, viewMode,
         <div className="flex gap-2 mt-auto">
           {isConfigured ? (
             <>
-              <Button variant="ghost" size="sm" onClick={() => onConfigure(p)} leftIcon={<Pencil className="w-3 h-3" />}>
+              <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onConfigure(p); }} leftIcon={<Pencil className="w-3 h-3" />}>
                 {t("common.edit")}
               </Button>
-              <Button variant="ghost" size="sm" onClick={() => onDelete(p)} leftIcon={<Trash2 className="w-3 h-3 text-error" />}>
+              <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onDelete(p); }} leftIcon={<Trash2 className="w-3 h-3 text-error" />}>
                 {p.is_custom ? t("common.delete") : t("providers.remove_key")}
               </Button>
               <Button
                 variant="secondary" size="sm"
-                onClick={() => onTest(p.id)}
+                onClick={(e) => { e.stopPropagation(); onTest(p.id); }}
                 disabled={pendingId === p.id}
                 leftIcon={pendingId === p.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
                 className="flex-1 whitespace-nowrap"
@@ -560,7 +563,7 @@ function ProviderCard({ provider: p, isSelected, isDefault, pendingId, viewMode,
               </Button>
             </>
           ) : (
-            <Button variant="ghost" size="sm" onClick={() => onConfigure(p)} leftIcon={<Key className="w-3 h-3" />} className="flex-1 whitespace-nowrap">
+            <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onConfigure(p); }} leftIcon={<Key className="w-3 h-3" />} className="flex-1 whitespace-nowrap">
               {t("providers.config")}
             </Button>
           )}
@@ -586,7 +589,7 @@ function DetailsModal({ provider, onClose, onTest, pendingId, t }: {
   const models = modelsQuery.data?.models ?? [];
 
   return (
-    <Modal isOpen onClose={onClose} title={provider.display_name || provider.id} size="lg">
+    <DrawerPanel isOpen onClose={onClose} title={provider.display_name || provider.id} size="lg">
       <div className="p-6 space-y-4">
         {/* Header info */}
         <div className="flex items-center gap-3">
@@ -611,6 +614,28 @@ function DetailsModal({ provider, onClose, onTest, pendingId, t }: {
               {provider.latency_ms ? `${provider.latency_ms}ms` : "-"}
             </p>
           </div>
+        </div>
+
+        {/* Model list — placed right under the count so users see what
+            actually counts toward the number rather than scrolling past
+            properties to find it. No inner scroll: the drawer's own
+            overflow-y-auto handles overflow. */}
+        <div className="space-y-3">
+          <h3 className="text-xs font-black uppercase tracking-wider text-text-dim">{t("providers.provider_models")}</h3>
+          {modelsQuery.isLoading ? (
+            <p className="text-xs text-text-dim">{t("common.loading")}</p>
+          ) : models.length === 0 ? (
+            <p className="text-xs text-text-dim">{t("providers.no_models_for_provider")}</p>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+              {models.map(m => (
+                <div key={m.id} className="flex items-center gap-2 p-2 rounded-lg bg-main/20 text-xs">
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${m.available ? "bg-success" : "bg-text-dim/30"}`} />
+                  <span className="truncate font-mono">{m.display_name || m.id}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Properties */}
@@ -656,25 +681,6 @@ function DetailsModal({ provider, onClose, onTest, pendingId, t }: {
           </div>
         </div>
 
-        {/* Model list */}
-        <div className="space-y-3">
-          <h3 className="text-xs font-black uppercase tracking-wider text-text-dim">{t("providers.provider_models")}</h3>
-          {modelsQuery.isLoading ? (
-            <p className="text-xs text-text-dim">{t("common.loading")}</p>
-          ) : models.length === 0 ? (
-            <p className="text-xs text-text-dim">{t("providers.no_models_for_provider")}</p>
-          ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-48 overflow-y-auto">
-              {models.map(m => (
-                <div key={m.id} className="flex items-center gap-2 p-2 rounded-lg bg-main/20 text-xs">
-                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${m.available ? "bg-success" : "bg-text-dim/30"}`} />
-                  <span className="truncate font-mono">{m.display_name || m.id}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
         {provider.error_message && (
           <div className="p-4 rounded-xl bg-error/10 border border-error/20">
             <h3 className="text-xs font-black uppercase tracking-wider text-error mb-2">{t("providers.error")}</h3>
@@ -694,7 +700,7 @@ function DetailsModal({ provider, onClose, onTest, pendingId, t }: {
           </Button>
         </div>
       </div>
-    </Modal>
+    </DrawerPanel>
   );
 }
 
@@ -1179,6 +1185,15 @@ export function ProvidersPage() {
     && config.urlInput === (config.provider.base_url || "")
     && config.proxyInput === (config.provider.proxy_url || "");
   const saveDisabled = !config.provider || config.saving || config.testing || isUnchanged;
+  // Local providers (Ollama / vLLM / LM Studio) declare `key_required: false`
+  // — for them, the Test button must NOT require a key, otherwise users have
+  // no way to verify their custom base_url. Issue #3138.
+  const testDisabled =
+    config.saving
+    || config.testing
+    || (config.provider?.key_required !== false
+        && !config.hasStoredKey
+        && !config.keyInput.trim());
 
   return (
     <div className="flex flex-col gap-6 transition-colors duration-300">
@@ -1239,14 +1254,26 @@ export function ProvidersPage() {
 
       {/* Tabs & Filter */}
       <div className="flex items-center justify-between gap-3 flex-wrap overflow-x-auto">
-        <div className="flex gap-1 p-1 bg-main/30 rounded-xl w-fit">
-          <button onClick={() => handleTabChange("configured")}
+        <div role="tablist" aria-label={t("providers.title", { defaultValue: "Providers" })} className="flex gap-1 p-1 bg-main/30 rounded-xl w-fit">
+          <button
+            id="providers-tab-configured"
+            role="tab"
+            aria-selected={activeTab === "configured"}
+            aria-controls="providers-panel"
+            tabIndex={activeTab === "configured" ? 0 : -1}
+            onClick={() => handleTabChange("configured")}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-colors ${activeTab === "configured" ? "bg-surface text-success shadow-sm" : "text-text-dim hover:text-text-main"}`}>
             <CheckCircle2 className="w-4 h-4" />
             {t("providers.configured")}
             <span className={`ml-1 px-1.5 py-0.5 rounded-full text-[10px] ${activeTab === "configured" ? "bg-success/20 text-success" : "bg-border-subtle text-text-dim"}`}>{configuredCount}</span>
           </button>
-          <button onClick={() => handleTabChange("unconfigured")}
+          <button
+            id="providers-tab-unconfigured"
+            role="tab"
+            aria-selected={activeTab === "unconfigured"}
+            aria-controls="providers-panel"
+            tabIndex={activeTab === "unconfigured" ? 0 : -1}
+            onClick={() => handleTabChange("unconfigured")}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-bold transition-colors ${activeTab === "unconfigured" ? "bg-surface text-brand shadow-sm" : "text-text-dim hover:text-text-main"}`}>
             <XCircle className="w-4 h-4" />
             {t("providers.unconfigured")}
@@ -1266,6 +1293,8 @@ export function ProvidersPage() {
         )}
       </div>
 
+      <AnimatePresence mode="wait">
+      <motion.div key={activeTab} id="providers-panel" role="tabpanel" aria-labelledby={`providers-tab-${activeTab}`} variants={tabContent} initial="initial" animate="animate" exit="exit" className="flex flex-col gap-4">
       {providersQuery.isLoading ? (
         <div className={viewMode === "grid" ? "grid gap-4 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 3xl:grid-cols-5 4xl:grid-cols-6" : "flex flex-col gap-2"}>
           {[1, 2, 3, 4, 5, 6].map((i) => <CardSkeleton key={i} />)}
@@ -1309,6 +1338,8 @@ export function ProvidersPage() {
           </div>
         </>
       )}
+      </motion.div>
+      </AnimatePresence>
 
       {/* Details Modal */}
       {detailsProvider && (
@@ -1322,7 +1353,7 @@ export function ProvidersPage() {
       )}
 
       {/* Config Modal */}
-      <Modal isOpen={!!config.provider} onClose={config.close} title={t("providers.configure_provider")} size="md">
+      <DrawerPanel isOpen={!!config.provider} onClose={config.close} title={t("providers.configure_provider")} size="md">
         {config.provider && (
           <div className="p-5 space-y-4">
             <div className="flex items-center gap-3 p-3 rounded-xl bg-main">
@@ -1352,6 +1383,12 @@ export function ProvidersPage() {
               <input type="text" value={config.urlInput} onChange={e => config.setUrlInput(e.target.value)}
                 placeholder="https://api.example.com/v1"
                 className="mt-1 w-full rounded-xl border border-border-subtle bg-main px-3 py-2 text-sm font-mono outline-none focus:border-brand focus:ring-1 focus:ring-brand/20" />
+              <p className="mt-1 text-[10px] text-text-dim/60 leading-snug">
+                {t("providers.base_url_hint", {
+                  defaultValue:
+                    "Bare host:port URLs (e.g. http://192.168.1.10:11434) will get /v1 appended automatically for OpenAI-compatible endpoints.",
+                })}
+              </p>
             </div>
 
             <div>
@@ -1381,7 +1418,7 @@ export function ProvidersPage() {
                 {config.saving ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : <Key className="w-4 h-4 mr-1" />}
                 {t("common.save")}
               </Button>
-              <Button variant="secondary" onClick={config.testKey} disabled={config.saving || config.testing || (!config.hasStoredKey && !config.keyInput.trim())}>
+              <Button variant="secondary" onClick={config.testKey} disabled={testDisabled}>
                 {config.testing ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : <Zap className="w-4 h-4 mr-1" />}
                 {t("providers.test")}
               </Button>
@@ -1403,7 +1440,7 @@ export function ProvidersPage() {
             )}
           </div>
         )}
-      </Modal>
+      </DrawerPanel>
 
       {/* Delete Confirmation Modal */}
       <Modal isOpen={!!deleteConfirmProvider} onClose={() => setDeleteConfirmProvider(null)}
@@ -1436,7 +1473,7 @@ export function ProvidersPage() {
       </Modal>
 
       {/* Create Provider Wizard */}
-      <Modal isOpen={showCreateForm} onClose={() => setShowCreateForm(false)} title={t("providers.add")} size="xl" hideCloseButton>
+      <DrawerPanel isOpen={showCreateForm} onClose={() => setShowCreateForm(false)} title={t("providers.add")} size="xl" hideCloseButton>
         <CreateProviderWizard
           onSubmit={async (values) => {
             await createRegistryContent("provider", values);
@@ -1446,7 +1483,7 @@ export function ProvidersPage() {
           }}
           onCancel={() => setShowCreateForm(false)}
         />
-      </Modal>
+      </DrawerPanel>
     </div>
   );
 }

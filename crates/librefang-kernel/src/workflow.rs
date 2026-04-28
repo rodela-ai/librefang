@@ -11,10 +11,11 @@
 //! Workflows are defined as Rust structs or loaded from JSON/TOML files.
 
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use librefang_types::agent::AgentId;
 use librefang_types::subagent::SubagentContext;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -169,8 +170,35 @@ pub enum ErrorMode {
 pub enum WorkflowRunState {
     Pending,
     Running,
+    /// The run was paused mid-execution and is waiting for an external
+    /// signal (an approval, a human-supplied input, etc.) before it
+    /// continues. Carry the `resume_token` the caller must present to
+    /// `WorkflowEngine::resume_run`, the wall-clock pause time, and a
+    /// human-readable reason for log/UI surfaces.
+    ///
+    /// Per-run snapshot data (step index, variable bindings, current
+    /// input) lives in fields on `WorkflowRun` rather than this variant
+    /// because runs are also used as raw step-history records — the
+    /// snapshot needs to be readable without matching on the state. See
+    /// #3335.
+    Paused {
+        resume_token: Uuid,
+        reason: String,
+        /// Wall-clock pause time. Surfaced in logs / UI today; future
+        /// follow-up will use this to drive a TTL-based GC sweep that
+        /// auto-expires Paused runs older than a configurable threshold
+        /// (#3335 GC follow-up).
+        paused_at: DateTime<Utc>,
+    },
     Completed,
     Failed,
+}
+
+impl WorkflowRunState {
+    /// True when the run is in the `Paused` variant.
+    pub fn is_paused(&self) -> bool {
+        matches!(self, WorkflowRunState::Paused { .. })
+    }
 }
 
 /// A running workflow instance.
@@ -196,6 +224,74 @@ pub struct WorkflowRun {
     pub started_at: DateTime<Utc>,
     /// Completed at.
     pub completed_at: Option<DateTime<Utc>>,
+    /// Pause request set externally via [`WorkflowEngine::pause_run`].
+    /// Honored at the next step boundary in
+    /// [`WorkflowEngine::execute_run_sequential`] — at which point this
+    /// field is consumed and the state transitions to
+    /// [`WorkflowRunState::Paused`] using the same `resume_token`. A
+    /// non-`None` value with state still `Running` means the engine has
+    /// not yet observed the request. See #3335.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_request: Option<PauseRequest>,
+    /// When the run is paused, the index of the next step to execute on
+    /// resume (so already-completed steps are not re-run). Set when the
+    /// engine honors a pause request; cleared when resume completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_step_index: Option<usize>,
+    /// Variable bindings as of the pause point. Restored into the local
+    /// `variables` map on resume so subsequent steps see the same
+    /// `{{var_name}}` substitutions they would have seen if the workflow
+    /// had not paused. `BTreeMap` rather than `HashMap` so the persisted
+    /// JSON has a stable key order — re-serializing a paused run twice
+    /// in a row produces byte-identical output, which keeps audit logs
+    /// and external snapshots clean.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub paused_variables: BTreeMap<String, String>,
+    /// `current_input` (output of the last completed step) as of the
+    /// pause point. Restored on resume so the paused step receives the
+    /// same `{{input}}` it would have seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_current_input: Option<String>,
+}
+
+impl WorkflowRun {
+    /// Wipe every pause-related field on the run. Called from terminal
+    /// transitions (Completed / Failed) so a Pause request lodged after
+    /// the loop's last boundary check or a snapshot left over from a
+    /// failed resume does not survive on a finished run as ghost data.
+    /// See #3335 review.
+    fn clear_pause_state(&mut self) {
+        self.pause_request = None;
+        self.paused_step_index = None;
+        self.paused_variables.clear();
+        self.paused_current_input = None;
+    }
+}
+
+/// External pause request lodged on a `WorkflowRun`. Pre-generates the
+/// `resume_token` so the caller can begin waiting for the corresponding
+/// approval / input artifact before the execution loop has actually
+/// transitioned the run to `WorkflowRunState::Paused`. The execution loop
+/// reuses this same token when it honors the request, guaranteeing the
+/// caller's resume call will match. See #3335.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PauseRequest {
+    /// Human-readable explanation surfaced in logs and UI.
+    ///
+    /// **SECURITY:** persisted plaintext to `workflow_runs.json` and
+    /// shown back to operators. Do not pass secrets, PII, or
+    /// approval-gating tokens here — use a side channel referenced by
+    /// id instead.
+    pub reason: String,
+    /// Token the caller must present to [`WorkflowEngine::resume_run`].
+    ///
+    /// **SECURITY:** today this is stored plaintext in `workflow_runs.json`
+    /// alongside the run. Anyone with read access to the daemon home
+    /// directory can recover live tokens and resume an arbitrary paused
+    /// workflow. Acceptable for the kernel-internal foundation in this
+    /// PR; the future REST handler must hash tokens at rest before that
+    /// surface ships. Tracked as a follow-up against #3335.
+    pub resume_token: Uuid,
 }
 
 /// Result from a single workflow step.
@@ -237,12 +333,18 @@ pub struct DryRunStep {
 }
 
 /// The workflow engine — manages definitions and executes pipeline runs.
+///
+/// `runs` is a [`DashMap`] so concurrent step writes for *different* runs
+/// take independent per-shard locks rather than serializing on a single
+/// global `RwLock` (#3717).  Reads and mutations within the same run still
+/// use the entry's exclusive shard lock, which is correct because a single
+/// run is always driven by one execution task at a time.
 #[derive(Clone)]
 pub struct WorkflowEngine {
     /// Registered workflow definitions.
     workflows: Arc<RwLock<HashMap<WorkflowId, Workflow>>>,
     /// Active and completed workflow runs.
-    runs: Arc<RwLock<HashMap<WorkflowRunId, WorkflowRun>>>,
+    runs: Arc<DashMap<WorkflowRunId, WorkflowRun>>,
     /// Optional path to persist completed/failed runs (`~/.librefang/workflow_runs.json`).
     persist_path: Option<PathBuf>,
 }
@@ -354,7 +456,7 @@ impl WorkflowEngine {
     pub fn new() -> Self {
         Self {
             workflows: Arc::new(RwLock::new(HashMap::new())),
-            runs: Arc::new(RwLock::new(HashMap::new())),
+            runs: Arc::new(DashMap::new()),
             persist_path: None,
         }
     }
@@ -365,7 +467,7 @@ impl WorkflowEngine {
     pub fn new_with_persistence(home_dir: &Path) -> Self {
         Self {
             workflows: Arc::new(RwLock::new(HashMap::new())),
-            runs: Arc::new(RwLock::new(HashMap::new())),
+            runs: Arc::new(DashMap::new()),
             persist_path: Some(home_dir.join("data").join("workflow_runs.json")),
         }
     }
@@ -386,14 +488,43 @@ impl WorkflowEngine {
         }
         let data = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read workflow runs: {e}"))?;
-        let runs: Vec<WorkflowRun> = serde_json::from_str(&data)
-            .map_err(|e| format!("Failed to parse workflow runs: {e}"))?;
-        let count = runs.len();
-        let mut map = self.runs.blocking_write();
-        for run in runs {
-            map.insert(run.id, run);
+
+        // Per-entry tolerant parse rather than `Vec<WorkflowRun>` in one
+        // shot: an old daemon reading a file written by a newer daemon
+        // may encounter rows with shapes it doesn't know (e.g. the
+        // tagged `Paused { ... }` variant added in #3335). Failing the
+        // whole load on the first bad row would drop *all* persisted
+        // history; instead, skip unrecognized rows with a WARN. Newer
+        // daemons reading older files still parse cleanly because every
+        // post-foundation field is `#[serde(default)]`.
+        let raw_rows: Vec<serde_json::Value> = serde_json::from_str(&data)
+            .map_err(|e| format!("Failed to parse workflow runs (top-level array): {e}"))?;
+        let total = raw_rows.len();
+        let mut runs: Vec<WorkflowRun> = Vec::with_capacity(total);
+        let mut skipped: usize = 0;
+        for (idx, row) in raw_rows.into_iter().enumerate() {
+            match serde_json::from_value::<WorkflowRun>(row) {
+                Ok(run) => runs.push(run),
+                Err(e) => {
+                    skipped += 1;
+                    warn!(
+                        index = idx,
+                        error = %e,
+                        "Skipping unrecognized workflow run during load (likely a newer schema; \
+                         downgrade-safe rollback)"
+                    );
+                }
+            }
         }
-        debug!(count, "Loaded persisted workflow runs from disk");
+
+        let count = runs.len();
+        for run in runs {
+            self.runs.insert(run.id, run);
+        }
+        debug!(
+            count,
+            skipped, total, "Loaded persisted workflow runs from disk"
+        );
         Ok(count)
     }
 
@@ -403,16 +534,28 @@ impl WorkflowEngine {
             Some(p) => p,
             None => return,
         };
-        // Acquire a blocking read — called from async context after state update.
-        let runs = self.runs.blocking_read();
-        let terminal: Vec<&WorkflowRun> = runs
-            .values()
+        // Collect terminal/paused runs from the DashMap.
+        // DashMap provides shared iteration via `iter()` without a global lock.
+        // Persist:
+        //   - terminal runs (Completed / Failed) for history queries
+        //   - paused runs (#3335) so a daemon restart preserves the
+        //     snapshot needed to resume — without this, a paused run
+        //     becomes unrecoverable on restart.
+        // Pending / Running are not persisted: they have no durable
+        // boundary on which to roll forward and would otherwise come
+        // back as zombie runs after a crash.
+        let terminal: Vec<WorkflowRun> = self
+            .runs
+            .iter()
             .filter(|r| {
                 matches!(
                     r.state,
-                    WorkflowRunState::Completed | WorkflowRunState::Failed
+                    WorkflowRunState::Completed
+                        | WorkflowRunState::Failed
+                        | WorkflowRunState::Paused { .. }
                 )
             })
+            .map(|r| r.value().clone())
             .collect();
         let data = match serde_json::to_string_pretty(&terminal) {
             Ok(d) => d,
@@ -421,20 +564,30 @@ impl WorkflowEngine {
                 return;
             }
         };
-        drop(runs);
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 warn!("Failed to create workflow runs dir: {e}");
                 return;
             }
         }
-        let tmp_path = path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp_path, data.as_bytes()) {
-            warn!("Failed to write workflow runs temp file: {e}");
-            return;
+        let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
+        {
+            use std::io::Write as _;
+            let write_result = (|| -> std::io::Result<()> {
+                let mut f = std::fs::File::create(&tmp_path)?;
+                f.write_all(data.as_bytes())?;
+                f.sync_all()?;
+                Ok(())
+            })();
+            if let Err(e) = write_result {
+                warn!("Failed to write workflow runs temp file: {e}");
+                let _ = std::fs::remove_file(&tmp_path);
+                return;
+            }
         }
         if let Err(e) = std::fs::rename(&tmp_path, path) {
             warn!("Failed to rename workflow runs file: {e}");
+            let _ = std::fs::remove_file(&tmp_path);
             return;
         }
         debug!("Persisted workflow runs to disk");
@@ -446,7 +599,10 @@ impl WorkflowEngine {
             return;
         }
         let engine = self.clone();
-        let _ = tokio::task::spawn_blocking(move || engine.persist_runs()).await;
+        match tokio::task::spawn_blocking(move || engine.persist_runs()).await {
+            Ok(()) => {}
+            Err(e) => warn!("workflow persist task panicked: {e}"),
+        }
     }
 
     /// Register a new workflow definition.
@@ -625,30 +781,34 @@ impl WorkflowEngine {
             error: None,
             started_at: Utc::now(),
             completed_at: None,
+            pause_request: None,
+            paused_step_index: None,
+            paused_variables: BTreeMap::new(),
+            paused_current_input: None,
         };
 
-        let mut runs = self.runs.write().await;
-        runs.insert(run_id, run);
+        self.runs.insert(run_id, run);
 
         // Evict oldest completed/failed runs when we exceed the cap
-        if runs.len() > Self::MAX_RETAINED_RUNS {
-            let mut evictable: Vec<(WorkflowRunId, DateTime<Utc>)> = runs
+        if self.runs.len() > Self::MAX_RETAINED_RUNS {
+            let mut evictable: Vec<(WorkflowRunId, DateTime<Utc>)> = self
+                .runs
                 .iter()
-                .filter(|(_, r)| {
+                .filter(|r| {
                     matches!(
                         r.state,
                         WorkflowRunState::Completed | WorkflowRunState::Failed
                     )
                 })
-                .map(|(id, r)| (*id, r.started_at))
+                .map(|r| (*r.key(), r.started_at))
                 .collect();
 
             // Sort oldest first
             evictable.sort_by_key(|(_, t)| *t);
 
-            let to_remove = runs.len() - Self::MAX_RETAINED_RUNS;
+            let to_remove = self.runs.len() - Self::MAX_RETAINED_RUNS;
             for (id, _) in evictable.into_iter().take(to_remove) {
-                runs.remove(&id);
+                self.runs.remove(&id);
                 debug!(run_id = %id, "Evicted old workflow run");
             }
         }
@@ -658,15 +818,58 @@ impl WorkflowEngine {
 
     /// Get the current state of a workflow run.
     pub async fn get_run(&self, run_id: WorkflowRunId) -> Option<WorkflowRun> {
-        self.runs.read().await.get(&run_id).cloned()
+        self.runs.get(&run_id).map(|r| r.clone())
+    }
+
+    /// Recover workflow runs left in `Running` or `Pending` state after a daemon crash.
+    ///
+    /// Called once at boot. Any run whose `started_at` age exceeds `stale_timeout` is
+    /// transitioned to `Failed` with a "Interrupted by daemon restart" error message.
+    /// Returns the number of runs recovered. A `stale_timeout` of zero is
+    /// treated as "feature disabled" and returns `0` without inspecting any
+    /// runs — kernel boot guards on this anyway, but keeping the no-op here
+    /// means a future direct caller can't accidentally fail every run.
+    pub fn recover_stale_running_runs(&self, stale_timeout: std::time::Duration) -> usize {
+        if stale_timeout.is_zero() {
+            return 0;
+        }
+        let now = Utc::now();
+        let stale_secs = stale_timeout.as_secs() as i64;
+        let mut recovered = 0usize;
+        // DashMap's `iter_mut` takes a per-shard write lock as the iterator
+        // visits each entry — no global write lock and no awaiting required.
+        for mut entry in self.runs.iter_mut() {
+            let run = entry.value_mut();
+            if !matches!(
+                run.state,
+                WorkflowRunState::Running | WorkflowRunState::Pending
+            ) {
+                continue;
+            }
+            let age = now.signed_duration_since(run.started_at).num_seconds();
+            if age < stale_secs {
+                continue;
+            }
+            warn!(
+                run_id = %run.id,
+                state = ?run.state,
+                started_at = %run.started_at,
+                age_secs = age,
+                "Recovering stale workflow run interrupted by daemon restart"
+            );
+            run.state = WorkflowRunState::Failed;
+            run.error = Some("Interrupted by daemon restart".to_string());
+            run.completed_at = Some(now);
+            run.clear_pause_state();
+            recovered += 1;
+        }
+        recovered
     }
 
     /// List all workflow runs (optionally filtered by state).
     pub async fn list_runs(&self, state_filter: Option<&str>) -> Vec<WorkflowRun> {
         self.runs
-            .read()
-            .await
-            .values()
+            .iter()
             .filter(|r| {
                 state_filter
                     .map(|f| match f {
@@ -678,7 +881,7 @@ impl WorkflowEngine {
                     })
                     .unwrap_or(true)
             })
-            .cloned()
+            .map(|r| r.value().clone())
             .collect()
     }
 
@@ -894,6 +1097,160 @@ impl WorkflowEngine {
         Ok(layers)
     }
 
+    /// Request that an in-flight workflow run pause at the next step
+    /// boundary. Returns the `resume_token` the caller must hand back to
+    /// [`Self::resume_run`].
+    ///
+    /// The actual transition to [`WorkflowRunState::Paused`] happens inside
+    /// the execution loop — the loop reads `pause_request` at the top of
+    /// each step iteration and, if set, snapshots
+    /// `(step_index, variables, current_input)` and updates the run's
+    /// state with the pre-generated token. Calling `pause_run` on an
+    /// already-paused run is idempotent: the existing token is returned.
+    ///
+    /// **DAG workflows fail-closed on pause.** Workflows whose steps use
+    /// `depends_on` are routed through the DAG executor, which does not
+    /// yet support pause. If `pause_run` is lodged on a DAG workflow,
+    /// the next `execute_run` call will mark the run `Failed` with a
+    /// "DAG pause not supported" error rather than silently completing.
+    /// Callers that don't know which executor a workflow targets should
+    /// either inspect `Workflow::steps` first or accept the fail-closed
+    /// behavior. Per-layer DAG pause checkpoints track as a follow-up
+    /// against #3335.
+    ///
+    /// **SECURITY:** the `reason` string is persisted plaintext to
+    /// `workflow_runs.json` and surfaced to operators. Do not include
+    /// secrets, PII, or approval-gating values in it.
+    ///
+    /// Errors:
+    /// - `Err` if the run is unknown.
+    /// - `Err` if the run has already finished (`Completed` / `Failed`).
+    pub async fn pause_run(
+        &self,
+        run_id: WorkflowRunId,
+        reason: impl Into<String>,
+    ) -> Result<Uuid, String> {
+        let mut run = self
+            .runs
+            .get_mut(&run_id)
+            .ok_or_else(|| format!("Workflow run not found: {run_id}"))?;
+        // We clone values out of the borrowed state before mutating, so we
+        // need to inspect the state in a block that ends before the write.
+        let existing_token = match &run.state {
+            WorkflowRunState::Pending | WorkflowRunState::Running => {
+                run.pause_request.as_ref().map(|r| r.resume_token)
+            }
+            WorkflowRunState::Paused { resume_token, .. } => return Ok(*resume_token),
+            WorkflowRunState::Completed | WorkflowRunState::Failed => {
+                return Err(format!(
+                    "Cannot pause workflow run {run_id}: state is terminal"
+                ))
+            }
+        };
+        if let Some(token) = existing_token {
+            return Ok(token);
+        }
+        let token = Uuid::new_v4();
+        run.pause_request = Some(PauseRequest {
+            reason: reason.into(),
+            resume_token: token,
+        });
+        Ok(token)
+    }
+
+    /// Resume a paused workflow run from where it stopped.
+    ///
+    /// Verifies that the run is in [`WorkflowRunState::Paused`] and that
+    /// the supplied `resume_token` matches the one stored on the run, then
+    /// restores the snapshotted bindings + input and re-enters
+    /// `execute_run_sequential` at the saved step index. The DAG path
+    /// does not yet support pause/resume — see
+    /// [`Self::execute_run_dag`] for the explicit guard.
+    ///
+    /// Returns the eventual workflow output (or step error) just like the
+    /// original `execute_run`.
+    pub async fn resume_run<F, Fut>(
+        &self,
+        run_id: WorkflowRunId,
+        resume_token: Uuid,
+        agent_resolver: impl Fn(&StepAgent) -> Option<(AgentId, String, bool)>,
+        send_message: F,
+    ) -> Result<String, String>
+    where
+        F: Fn(AgentId, String) -> Fut + Sync,
+        Fut: std::future::Future<Output = Result<(String, u64, u64), String>> + Send,
+    {
+        // Validate state + token, snapshot what we need, flip state back to
+        // Running, then drop the lock before re-entering execution. The
+        // execution path takes the same DashMap shard lock per step, so we
+        // must not hold it across the await.
+        let workflow = {
+            let workflow_id = {
+                let mut run = self
+                    .runs
+                    .get_mut(&run_id)
+                    .ok_or_else(|| format!("Workflow run not found: {run_id}"))?;
+                // Validate token inside a scope so the immutable borrow of
+                // `run.state` ends before we mutate it below.
+                {
+                    match &run.state {
+                        WorkflowRunState::Paused {
+                            resume_token: stored,
+                            ..
+                        } => {
+                            if *stored != resume_token {
+                                return Err(format!(
+                                    "Resume token mismatch for run {run_id}: presented token does not match stored token"
+                                ));
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "Cannot resume workflow run {run_id}: state is {other:?}, expected Paused"
+                            ));
+                        }
+                    }
+                }
+                // Flip back to Running and clear pause_request so the loop
+                // does not re-pause itself immediately.
+                run.state = WorkflowRunState::Running;
+                run.pause_request = None;
+                run.workflow_id
+                // `run` (DashMap shard guard) is dropped here
+            };
+            self.workflows
+                .read()
+                .await
+                .get(&workflow_id)
+                .cloned()
+                .ok_or_else(|| format!("Workflow definition {workflow_id} not found"))?
+        };
+
+        // Re-enter the sequential path. It looks at paused_step_index /
+        // paused_variables / paused_current_input on the run and resumes
+        // from there. The dispatch over has_dag_deps mirrors execute_run.
+        let has_dag_deps = workflow.steps.iter().any(|s| !s.depends_on.is_empty());
+        let result = if has_dag_deps {
+            // Symmetric guard with execute_run_dag's check; we only reach
+            // this path if a run was paused via the sequential path before
+            // the DAG branch was selected, which the DAG guard refuses to
+            // do today. Belt-and-suspenders so resume can never fan out
+            // into the unsupported DAG executor by accident.
+            Err(
+                "Resuming a workflow with DAG dependencies is not yet supported (#3335 follow-up)"
+                    .to_string(),
+            )
+        } else {
+            // `input` here is unused on the resume path because the loop
+            // pulls `paused_current_input` off the run when present.
+            self.execute_run_sequential(run_id, &workflow, "", &agent_resolver, &send_message)
+                .await
+        };
+        self.cleanup_terminal_pause_state(run_id).await;
+        self.persist_runs_async().await;
+        result
+    }
+
     /// Execute a workflow run step-by-step.
     ///
     /// This method takes a closure that sends messages to agents,
@@ -912,22 +1269,23 @@ impl WorkflowEngine {
         F: Fn(AgentId, String) -> Fut + Sync,
         Fut: std::future::Future<Output = Result<(String, u64, u64), String>> + Send,
     {
-        // Get the run and workflow
-        let (workflow, input) = {
-            let mut runs = self.runs.write().await;
-            let run = runs.get_mut(&run_id).ok_or("Workflow run not found")?;
+        // Get the run and workflow. Mutate the run's state synchronously
+        // via DashMap's get_mut, then drop the shard guard before the
+        // async workflow lookup.
+        let (workflow_id, input) = {
+            let mut run = self.runs.get_mut(&run_id).ok_or("Workflow run not found")?;
+            // Mutate via DerefMut — `mut` on the binding required to invoke it.
             run.state = WorkflowRunState::Running;
-
-            let workflow = self
-                .workflows
-                .read()
-                .await
-                .get(&run.workflow_id)
-                .ok_or("Workflow definition not found")?
-                .clone();
-
-            (workflow, run.input.clone())
+            (run.workflow_id, run.input.clone())
+            // `run` (DashMap RefMut shard guard) is dropped here
         };
+        let workflow = self
+            .workflows
+            .read()
+            .await
+            .get(&workflow_id)
+            .ok_or("Workflow definition not found")?
+            .clone();
 
         info!(
             run_id = %run_id,
@@ -938,19 +1296,34 @@ impl WorkflowEngine {
 
         // Check if any step has non-empty depends_on — if so, use DAG execution
         let has_dag_deps = workflow.steps.iter().any(|s| !s.depends_on.is_empty());
-        if has_dag_deps {
-            let result = self
-                .execute_run_dag(run_id, &workflow, &input, &agent_resolver, &send_message)
-                .await;
-            self.persist_runs_async().await;
-            return result;
-        }
-
-        let result = self
-            .execute_run_sequential(run_id, &workflow, &input, &agent_resolver, &send_message)
-            .await;
+        let result = if has_dag_deps {
+            self.execute_run_dag(run_id, &workflow, &input, &agent_resolver, &send_message)
+                .await
+        } else {
+            self.execute_run_sequential(run_id, &workflow, &input, &agent_resolver, &send_message)
+                .await
+        };
+        self.cleanup_terminal_pause_state(run_id).await;
         self.persist_runs_async().await;
         result
+    }
+
+    /// Wipe pause-related fields on the run if it ended up in a terminal
+    /// state (Completed / Failed). Called once at the bottom of
+    /// `execute_run` and `resume_run` so every terminal transition gets
+    /// the same cleanup, regardless of which inner branch (sequential
+    /// happy path, DAG entry-guard refuse, mid-step Failed) ran. Avoids
+    /// scattering identical clear-five-fields blocks across ~10 sites.
+    /// See #3335 review.
+    async fn cleanup_terminal_pause_state(&self, run_id: WorkflowRunId) {
+        if let Some(mut run) = self.runs.get_mut(&run_id) {
+            if matches!(
+                run.state,
+                WorkflowRunState::Completed | WorkflowRunState::Failed
+            ) {
+                run.clear_pause_state();
+            }
+        }
     }
 
     /// Sequential workflow execution (extracted for persistence wrapping).
@@ -966,12 +1339,70 @@ impl WorkflowEngine {
         F: Fn(AgentId, String) -> Fut + Sync,
         Fut: std::future::Future<Output = Result<(String, u64, u64), String>> + Send,
     {
-        let mut current_input = input.to_string();
+        // Resume snapshot: when the run was previously paused, the prior
+        // execution stored `(step_index, variables, current_input)` on the
+        // run before transitioning to `Paused`. Clone (not take!) so a
+        // mid-resume failure leaves the snapshot intact for future
+        // retry-from-failure paths — the snapshot is only authoritatively
+        // cleared on successful completion, see the Completed transition
+        // at the bottom of this function. The pause-mid-loop branch
+        // overwrites the snapshot with fresh values when it transitions
+        // back to Paused.
+        let (mut current_input, mut variables, mut i) = {
+            if let Some(run) = self.runs.get(&run_id) {
+                if let Some(saved_idx) = run.paused_step_index {
+                    let saved_vars: HashMap<String, String> = run
+                        .paused_variables
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    let saved_input = run.paused_current_input.clone().unwrap_or_default();
+                    debug!(
+                        run_id = %run_id,
+                        resume_step = saved_idx,
+                        var_count = saved_vars.len(),
+                        "Resuming workflow run from saved snapshot"
+                    );
+                    (saved_input, saved_vars, saved_idx)
+                } else {
+                    (input.to_string(), HashMap::new(), 0_usize)
+                }
+            } else {
+                (input.to_string(), HashMap::new(), 0_usize)
+            }
+        };
         let mut all_outputs: Vec<String> = Vec::new();
-        let mut variables: HashMap<String, String> = HashMap::new();
-        let mut i = 0;
 
         while i < workflow.steps.len() {
+            // Pause-request gate. Honored at the top of every step
+            // iteration so an in-flight step is allowed to finish before
+            // the run pauses — partial-step rollback would be a much
+            // larger feature than #3335 requires.
+            let pending_pause = self.runs.get(&run_id).and_then(|r| r.pause_request.clone());
+            if let Some(pause) = pending_pause {
+                if let Some(mut run) = self.runs.get_mut(&run_id) {
+                    run.paused_step_index = Some(i);
+                    run.paused_variables = variables
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    run.paused_current_input = Some(current_input.clone());
+                    run.pause_request = None;
+                    run.state = WorkflowRunState::Paused {
+                        resume_token: pause.resume_token,
+                        reason: pause.reason.clone(),
+                        paused_at: Utc::now(),
+                    };
+                }
+                info!(
+                    run_id = %run_id,
+                    resume_step = i,
+                    reason = %pause.reason,
+                    "Workflow run paused at step boundary"
+                );
+                return Ok(current_input);
+            }
+
             let step = &workflow.steps[i];
 
             debug!(
@@ -991,8 +1422,6 @@ impl WorkflowEngine {
                     // Snapshot step results for context injection
                     let prev_results: Vec<StepResult> = self
                         .runs
-                        .read()
-                        .await
                         .get(&run_id)
                         .map(|r| r.step_results.clone())
                         .unwrap_or_default();
@@ -1024,7 +1453,7 @@ impl WorkflowEngine {
                                 output_tokens,
                                 duration_ms,
                             };
-                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
                                 r.step_results.push(step_result);
                             }
 
@@ -1041,7 +1470,7 @@ impl WorkflowEngine {
                             info!(step = i + 1, name = %step.name, "Step skipped");
                         }
                         Err(e) => {
-                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
                                 r.state = WorkflowRunState::Failed;
                                 r.error = Some(e.clone());
                                 r.completed_at = Some(Utc::now());
@@ -1072,8 +1501,6 @@ impl WorkflowEngine {
                     // Snapshot step results once for all fan-out steps
                     let prev_results: Vec<StepResult> = self
                         .runs
-                        .read()
-                        .await
                         .get(&run_id)
                         .map(|r| r.step_results.clone())
                         .unwrap_or_default();
@@ -1126,7 +1553,7 @@ impl WorkflowEngine {
                                     output_tokens,
                                     duration_ms,
                                 };
-                                if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                                if let Some(mut r) = self.runs.get_mut(&run_id) {
                                     r.step_results.push(step_result);
                                 }
                                 if let Some(ref var) = fan_step.output_var {
@@ -1139,7 +1566,7 @@ impl WorkflowEngine {
                                 let error_msg =
                                     format!("FanOut step '{}' failed: {}", step_name, e);
                                 warn!(%error_msg);
-                                if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                                if let Some(mut r) = self.runs.get_mut(&run_id) {
                                     r.state = WorkflowRunState::Failed;
                                     r.error = Some(error_msg.clone());
                                     r.completed_at = Some(Utc::now());
@@ -1152,7 +1579,7 @@ impl WorkflowEngine {
                                     step_name, fan_step.timeout_secs
                                 );
                                 warn!(%error_msg);
-                                if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                                if let Some(mut r) = self.runs.get_mut(&run_id) {
                                     r.state = WorkflowRunState::Failed;
                                     r.error = Some(error_msg.clone());
                                     r.completed_at = Some(Utc::now());
@@ -1178,8 +1605,6 @@ impl WorkflowEngine {
                     // so downstream steps can parse individual fan-out results programmatically.
                     let step_results: Vec<StepResult> = self
                         .runs
-                        .read()
-                        .await
                         .get(&run_id)
                         .map(|r| r.step_results.clone())
                         .unwrap_or_default();
@@ -1236,8 +1661,6 @@ impl WorkflowEngine {
                         Self::expand_variables(&step.prompt_template, &current_input, &variables);
                     let prev_results: Vec<StepResult> = self
                         .runs
-                        .read()
-                        .await
                         .get(&run_id)
                         .map(|r| r.step_results.clone())
                         .unwrap_or_default();
@@ -1269,7 +1692,7 @@ impl WorkflowEngine {
                                 output_tokens,
                                 duration_ms,
                             };
-                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
                                 r.step_results.push(step_result);
                             }
                             if let Some(ref var) = step.output_var {
@@ -1280,7 +1703,7 @@ impl WorkflowEngine {
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
                                 r.state = WorkflowRunState::Failed;
                                 r.error = Some(e.clone());
                                 r.completed_at = Some(Utc::now());
@@ -1308,8 +1731,6 @@ impl WorkflowEngine {
                         // Re-snapshot step results each iteration (accumulates loop outputs)
                         let prev_results: Vec<StepResult> = self
                             .runs
-                            .read()
-                            .await
                             .get(&run_id)
                             .map(|r| r.step_results.clone())
                             .unwrap_or_default();
@@ -1345,7 +1766,7 @@ impl WorkflowEngine {
                                     output_tokens,
                                     duration_ms,
                                 };
-                                if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                                if let Some(mut r) = self.runs.get_mut(&run_id) {
                                     r.step_results.push(step_result);
                                 }
 
@@ -1371,7 +1792,7 @@ impl WorkflowEngine {
                             }
                             Ok(None) => break,
                             Err(e) => {
-                                if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                                if let Some(mut r) = self.runs.get_mut(&run_id) {
                                     r.state = WorkflowRunState::Failed;
                                     r.error = Some(e.clone());
                                     r.completed_at = Some(Utc::now());
@@ -1391,12 +1812,20 @@ impl WorkflowEngine {
             i += 1;
         }
 
-        // Mark workflow as completed
+        // Mark workflow as completed. Clear the pause snapshot fields and
+        // any orphan `pause_request` that may have been lodged after the
+        // last step boundary check — a pause requested between the loop's
+        // final iteration and this transition would otherwise survive on a
+        // Completed run as dead data.
         let final_output = current_input.clone();
-        if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+        if let Some(mut r) = self.runs.get_mut(&run_id) {
             r.state = WorkflowRunState::Completed;
             r.output = Some(final_output.clone());
             r.completed_at = Some(Utc::now());
+            r.pause_request = None;
+            r.paused_step_index = None;
+            r.paused_variables.clear();
+            r.paused_current_input = None;
         }
 
         info!(run_id = %run_id, "Workflow completed successfully");
@@ -1421,6 +1850,39 @@ impl WorkflowEngine {
         F: Fn(AgentId, String) -> Fut + Sync,
         Fut: std::future::Future<Output = Result<(String, u64, u64), String>> + Send,
     {
+        // Pause/resume support is sequential-path only in #3335. If a pause
+        // request was lodged before the engine routed into the DAG branch,
+        // refuse cleanly rather than silently dropping the request — the
+        // DAG executor would never observe `pause_request` and the run
+        // would just complete normally, leaving the caller's `resume_run`
+        // call hanging. The follow-up to add per-layer pause checkpoints
+        // tracks against #3335.
+        let dag_pause_requested = self
+            .runs
+            .get(&run_id)
+            .and_then(|r| r.pause_request.as_ref().map(|p| p.reason.clone()));
+        if let Some(reason) = dag_pause_requested {
+            // Mark the run Failed and consume the lingering pause_request
+            // before returning. Without this the run stays Running with
+            // `pause_request: Some(_)` forever, looking like a live
+            // workflow that just never executes — and `cleanup_terminal_pause_state`
+            // (called by execute_run after we return) wouldn't run because
+            // state isn't terminal. Set Failed so the cleanup pass picks it up.
+            if let Some(mut run) = self.runs.get_mut(&run_id) {
+                run.state = WorkflowRunState::Failed;
+                run.error = Some(format!(
+                    "DAG workflow refused to start: pause requested ({reason}) \
+                     but pause/resume is supported on the sequential path only \
+                     (#3335 follow-up)"
+                ));
+                run.completed_at = Some(Utc::now());
+            }
+            return Err(format!(
+                "Pause requested ({reason}) but the workflow uses DAG dependencies; \
+                 pause/resume is supported on the sequential path only (#3335 follow-up)"
+            ));
+        }
+
         let layers = Self::topological_sort(&workflow.steps)?;
         let mut variables: HashMap<String, String> = HashMap::new();
         // Track which step names have failed so we can skip dependents
@@ -1453,7 +1915,7 @@ impl WorkflowEngine {
                         ErrorMode::Fail => {
                             let error_msg =
                                 format!("Step '{}' skipped: dependency failed", step.name);
-                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
                                 r.state = WorkflowRunState::Failed;
                                 r.error = Some(error_msg.clone());
                                 r.completed_at = Some(Utc::now());
@@ -1493,7 +1955,7 @@ impl WorkflowEngine {
                             output_tokens,
                             duration_ms,
                         };
-                        if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                        if let Some(mut r) = self.runs.get_mut(&run_id) {
                             r.step_results.push(step_result);
                         }
                         if let Some(ref var) = step.output_var {
@@ -1513,7 +1975,7 @@ impl WorkflowEngine {
                     Err(e) => {
                         failed_steps.insert(step.name.clone());
                         if matches!(step.error_mode, ErrorMode::Fail) {
-                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
                                 r.state = WorkflowRunState::Failed;
                                 r.error = Some(e.clone());
                                 r.completed_at = Some(Utc::now());
@@ -1633,7 +2095,7 @@ impl WorkflowEngine {
                                 output_tokens,
                                 duration_ms: step_duration_ms,
                             };
-                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
                                 r.step_results.push(step_result);
                             }
                             if let Some(ref var) = step.output_var {
@@ -1652,7 +2114,7 @@ impl WorkflowEngine {
                         }
                         Err(e) => {
                             failed_steps.insert(step_name.clone());
-                            if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+                            if let Some(mut r) = self.runs.get_mut(&run_id) {
                                 r.state = WorkflowRunState::Failed;
                                 r.error = Some(e.clone());
                                 r.completed_at = Some(Utc::now());
@@ -1672,7 +2134,7 @@ impl WorkflowEngine {
         }
 
         // Mark workflow as completed
-        if let Some(r) = self.runs.write().await.get_mut(&run_id) {
+        if let Some(mut r) = self.runs.get_mut(&run_id) {
             r.state = WorkflowRunState::Completed;
             r.output = Some(last_output.clone());
             r.completed_at = Some(Utc::now());
@@ -3732,6 +4194,10 @@ prompt_template = "do {{x}}"
             error: None,
             started_at: Utc::now(),
             completed_at: Some(Utc::now()),
+            pause_request: None,
+            paused_step_index: None,
+            paused_variables: BTreeMap::new(),
+            paused_current_input: None,
         }
     }
 
@@ -3751,11 +4217,8 @@ prompt_template = "do {{x}}"
         // Persist runs from one engine instance.
         {
             let engine = WorkflowEngine::new_with_persistence(tmp.path());
-            {
-                let mut runs = engine.runs.blocking_write();
-                runs.insert(run_completed.id, run_completed);
-                runs.insert(run_failed.id, run_failed);
-            }
+            engine.runs.insert(run_completed.id, run_completed);
+            engine.runs.insert(run_failed.id, run_failed);
             engine.persist_runs();
         }
 
@@ -3765,15 +4228,17 @@ prompt_template = "do {{x}}"
             let count = engine.load_runs().unwrap();
             assert_eq!(count, 2);
 
-            let runs = engine.runs.blocking_read();
-            let c = runs.get(&completed_id).expect("completed run missing");
+            let c = engine
+                .runs
+                .get(&completed_id)
+                .expect("completed run missing");
             assert!(matches!(c.state, WorkflowRunState::Completed));
             assert_eq!(c.workflow_name, "persist-test");
             assert_eq!(c.output.as_deref(), Some("final output"));
             assert_eq!(c.step_results.len(), 1);
             assert_eq!(c.step_results[0].step_name, "step-1");
 
-            let f = runs.get(&failed_id).expect("failed run missing");
+            let f = engine.runs.get(&failed_id).expect("failed run missing");
             assert!(matches!(f.state, WorkflowRunState::Failed));
             assert_eq!(f.error.as_deref(), Some("something went wrong"));
         }
@@ -3795,17 +4260,18 @@ prompt_template = "do {{x}}"
             error: None,
             started_at: Utc::now(),
             completed_at: None,
+            pause_request: None,
+            paused_step_index: None,
+            paused_variables: BTreeMap::new(),
+            paused_current_input: None,
         };
         let running_id = running.id;
 
         // Persist — should only write the completed run, not the running one.
         {
             let engine = WorkflowEngine::new_with_persistence(tmp.path());
-            {
-                let mut runs = engine.runs.blocking_write();
-                runs.insert(completed.id, completed);
-                runs.insert(running.id, running);
-            }
+            engine.runs.insert(completed.id, completed);
+            engine.runs.insert(running.id, running);
             engine.persist_runs();
         }
 
@@ -3815,9 +4281,8 @@ prompt_template = "do {{x}}"
             let count = engine.load_runs().unwrap();
             assert_eq!(count, 1);
 
-            let runs = engine.runs.blocking_read();
-            assert!(runs.contains_key(&completed_id));
-            assert!(!runs.contains_key(&running_id));
+            assert!(engine.runs.contains_key(&completed_id));
+            assert!(!engine.runs.contains_key(&running_id));
         }
     }
 
@@ -3916,5 +4381,372 @@ prompt_template = "do {{x}}"
         assert!(!evaluate_condition("", "hello"));
         // Both empty
         assert!(evaluate_condition("", ""));
+    }
+
+    // -- #3335 pause / resume tests ----------------------------------------
+
+    #[tokio::test]
+    async fn pause_after_first_step_then_resume_finishes_workflow() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let engine = Arc::new(WorkflowEngine::new());
+        let wf_id = engine.register(test_workflow()).await;
+        let run_id = engine
+            .create_run(wf_id, "raw data".to_string())
+            .await
+            .unwrap();
+
+        // Shared state: capture the resume token from inside the sender so
+        // the test can present it later. The first sender invocation
+        // triggers `pause_run` so the loop honors the request *before*
+        // step 2 — verifying that pause respects step boundaries.
+        let captured_token = Arc::new(std::sync::Mutex::new(None::<Uuid>));
+        let pause_requested = Arc::new(AtomicBool::new(false));
+
+        let engine_for_sender = Arc::clone(&engine);
+        let captured_for_sender = Arc::clone(&captured_token);
+        let pause_for_sender = Arc::clone(&pause_requested);
+
+        let sender = move |_id: AgentId, msg: String| {
+            let engine = Arc::clone(&engine_for_sender);
+            let captured = Arc::clone(&captured_for_sender);
+            let pause_flag = Arc::clone(&pause_for_sender);
+            async move {
+                if !pause_flag.swap(true, Ordering::SeqCst) {
+                    let token = engine
+                        .pause_run(run_id, "test pause request")
+                        .await
+                        .expect("pause_run should succeed on a Running workflow");
+                    *captured.lock().unwrap() = Some(token);
+                }
+                Ok((format!("Processed: {msg}"), 100_u64, 50_u64))
+            }
+        };
+
+        // First execute_run: runs step 1, sender requests pause, loop
+        // honors at the next step boundary (before step 2).
+        engine
+            .execute_run(run_id, mock_resolver, sender)
+            .await
+            .expect("execute_run should pause cleanly without erroring");
+
+        let run = engine.get_run(run_id).await.unwrap();
+        assert!(
+            matches!(run.state, WorkflowRunState::Paused { .. }),
+            "expected Paused, got {:?}",
+            run.state
+        );
+        assert_eq!(
+            run.paused_step_index,
+            Some(1),
+            "should pause before step index 1 (step 2)"
+        );
+        assert_eq!(
+            run.step_results.len(),
+            1,
+            "exactly one step should have completed before the pause"
+        );
+
+        let token = captured_token
+            .lock()
+            .unwrap()
+            .expect("sender should have captured a token");
+
+        // Resume: replay from saved snapshot, executing the remaining step.
+        let sender_resume = |_id: AgentId, msg: String| async move {
+            Ok((format!("Processed: {msg}"), 100_u64, 50_u64))
+        };
+        let result = engine
+            .resume_run(run_id, token, mock_resolver, sender_resume)
+            .await
+            .expect("resume_run should succeed");
+        assert!(result.contains("Processed:"));
+
+        let run = engine.get_run(run_id).await.unwrap();
+        assert!(
+            matches!(run.state, WorkflowRunState::Completed),
+            "expected Completed, got {:?}",
+            run.state
+        );
+        assert_eq!(run.step_results.len(), 2);
+        assert!(
+            run.paused_step_index.is_none(),
+            "snapshot should be cleared after resume"
+        );
+        assert!(run.paused_variables.is_empty());
+        assert!(run.paused_current_input.is_none());
+    }
+
+    #[tokio::test]
+    async fn resume_run_with_wrong_token_is_rejected() {
+        let engine = WorkflowEngine::new();
+        let wf_id = engine.register(test_workflow()).await;
+        let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
+
+        // Pause-before-execute: loop will pause at step 0 immediately,
+        // giving us a Paused state with a known token.
+        let real_token = engine
+            .pause_run(run_id, "before-start pause")
+            .await
+            .unwrap();
+        let sender = |_id: AgentId, msg: String| async move {
+            Ok((format!("Processed: {msg}"), 1_u64, 1_u64))
+        };
+        engine
+            .execute_run(run_id, mock_resolver, sender)
+            .await
+            .unwrap();
+
+        let run = engine.get_run(run_id).await.unwrap();
+        assert!(matches!(run.state, WorkflowRunState::Paused { .. }));
+
+        let bogus_token = Uuid::new_v4();
+        assert_ne!(bogus_token, real_token);
+        let sender2 = |_id: AgentId, msg: String| async move {
+            Ok((format!("Processed: {msg}"), 1_u64, 1_u64))
+        };
+        let err = engine
+            .resume_run(run_id, bogus_token, mock_resolver, sender2)
+            .await
+            .expect_err("resume_run with wrong token must error");
+        assert!(err.contains("token"), "error should mention token: {err}");
+
+        // Run is still Paused — a failed resume attempt does not flip state.
+        let run = engine.get_run(run_id).await.unwrap();
+        assert!(matches!(run.state, WorkflowRunState::Paused { .. }));
+    }
+
+    #[tokio::test]
+    async fn resume_run_on_non_paused_run_is_rejected() {
+        let engine = WorkflowEngine::new();
+        let wf_id = engine.register(test_workflow()).await;
+        let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
+        // No pause requested — run is in Pending.
+        let sender = |_id: AgentId, msg: String| async move {
+            Ok((format!("Processed: {msg}"), 1_u64, 1_u64))
+        };
+        let err = engine
+            .resume_run(run_id, Uuid::new_v4(), mock_resolver, sender)
+            .await
+            .expect_err("resume_run on non-paused run must error");
+        assert!(
+            err.contains("expected Paused"),
+            "error should mention required state: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paused_run_round_trips_through_persist_and_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original_token: Uuid;
+        let original_run_id: WorkflowRunId;
+
+        // Phase 1: build a paused run on engine instance #1, then persist.
+        {
+            let engine = Arc::new(WorkflowEngine::new_with_persistence(tmp.path()));
+            let wf_id = engine.register(test_workflow()).await;
+            let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
+            original_run_id = run_id;
+            original_token = engine
+                .pause_run(run_id, "before-start pause")
+                .await
+                .unwrap();
+            let sender = |_id: AgentId, msg: String| async move {
+                Ok((format!("Processed: {msg}"), 1_u64, 1_u64))
+            };
+            engine
+                .execute_run(run_id, mock_resolver, sender)
+                .await
+                .unwrap();
+            // `execute_run` ends with `persist_runs_async().await`, which
+            // routes through `spawn_blocking` and respects the runtime.
+            // Awaiting `execute_run` already implies the persist completed.
+        }
+
+        // Phase 2: load from disk into a fresh engine, verify the
+        // Paused-state run came back with its token + snapshot intact.
+        // `load_runs` uses `blocking_write` internally, so wrap in
+        // `block_in_place` (requires multi-thread runtime, which this
+        // test selects via the `flavor` attribute).
+        let engine = WorkflowEngine::new_with_persistence(tmp.path());
+        let count = tokio::task::block_in_place(|| engine.load_runs()).unwrap();
+        assert_eq!(count, 1);
+        let run = engine.get_run(original_run_id).await.unwrap();
+        match &run.state {
+            WorkflowRunState::Paused { resume_token, .. } => {
+                assert_eq!(
+                    *resume_token, original_token,
+                    "persisted resume_token must match across daemon restart"
+                );
+            }
+            other => panic!("expected Paused after reload, got {:?}", other),
+        }
+        assert_eq!(run.paused_step_index, Some(0));
+    }
+
+    #[tokio::test]
+    async fn pause_request_on_dag_workflow_returns_explicit_error() {
+        let engine = Arc::new(WorkflowEngine::new());
+        // Build a 2-step workflow whose second step `depends_on` the
+        // first — that's enough for `execute_run` to route into the
+        // DAG executor.
+        let wf = Workflow {
+            id: WorkflowId::new(),
+            name: "dag".into(),
+            description: "".into(),
+            steps: vec![
+                WorkflowStep {
+                    name: "a".into(),
+                    agent: StepAgent::ByName { name: "x".into() },
+                    prompt_template: "{{input}}".into(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 30,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                    inherit_context: None,
+                    depends_on: vec![],
+                },
+                WorkflowStep {
+                    name: "b".into(),
+                    agent: StepAgent::ByName { name: "y".into() },
+                    prompt_template: "{{input}}".into(),
+                    mode: StepMode::Sequential,
+                    timeout_secs: 30,
+                    error_mode: ErrorMode::Fail,
+                    output_var: None,
+                    inherit_context: None,
+                    depends_on: vec!["a".into()],
+                },
+            ],
+            created_at: Utc::now(),
+            layout: None,
+        };
+        let wf_id = engine.register(wf).await;
+        let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
+
+        // Lodge a pause request *before* execute_run — DAG executor must
+        // refuse cleanly rather than silently dropping the request.
+        let _ = engine.pause_run(run_id, "dag pause").await.unwrap();
+        let sender = |_id: AgentId, msg: String| async move {
+            Ok((format!("Processed: {msg}"), 1_u64, 1_u64))
+        };
+        let err = engine
+            .execute_run(run_id, mock_resolver, sender)
+            .await
+            .expect_err("DAG executor with pause request must return an explicit error");
+        assert!(
+            err.contains("DAG"),
+            "error should mention DAG limitation: {err}"
+        );
+
+        // Refuse path must also flip the run to Failed and clear the
+        // lingering pause_request — otherwise a buggy caller sees a run
+        // stuck in Running with a pause_request that nothing will ever
+        // honor (review feedback on #3418).
+        let run = engine.get_run(run_id).await.unwrap();
+        assert!(
+            matches!(run.state, WorkflowRunState::Failed),
+            "DAG refuse must mark the run Failed, got {:?}",
+            run.state
+        );
+        assert!(
+            run.pause_request.is_none(),
+            "pause_request must be cleared after DAG refuse"
+        );
+        assert!(run.error.as_deref().unwrap_or("").contains("DAG"));
+    }
+
+    #[tokio::test]
+    async fn pause_run_is_idempotent_returns_same_token() {
+        let engine = WorkflowEngine::new();
+        let wf_id = engine.register(test_workflow()).await;
+        let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
+
+        let token1 = engine.pause_run(run_id, "first").await.unwrap();
+        let token2 = engine.pause_run(run_id, "second").await.unwrap();
+        let token3 = engine.pause_run(run_id, "third").await.unwrap();
+        assert_eq!(token1, token2);
+        assert_eq!(token2, token3);
+
+        // Reason from the *first* call wins — later calls must not
+        // overwrite the message that surfaces in logs / UI.
+        let run = engine.get_run(run_id).await.unwrap();
+        let lodged = run.pause_request.expect("request should be present");
+        assert_eq!(lodged.reason, "first");
+    }
+
+    #[tokio::test]
+    async fn resume_run_after_completion_is_rejected() {
+        let engine = Arc::new(WorkflowEngine::new());
+        let wf_id = engine.register(test_workflow()).await;
+        let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
+
+        // Pause-before-execute → loop pauses at step 0 → resume runs
+        // the workflow to completion.
+        let token = engine.pause_run(run_id, "before-start").await.unwrap();
+        let sender = |_id: AgentId, msg: String| async move {
+            Ok((format!("Processed: {msg}"), 1_u64, 1_u64))
+        };
+        engine
+            .execute_run(run_id, mock_resolver, sender)
+            .await
+            .unwrap();
+        let sender2 = |_id: AgentId, msg: String| async move {
+            Ok((format!("Processed: {msg}"), 1_u64, 1_u64))
+        };
+        engine
+            .resume_run(run_id, token, mock_resolver, sender2)
+            .await
+            .unwrap();
+
+        // Run is now Completed. A second resume_run with the same token
+        // must error rather than silently re-running the workflow.
+        let run = engine.get_run(run_id).await.unwrap();
+        assert!(matches!(run.state, WorkflowRunState::Completed));
+        let sender3 = |_id: AgentId, msg: String| async move {
+            Ok((format!("Processed: {msg}"), 1_u64, 1_u64))
+        };
+        let err = engine
+            .resume_run(run_id, token, mock_resolver, sender3)
+            .await
+            .expect_err("double-resume on a completed run must error");
+        assert!(
+            err.contains("expected Paused"),
+            "error should explain state mismatch: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_then_execute_on_pending_pauses_at_step_zero() {
+        let engine = WorkflowEngine::new();
+        let wf_id = engine.register(test_workflow()).await;
+        let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
+
+        // Run is Pending — pause is lodged before any step has executed.
+        let token = engine.pause_run(run_id, "pre-start").await.unwrap();
+        let sender = |_id: AgentId, msg: String| async move {
+            Ok((format!("Processed: {msg}"), 1_u64, 1_u64))
+        };
+        engine
+            .execute_run(run_id, mock_resolver, sender)
+            .await
+            .expect("pause-at-zero path must not error");
+
+        let run = engine.get_run(run_id).await.unwrap();
+        match &run.state {
+            WorkflowRunState::Paused { resume_token, .. } => {
+                assert_eq!(*resume_token, token);
+            }
+            other => panic!("expected Paused, got {:?}", other),
+        }
+        assert_eq!(
+            run.paused_step_index,
+            Some(0),
+            "pre-start pause should snapshot at step index 0"
+        );
+        assert!(
+            run.step_results.is_empty(),
+            "no steps should have executed before the pause"
+        );
     }
 }

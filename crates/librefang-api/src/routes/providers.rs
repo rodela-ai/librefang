@@ -91,6 +91,42 @@ pub async fn list_models(
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
 
+    // Pre-compute the live-discovered model ID set per local provider so we
+    // can hide static catalog entries whose IDs aren't actually exposed by
+    // the user's running daemon. Issue #3191: a user pointing the `ollama`
+    // provider slot at Lemonade Server saw `gemma4` (a real Ollama tag, but
+    // not on Lemonade) listed in the Models page, picked it, and got
+    // "model not found" from the chat call. The catalog still ships static
+    // entries for upstream-known Ollama models — those are correct for an
+    // actual Ollama install, but wrong for any other OpenAI-compatible
+    // server that happens to be configured under the same provider slot.
+    //
+    // Policy:
+    //   - probe cache hit + reachable + non-empty discovered list → only
+    //     keep catalog entries whose ID matches a discovered name.
+    //   - probe failed / cache miss → keep all static entries (don't make
+    //     things worse than the pre-fix state when we can't see live).
+    //   - Custom-tier models (user-added via /api/models/custom) always pass
+    //     through — they're explicit user intent, not catalog inheritance.
+    use std::collections::HashSet;
+    let live_models_per_provider: std::collections::HashMap<String, HashSet<String>> = catalog
+        .list_providers()
+        .iter()
+        .filter(|p| librefang_runtime::provider_health::is_local_provider(&p.id))
+        .filter_map(|p| {
+            let probe = state.provider_probe_cache.get(&p.id)?;
+            if !probe.reachable || probe.discovered_models.is_empty() {
+                return None;
+            }
+            let set: HashSet<String> = probe
+                .discovered_models
+                .iter()
+                .map(|s| s.to_lowercase())
+                .collect();
+            Some((p.id.to_lowercase(), set))
+        })
+        .collect();
+
     let models: Vec<serde_json::Value> = catalog
         .list_models()
         .iter()
@@ -113,6 +149,14 @@ pub async fn list_models(
                     }
                 }
             }
+            // Live-discovered filter for local providers (see comment above).
+            if m.tier != librefang_types::model_catalog::ModelTier::Custom {
+                if let Some(live_set) = live_models_per_provider.get(&m.provider.to_lowercase()) {
+                    if !live_set.contains(&m.id.to_lowercase()) {
+                        return false;
+                    }
+                }
+            }
             true
         })
         .map(|m| {
@@ -126,10 +170,13 @@ pub async fn list_models(
                 "display_name": m.display_name,
                 "provider": m.provider,
                 "tier": m.tier,
+                "modality": m.modality,
                 "context_window": m.context_window,
                 "max_output_tokens": m.max_output_tokens,
                 "input_cost_per_m": m.input_cost_per_m,
                 "output_cost_per_m": m.output_cost_per_m,
+                "image_input_cost_per_m": m.image_input_cost_per_m,
+                "image_output_cost_per_m": m.image_output_cost_per_m,
                 "supports_tools": m.supports_tools,
                 "supports_vision": m.supports_vision,
                 "supports_streaming": m.supports_streaming,
@@ -245,10 +292,7 @@ pub async fn delete_alias(
             .into_json_tuple();
     }
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "removed"})),
-    )
+    (StatusCode::NO_CONTENT, Json(serde_json::json!(null)))
 }
 
 #[utoipa::path(get, path = "/api/models/{id}", tag = "models", params(("id" = String, Path, description = "Model ID")), responses((status = 200, description = "Model details", body = serde_json::Value)))]
@@ -276,10 +320,13 @@ pub async fn get_model(
                     "display_name": m.display_name,
                     "provider": m.provider,
                     "tier": m.tier,
+                    "modality": m.modality,
                     "context_window": m.context_window,
                     "max_output_tokens": m.max_output_tokens,
                     "input_cost_per_m": m.input_cost_per_m,
                     "output_cost_per_m": m.output_cost_per_m,
+                    "image_input_cost_per_m": m.image_input_cost_per_m,
+                    "image_output_cost_per_m": m.image_output_cost_per_m,
                     "supports_tools": m.supports_tools,
                     "supports_vision": m.supports_vision,
                     "supports_streaming": m.supports_streaming,
@@ -363,7 +410,7 @@ pub async fn delete_model_overrides(
     if let Err(e) = catalog.save_overrides(&overrides_path) {
         tracing::warn!("Failed to persist model overrides: {e}");
     }
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+    (StatusCode::NO_CONTENT, Json(serde_json::json!(null)))
 }
 
 /// Attach local-provider probe results to a JSON entry and optionally merge
@@ -438,21 +485,42 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
     };
 
     // Collect local providers that need probing
-    let local_providers: Vec<(usize, String, String)> = provider_list
+    let local_providers: Vec<(usize, String, String, Option<String>)> = provider_list
         .iter()
         .enumerate()
         .filter(|(_, p)| {
             librefang_runtime::provider_health::is_local_provider(&p.id) && !p.base_url.is_empty()
         })
-        .map(|(i, p)| (i, p.id.clone(), p.base_url.clone()))
+        .map(|(i, p)| {
+            // Resolve the provider's api_key env var (catalog field, falling
+            // back to the {PROVIDER}_API_KEY convention) and read its value
+            // for the probe. Local providers fronted by an authenticating
+            // reverse proxy (Open WebUI, LiteLLM, etc.) need this Bearer
+            // token forwarded; bare-localhost setups have nothing in the
+            // env so the probe runs unauthenticated as before.
+            let env_var = if p.api_key_env.trim().is_empty() {
+                format!("{}_API_KEY", p.id.to_uppercase().replace('-', "_"))
+            } else {
+                p.api_key_env.clone()
+            };
+            let api_key = std::env::var(&env_var)
+                .ok()
+                .filter(|v| !v.trim().is_empty());
+            (i, p.id.clone(), p.base_url.clone(), api_key)
+        })
         .collect();
 
     // Fire all probes concurrently (cached results return instantly)
     let cache = &state.provider_probe_cache;
     let probe_futures: Vec<_> = local_providers
         .iter()
-        .map(|(_, id, url)| {
-            librefang_runtime::provider_health::probe_provider_cached(id, url, cache)
+        .map(|(_, id, url, api_key)| {
+            librefang_runtime::provider_health::probe_provider_cached(
+                id,
+                url,
+                api_key.as_deref(),
+                cache,
+            )
         })
         .collect();
     let probe_results = futures::future::join_all(probe_futures).await;
@@ -460,7 +528,7 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
     // Index probe results by provider list position for O(1) lookup
     let mut probe_map: HashMap<usize, librefang_runtime::provider_health::ProbeResult> =
         HashMap::with_capacity(local_providers.len());
-    for ((idx, _, _), result) in local_providers.iter().zip(probe_results) {
+    for ((idx, _, _, _), result) in local_providers.iter().zip(probe_results) {
         probe_map.insert(*idx, result);
     }
 
@@ -553,27 +621,44 @@ pub(crate) async fn providers_snapshot(state: &Arc<AppState>) -> Vec<serde_json:
         catalog.list_providers().to_vec()
     };
 
-    let local_providers: Vec<(usize, String, String)> = provider_list
+    let local_providers: Vec<(usize, String, String, Option<String>)> = provider_list
         .iter()
         .enumerate()
         .filter(|(_, p)| {
             librefang_runtime::provider_health::is_local_provider(&p.id) && !p.base_url.is_empty()
         })
-        .map(|(i, p)| (i, p.id.clone(), p.base_url.clone()))
+        .map(|(i, p)| {
+            // See sibling site above — same env-var resolution so Open WebUI
+            // / LiteLLM-fronted local providers get a Bearer token attached.
+            let env_var = if p.api_key_env.trim().is_empty() {
+                format!("{}_API_KEY", p.id.to_uppercase().replace('-', "_"))
+            } else {
+                p.api_key_env.clone()
+            };
+            let api_key = std::env::var(&env_var)
+                .ok()
+                .filter(|v| !v.trim().is_empty());
+            (i, p.id.clone(), p.base_url.clone(), api_key)
+        })
         .collect();
 
     let cache = &state.provider_probe_cache;
     let probe_futures: Vec<_> = local_providers
         .iter()
-        .map(|(_, id, url)| {
-            librefang_runtime::provider_health::probe_provider_cached(id, url, cache)
+        .map(|(_, id, url, api_key)| {
+            librefang_runtime::provider_health::probe_provider_cached(
+                id,
+                url,
+                api_key.as_deref(),
+                cache,
+            )
         })
         .collect();
     let probe_results = futures::future::join_all(probe_futures).await;
 
     let mut probe_map: HashMap<usize, librefang_runtime::provider_health::ProbeResult> =
         HashMap::with_capacity(local_providers.len());
-    for ((idx, _, _), result) in local_providers.iter().zip(probe_results) {
+    for ((idx, _, _, _), result) in local_providers.iter().zip(probe_results) {
         probe_map.insert(*idx, result);
     }
 
@@ -636,10 +721,13 @@ pub async fn get_provider(
                             "id": m.id,
                             "display_name": m.display_name,
                             "tier": m.tier,
+                            "modality": m.modality,
                             "context_window": m.context_window,
                             "max_output_tokens": m.max_output_tokens,
                             "input_cost_per_m": m.input_cost_per_m,
                             "output_cost_per_m": m.output_cost_per_m,
+                            "image_input_cost_per_m": m.image_input_cost_per_m,
+                            "image_output_cost_per_m": m.image_output_cost_per_m,
                             "supports_tools": m.supports_tools,
                             "supports_vision": m.supports_vision,
                             "supports_streaming": m.supports_streaming,
@@ -672,9 +760,20 @@ pub async fn get_provider(
         && !provider.base_url.is_empty()
     {
         let cache = &state.provider_probe_cache;
+        // Forward the api_key when present so reverse-proxy-fronted local
+        // providers (Open WebUI, LiteLLM) get a valid Bearer token.
+        let env_var = if provider.api_key_env.trim().is_empty() {
+            format!("{}_API_KEY", provider.id.to_uppercase().replace('-', "_"))
+        } else {
+            provider.api_key_env.clone()
+        };
+        let api_key = std::env::var(&env_var)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
         let probe = librefang_runtime::provider_health::probe_provider_cached(
             &provider.id,
             &provider.base_url,
+            api_key.as_deref(),
             cache,
         )
         .await;
@@ -734,11 +833,20 @@ pub async fn add_custom_model(
         .unwrap_or(&id)
         .to_string();
 
+    let modality = match body.get("modality").and_then(|v| v.as_str()) {
+        Some("image") => librefang_types::model_catalog::Modality::Image,
+        Some("audio") => librefang_types::model_catalog::Modality::Audio,
+        Some("video") => librefang_types::model_catalog::Modality::Video,
+        Some("music") => librefang_types::model_catalog::Modality::Music,
+        _ => librefang_types::model_catalog::Modality::Text,
+    };
+
     let entry = librefang_types::model_catalog::ModelCatalogEntry {
         id: id.clone(),
         display_name: display,
         provider: provider.clone(),
         tier: librefang_types::model_catalog::ModelTier::Custom,
+        modality,
         context_window,
         max_output_tokens: max_output,
         input_cost_per_m: body
@@ -749,6 +857,8 @@ pub async fn add_custom_model(
             .get("output_cost_per_m")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0),
+        image_input_cost_per_m: body.get("image_input_cost_per_m").and_then(|v| v.as_f64()),
+        image_output_cost_per_m: body.get("image_output_cost_per_m").and_then(|v| v.as_f64()),
         supports_tools: body
             .get("supports_tools")
             .and_then(|v| v.as_bool())
@@ -767,6 +877,14 @@ pub async fn add_custom_model(
             .unwrap_or(false),
         aliases: vec![],
     };
+
+    // Same modality-aware gate the catalog loaders apply: text entries
+    // must have nonzero context_window and max_output_tokens. Reject
+    // synchronously so misconfigured custom models can't enter the
+    // catalog and propagate `0` into compaction / budget math.
+    if let Err(e) = entry.validate() {
+        return ApiErrorResponse::bad_request(e).into_json_tuple();
+    }
 
     let mut catalog = state
         .kernel
@@ -842,10 +960,7 @@ pub async fn remove_custom_model(
             .into_json_tuple();
     }
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "removed"})),
-    )
+    (StatusCode::NO_CONTENT, Json(serde_json::json!(null)))
 }
 
 // ── A2A (Agent-to-Agent) Protocol Endpoints ─────────────────────────
@@ -887,8 +1002,18 @@ pub async fn set_provider_key(
             .into_json_tuple();
     }
 
-    // Set env var in current process so detect_auth picks it up
-    std::env::set_var(&env_var, &key);
+    // Set env var in current process so detect_auth picks it up.
+    // `std::env::set_var` is not thread-safe in an async context; delegate to
+    // a blocking thread to avoid undefined behaviour in the tokio runtime.
+    {
+        let env_var_clone = env_var.clone();
+        let key_clone = key.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            // SAFETY: single mutation on a dedicated blocking thread.
+            unsafe { std::env::set_var(&env_var_clone, &key_clone) };
+        })
+        .await;
+    }
 
     // Re-enable fallback detection (user is adding a key, undo any prior suppress)
     // and refresh auth status.
@@ -1108,10 +1233,7 @@ pub async fn delete_provider_key(
         catalog.detect_auth();
     }
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({"status": "removed", "provider": name})),
-    )
+    (StatusCode::NO_CONTENT, Json(serde_json::json!(null)))
 }
 
 /// POST /api/providers/{name}/test — Test a provider's connectivity.
@@ -1120,19 +1242,14 @@ pub async fn test_provider(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let (env_var, base_url, key_required, auth_status) = {
+    let (env_var, base_url, key_required) = {
         let catalog = state
             .kernel
             .model_catalog_ref()
             .read()
             .unwrap_or_else(|e| e.into_inner());
         match catalog.get_provider(&name) {
-            Some(p) => (
-                p.api_key_env.clone(),
-                p.base_url.clone(),
-                p.key_required,
-                p.auth_status,
-            ),
+            Some(p) => (p.api_key_env.clone(), p.base_url.clone(), p.key_required),
             None => {
                 return ApiErrorResponse::not_found(format!("Unknown provider '{}'", name))
                     .into_json_tuple();
@@ -1172,41 +1289,49 @@ pub async fn test_provider(
         };
     }
 
-    // API provider with CLI fallback but no API key — test the CLI instead.
-    if auth_status == librefang_types::model_catalog::AuthStatus::ConfiguredCli {
-        let cli_start = Instant::now();
-        // The CLI name may differ from the provider name (e.g. gemini → gemini-cli)
-        let cli_name = match name.as_str() {
-            "gemini" => "gemini-cli",
-            "anthropic" => "claude-code",
-            "openai" | "codex" => "codex-cli",
-            "qwen" => "qwen-code",
-            _ => name.as_str(),
-        };
-        let cli_ok = librefang_runtime::drivers::cli_provider_available(cli_name);
-        let cli_latency = cli_start.elapsed().as_millis();
+    // ── Local providers (Ollama / vLLM / LM Studio / lemonade) ──
+    // Delegate to the kernel's shared probe helper so the on-demand test
+    // updates `auth_status` in the catalog (NotRequired on success,
+    // LocalOffline on failure). Before this, the endpoint only refreshed an
+    // in-memory cache — users could start Ollama after LibreFang booted and
+    // the dashboard would stay stuck on `local_offline` forever.
+    if librefang_runtime::provider_health::is_local_provider(&name) {
+        let result = librefang_kernel::kernel::probe_and_update_local_provider(
+            &state.kernel,
+            &name,
+            &base_url,
+            false, // user-triggered test — don't escalate to warn!
+        )
+        .await;
+        let latency = result.latency_ms as u128;
         state.provider_test_cache.insert(
             name.clone(),
             (
                 Instant::now(),
-                cli_latency,
+                latency,
                 chrono::Utc::now().to_rfc3339(),
-                cli_ok,
+                result.reachable,
             ),
         );
-        return if cli_ok {
+        return if result.reachable {
             (
                 StatusCode::OK,
-                Json(
-                    serde_json::json!({"status":"ok","provider":name,"latency_ms":cli_latency,"note":format!("via {cli_name} CLI")}),
-                ),
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "provider": name,
+                    "latency_ms": latency,
+                    "discovered_models": result.discovered_models.len(),
+                })),
             )
         } else {
             (
                 StatusCode::OK,
-                Json(
-                    serde_json::json!({"status":"error","provider":name,"error":format!("{cli_name} CLI not found in PATH")}),
-                ),
+                Json(serde_json::json!({
+                    "status": "error",
+                    "provider": name,
+                    "latency_ms": latency,
+                    "error": result.error.unwrap_or_else(|| "unreachable".to_string()),
+                })),
             )
         };
     }
@@ -1225,20 +1350,16 @@ pub async fn test_provider(
         return ApiErrorResponse::bad_request("Provider API key not configured").into_json_tuple();
     }
 
-    let start = std::time::Instant::now();
     let api_key_val = api_key.unwrap_or_default();
-    let client = match librefang_runtime::http_client::proxied_client_builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return ApiErrorResponse::internal(format!(
-                "Failed to build HTTP client for provider test: {e}"
-            ))
-            .into_json_tuple();
-        }
-    };
+    // Reuse the shared probe HTTP client instead of building a fresh
+    // `reqwest::Client` per request. Each rebuild paid a TLS-config init +
+    // root-cert-chain load (~50–100 ms) on top of the actual handshake,
+    // and that cost was being **counted as provider latency** below — so
+    // a single `byteplus_coding 230 ms` round-trip surfaced on the
+    // dashboard as `~500 ms` purely from the rebuilt client. Sharing the
+    // pool also lets the second click reuse the warm TLS session.
+    let client = librefang_runtime::provider_health::probe_client();
+    let start = std::time::Instant::now();
 
     // ── Bedrock: AWS Signature auth — can't test with simple HTTP ──
     if name == "bedrock" || name == "aws-bedrock" {
@@ -1258,38 +1379,52 @@ pub async fn test_provider(
     }
 
     // ── Provider-specific test URL ──
-    let test_url_str = match name.as_str() {
-        "anthropic" => format!("{}/v1/models", base_url.trim_end_matches('/')),
-        "gemini" | "google" => format!(
-            "{}/v1beta/models?key={}",
-            base_url.trim_end_matches('/'),
-            api_key_val
-        ),
-        "chatgpt" => format!("{}/me", base_url.trim_end_matches('/')),
-        "github-copilot" => format!("{}/models", base_url.trim_end_matches('/')),
-        "elevenlabs" => format!("{}/user", base_url.trim_end_matches('/')),
-        _ => format!("{}/models", base_url.trim_end_matches('/')),
+    // Anthropic-format providers (anthropic + byteplus_coding +
+    // volcengine_coding + …) all probe via `/v1/models` with x-api-key
+    // headers. Look up the registered ApiFormat instead of duplicating
+    // the registry's name list here, so future Anthropic-protocol
+    // providers don't need a parallel edit in this file.
+    let api_format = librefang_llm_drivers::drivers::provider_api_format(&name);
+    let is_anthropic_shape = matches!(
+        api_format,
+        Some(librefang_llm_drivers::drivers::ApiFormat::Anthropic)
+    );
+    let test_url_str = if is_anthropic_shape {
+        format!("{}/v1/models", base_url.trim_end_matches('/'))
+    } else {
+        match name.as_str() {
+            "gemini" | "google" => format!(
+                "{}/v1beta/models?key={}",
+                base_url.trim_end_matches('/'),
+                api_key_val
+            ),
+            "chatgpt" => format!("{}/me", base_url.trim_end_matches('/')),
+            "github-copilot" => format!("{}/models", base_url.trim_end_matches('/')),
+            "elevenlabs" => format!("{}/user", base_url.trim_end_matches('/')),
+            _ => format!("{}/models", base_url.trim_end_matches('/')),
+        }
     };
 
     let mut req = client.get(&test_url_str);
-    match name.as_str() {
-        "anthropic" => {
-            req = req
-                .header("x-api-key", &api_key_val)
-                .header("anthropic-version", "2023-06-01");
-        }
-        "gemini" | "google" => {
-            // Key is in query param, no header needed
-        }
-        "github-copilot" => {
-            req = req.header("Authorization", format!("token {}", api_key_val));
-        }
-        "elevenlabs" => {
-            req = req.header("xi-api-key", &api_key_val);
-        }
-        _ => {
-            if !api_key_val.is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", api_key_val));
+    if is_anthropic_shape {
+        req = req
+            .header("x-api-key", &api_key_val)
+            .header("anthropic-version", "2023-06-01");
+    } else {
+        match name.as_str() {
+            "gemini" | "google" => {
+                // Key is in query param, no header needed
+            }
+            "github-copilot" => {
+                req = req.header("Authorization", format!("token {}", api_key_val));
+            }
+            "elevenlabs" => {
+                req = req.header("xi-api-key", &api_key_val);
+            }
+            _ => {
+                if !api_key_val.is_empty() {
+                    req = req.header("Authorization", format!("Bearer {}", api_key_val));
+                }
             }
         }
     }
@@ -1326,7 +1461,17 @@ pub async fn test_provider(
         ),
     );
 
-    if status_code == 401 || status_code == 403 {
+    // For Anthropic-protocol providers, 401/403/404 on /v1/models is a
+    // **listing-endpoint-not-exposed** signal, not an auth failure. The
+    // BytePlus and Volcengine "coding plan" tokens, for instance, work
+    // fine for /v1/messages (the real chat path) but the same key gets
+    // a 401 from /v1/models because that endpoint isn't part of the
+    // coding-plan scope. Reporting "Authentication failed" makes the
+    // dashboard show a red "broken provider" tile when the key is in
+    // fact valid for actual inference. Treat the same status codes that
+    // the background `probe_provider` already treats as `Ok` here too —
+    // both paths now converge on the same Anthropic-shape semantics.
+    if !is_anthropic_shape && (status_code == 401 || status_code == 403) {
         (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -1357,7 +1502,7 @@ pub async fn set_provider_url(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     // Accept any provider name — custom providers are supported via OpenAI-compatible format.
-    let base_url = match body["base_url"].as_str() {
+    let base_url_raw = match body["base_url"].as_str() {
         Some(u) if !u.trim().is_empty() => u.trim().to_string(),
         _ => {
             return ApiErrorResponse::bad_request("Missing or empty 'base_url' field")
@@ -1366,10 +1511,19 @@ pub async fn set_provider_url(
     };
 
     // Validate URL scheme
-    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+    if !base_url_raw.starts_with("http://") && !base_url_raw.starts_with("https://") {
         return ApiErrorResponse::bad_request("base_url must start with http:// or https://")
             .into_json_tuple();
     }
+
+    // Normalize for the common Ollama / vLLM / LM Studio mistake: users
+    // paste `http://host:port` (no path) and the OpenAI driver then hits
+    // `/chat/completions` instead of `/v1/chat/completions`, getting a 404.
+    // If the user gave us a host-only URL (path is empty or just "/"),
+    // append `/v1` so OpenAI-compatible endpoints work out of the box.
+    // Custom paths (`/api/openai`, `/openai/v1`, etc.) are left alone.
+    // Issue #3138.
+    let base_url = normalize_base_url(&base_url_raw);
 
     // Optional proxy_url in same request
     let proxy_url = body["proxy_url"].as_str().map(|s| s.trim().to_string());
@@ -1411,8 +1565,31 @@ pub async fn set_provider_url(
         }
     }
 
-    // Probe reachability at the new URL
-    let probe = librefang_runtime::provider_health::probe_provider(&name, &base_url).await;
+    // Probe reachability at the new URL. Forward the configured api_key so
+    // reverse-proxy-fronted endpoints (Open WebUI, LiteLLM, etc.) accept
+    // the listing request — without this, they return 401 even when the
+    // backing model server is healthy.
+    let probe_env_var = {
+        let catalog = state
+            .kernel
+            .model_catalog_ref()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        catalog
+            .get_provider(&name)
+            .map(|p| p.api_key_env.clone())
+            .filter(|env| !env.trim().is_empty())
+            .unwrap_or_else(|| format!("{}_API_KEY", name.to_uppercase().replace('-', "_")))
+    };
+    let probe_api_key = std::env::var(&probe_env_var)
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let probe = librefang_runtime::provider_health::probe_provider(
+        &name,
+        &base_url,
+        probe_api_key.as_deref(),
+    )
+    .await;
 
     // Merge discovered models into catalog
     if !probe.discovered_models.is_empty() {
@@ -1600,8 +1777,85 @@ fn persist_default_model(
     };
     let root = doc.as_table_mut().ok_or("Config is not a TOML table")?;
     root.insert("default_model".to_string(), toml::Value::Table(dm_table));
-    std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
+    let toml_str = toml::to_string_pretty(&doc)?;
+    crate::atomic_write(config_path, toml_str.as_bytes())?;
     Ok(())
+}
+
+/// Normalize a user-supplied provider base URL.
+///
+/// `http://host:port` (no path) and `http://host:port/` are rewritten to
+/// `http://host:port/v1` because every OpenAI-compatible local server we
+/// support (Ollama, vLLM, LM Studio, LlamaSwap, llama-server, etc.) serves
+/// its chat-completions endpoint at `/v1/chat/completions`. Without the
+/// normalisation the OpenAI driver produces `/chat/completions` and the
+/// server returns HTTP 404 — see issue #3138.
+///
+/// Custom paths (`/api/openai`, `/openai/v1`, `/router/some/path`) are left
+/// untouched: if a user explicitly typed a path we trust it.
+fn normalize_base_url(input: &str) -> String {
+    let trimmed = input.trim().trim_end_matches('/').to_string();
+    // After scheme there must be host[:port][/path…]. Find the first '/'
+    // after the scheme separator to know whether a path was supplied.
+    let after_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or("");
+    let has_path = after_scheme.find('/').is_some();
+    if has_path {
+        // User supplied an explicit path — respect it.
+        trimmed
+    } else {
+        // Bare host[:port] — assume OpenAI-compatible default.
+        format!("{trimmed}/v1")
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn normalize_base_url_appends_v1_for_bare_host() {
+    assert_eq!(
+        normalize_base_url("http://192.168.1.10:11434"),
+        "http://192.168.1.10:11434/v1"
+    );
+    assert_eq!(
+        normalize_base_url("http://192.168.1.10:11434/"),
+        "http://192.168.1.10:11434/v1"
+    );
+    assert_eq!(
+        normalize_base_url("http://localhost:8000"),
+        "http://localhost:8000/v1"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn normalize_base_url_preserves_explicit_path() {
+    assert_eq!(
+        normalize_base_url("http://192.168.1.10:11434/v1"),
+        "http://192.168.1.10:11434/v1"
+    );
+    assert_eq!(
+        normalize_base_url("http://192.168.1.10:11434/v1/"),
+        "http://192.168.1.10:11434/v1"
+    );
+    assert_eq!(
+        normalize_base_url("https://api.openai.com/v1"),
+        "https://api.openai.com/v1"
+    );
+    assert_eq!(
+        normalize_base_url("https://example.com/api/openai"),
+        "https://example.com/api/openai"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn normalize_base_url_trims_whitespace() {
+    assert_eq!(
+        normalize_base_url("  http://localhost:11434  "),
+        "http://localhost:11434/v1"
+    );
 }
 
 /// Upsert a provider URL in the `[provider_urls]` section of config.toml.
@@ -1660,7 +1914,8 @@ fn upsert_provider_url(
         std::fs::create_dir_all(parent)?;
     }
 
-    std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
+    let toml_str = toml::to_string_pretty(&doc)?;
+    crate::atomic_write(config_path, toml_str.as_bytes())?;
     Ok(())
 }
 
@@ -1704,7 +1959,8 @@ fn upsert_provider_proxy_url(
         );
     }
 
-    std::fs::write(config_path, toml::to_string_pretty(&doc)?)?;
+    let toml_str = toml::to_string_pretty(&doc)?;
+    crate::atomic_write(config_path, toml_str.as_bytes())?;
     Ok(())
 }
 
@@ -1811,8 +2067,17 @@ pub async fn copilot_oauth_poll(
                 );
             }
 
-            // Set in current process
-            std::env::set_var("GITHUB_TOKEN", access_token.as_str());
+            // Set in current process.
+            // `std::env::set_var` is not thread-safe inside async; push to a
+            // blocking thread to avoid UB in the multithreaded tokio runtime.
+            {
+                let token = access_token.to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    // SAFETY: single mutation on a dedicated blocking thread.
+                    unsafe { std::env::set_var("GITHUB_TOKEN", &token) };
+                })
+                .await;
+            }
 
             // Refresh auth detection
             state
@@ -1938,7 +2203,10 @@ pub async fn detect_ollama() -> impl IntoResponse {
         }
     };
 
-    match client.get("http://localhost:11434/api/tags").send().await {
+    // Use 127.0.0.1 instead of localhost: on dual-stack hosts (macOS)
+    // localhost resolves to ::1 first and Ollama binds IPv4 only, causing
+    // probes to fail without reliable IPv4 fallback.
+    match client.get("http://127.0.0.1:11434/api/tags").send().await {
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await.unwrap_or_else(|e| {
                 tracing::warn!("Ollama responded but JSON parse failed: {e}");

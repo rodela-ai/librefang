@@ -1,5 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { AnimatePresence, motion } from "motion/react";
+import { tabContent } from "../lib/motion";
 import {
   type MediaProvider,
   type MediaImageResult,
@@ -103,35 +105,31 @@ export function MediaPage() {
       <ProviderStatusGrid providers={providers} />
 
       {/* Tab bar */}
-      <div className="flex gap-1 rounded-xl border border-border-subtle bg-surface p-1 flex-wrap">
-        <TabButton tab="image" active={activeTab} onClick={setActiveTab} icon={TAB_ICONS.image}>
+      <div role="tablist" aria-label={t("media.title")} className="flex gap-1 rounded-xl border border-border-subtle bg-surface p-1 flex-wrap">
+        <TabButton tab="image" active={activeTab} onClick={setActiveTab} icon={TAB_ICONS.image} panelId="media-panel-image">
           {t("media.tab_image")}
         </TabButton>
-        <TabButton tab="speech" active={activeTab} onClick={setActiveTab} icon={TAB_ICONS.speech}>
+        <TabButton tab="speech" active={activeTab} onClick={setActiveTab} icon={TAB_ICONS.speech} panelId="media-panel-speech">
           {t("media.tab_speech")}
         </TabButton>
-        <TabButton tab="video" active={activeTab} onClick={setActiveTab} icon={TAB_ICONS.video}>
+        <TabButton tab="video" active={activeTab} onClick={setActiveTab} icon={TAB_ICONS.video} panelId="media-panel-video">
           {t("media.tab_video")}
         </TabButton>
-        <TabButton tab="music" active={activeTab} onClick={setActiveTab} icon={TAB_ICONS.music}>
+        <TabButton tab="music" active={activeTab} onClick={setActiveTab} icon={TAB_ICONS.music} panelId="media-panel-music">
           {t("media.tab_music")}
         </TabButton>
       </div>
 
       {/* Active panel */}
       <div className="rounded-2xl border border-border-subtle bg-surface p-5">
-        {activeTab === "image" && (
-          <ImagePanel providers={imageProviders} onToast={addToast} />
-        )}
-        {activeTab === "speech" && (
-          <SpeechPanel providers={speechProviders} onToast={addToast} />
-        )}
-        {activeTab === "video" && (
-          <VideoPanel providers={videoProviders} onToast={addToast} />
-        )}
-        {activeTab === "music" && (
-          <MusicPanel providers={musicProviders} onToast={addToast} />
-        )}
+        <AnimatePresence mode="wait">
+          <motion.div key={activeTab} variants={tabContent} initial="initial" animate="animate" exit="exit">
+            {activeTab === "image" && <div id="media-panel-image" role="tabpanel" aria-labelledby="media-tab-image"><ImagePanel providers={imageProviders} onToast={addToast} /></div>}
+            {activeTab === "speech" && <div id="media-panel-speech" role="tabpanel" aria-labelledby="media-tab-speech"><SpeechPanel providers={speechProviders} onToast={addToast} /></div>}
+            {activeTab === "video" && <div id="media-panel-video" role="tabpanel" aria-labelledby="media-tab-video"><VideoPanel providers={videoProviders} onToast={addToast} /></div>}
+            {activeTab === "music" && <div id="media-panel-music" role="tabpanel" aria-labelledby="media-tab-music"><MusicPanel providers={musicProviders} onToast={addToast} /></div>}
+          </motion.div>
+        </AnimatePresence>
       </div>
     </div>
   );
@@ -199,17 +197,24 @@ function TabButton({
   active,
   onClick,
   icon,
+  panelId,
   children,
 }: {
   tab: MediaTab;
   active: MediaTab;
   onClick: (t: MediaTab) => void;
   icon: React.ReactNode;
+  panelId: string;
   children: React.ReactNode;
 }) {
   const isActive = tab === active;
   return (
     <button
+      id={`media-tab-${tab}`}
+      role="tab"
+      aria-selected={isActive}
+      aria-controls={panelId}
+      tabIndex={isActive ? 0 : -1}
       onClick={() => onClick(tab)}
       className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-bold transition-colors ${
         isActive

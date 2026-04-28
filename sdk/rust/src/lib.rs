@@ -159,6 +159,7 @@ pub struct LibreFang {
     pub skills: Arc<SkillsResource>,
     pub system: Arc<SystemResource>,
     pub tools: Arc<ToolsResource>,
+    pub users: Arc<UsersResource>,
     pub webhooks: Arc<WebhooksResource>,
     pub workflows: Arc<WorkflowsResource>,
     _base_url: String,
@@ -189,6 +190,7 @@ impl LibreFang {
             skills: Arc::new(SkillsResource::new(base_url.clone(), client.clone())),
             system: Arc::new(SystemResource::new(base_url.clone(), client.clone())),
             tools: Arc::new(ToolsResource::new(base_url.clone(), client.clone())),
+            users: Arc::new(UsersResource::new(base_url.clone(), client.clone())),
             webhooks: Arc::new(WebhooksResource::new(base_url.clone(), client.clone())),
             workflows: Arc::new(WorkflowsResource::new(base_url.clone(), client.clone())),
             _base_url: base_url,
@@ -308,6 +310,14 @@ impl AgentsResource {
         do_req(&self.client, &self.base_url, reqwest::Method::DELETE, &format!("/api/agents/{}/files/{}", id, filename), None, &[]).await
     }
 
+    pub async fn delete_hand_agent_runtime_config(&self, id: &str) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::DELETE, &format!("/api/agents/{}/hand-runtime-config", id), None, &[]).await
+    }
+
+    pub async fn patch_hand_agent_runtime_config(&self, id: &str, data: Value) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::PATCH, &format!("/api/agents/{}/hand-runtime-config", id), Some(data), &[]).await
+    }
+
     pub async fn clear_agent_history(&self, id: &str) -> Result<Value> {
         do_req(&self.client, &self.base_url, reqwest::Method::DELETE, &format!("/api/agents/{}/history", id), None, &[]).await
     }
@@ -340,8 +350,12 @@ impl AgentsResource {
         do_req(&self.client, &self.base_url, reqwest::Method::PUT, &format!("/api/agents/{}/model", id), Some(data), &[]).await
     }
 
-    pub async fn get_agent_session(&self, id: &str) -> Result<Value> {
-        do_req(&self.client, &self.base_url, reqwest::Method::GET, &format!("/api/agents/{}/session", id), None, &[]).await
+    pub async fn list_agent_runtime(&self, id: &str) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::GET, &format!("/api/agents/{}/runtime", id), None, &[]).await
+    }
+
+    pub async fn get_agent_session(&self, id: &str, session_id: Option<&str>) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::GET, &format!("/api/agents/{}/session", id), None, &[("session_id", session_id)]).await
     }
 
     pub async fn compact_session(&self, id: &str) -> Result<Value> {
@@ -372,8 +386,20 @@ impl AgentsResource {
         do_req(&self.client, &self.base_url, reqwest::Method::GET, &format!("/api/agents/{}/sessions/{}/export", id, session_id), None, &[]).await
     }
 
+    pub async fn stop_session(&self, id: &str, session_id: &str) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::POST, &format!("/api/agents/{}/sessions/{}/stop", id, session_id), None, &[]).await
+    }
+
+    pub fn attach_session_stream(&self, id: &str, session_id: &str) -> tokio::sync::mpsc::UnboundedReceiver<Value> {
+        do_stream(self.client.clone(), self.base_url.clone(), format!("/api/agents/{}/sessions/{}/stream", id, session_id), reqwest::Method::GET, None, Vec::new())
+    }
+
     pub async fn switch_agent_session(&self, id: &str, session_id: &str) -> Result<Value> {
         do_req(&self.client, &self.base_url, reqwest::Method::POST, &format!("/api/agents/{}/sessions/{}/switch", id, session_id), None, &[]).await
+    }
+
+    pub async fn export_session_trajectory(&self, id: &str, session_id: &str, format: Option<&str>) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::GET, &format!("/api/agents/{}/sessions/{}/trajectory", id, session_id), None, &[("format", format)]).await
     }
 
     pub async fn get_agent_skills(&self, id: &str) -> Result<Value> {
@@ -550,6 +576,14 @@ impl BudgetResource {
 
     pub async fn update_agent_budget(&self, id: &str, data: Value) -> Result<Value> {
         do_req(&self.client, &self.base_url, reqwest::Method::PUT, &format!("/api/budget/agents/{}", id), Some(data), &[]).await
+    }
+
+    pub async fn user_budget_ranking(&self, limit: Option<&str>) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::GET, &"/api/budget/users".to_string(), None, &[("limit", limit)]).await
+    }
+
+    pub async fn user_budget_detail(&self, user_id: &str) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::GET, &format!("/api/budget/users/{}", user_id), None, &[]).await
     }
 
     pub async fn usage_stats(&self) -> Result<Value> {
@@ -774,6 +808,10 @@ impl McpResource {
 
     pub async fn reconnect_mcp_server_handler(&self, name: &str) -> Result<Value> {
         do_req(&self.client, &self.base_url, reqwest::Method::POST, &format!("/api/mcp/servers/{}/reconnect", name), None, &[]).await
+    }
+
+    pub async fn list_mcp_taint_rules(&self) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::GET, &"/api/mcp/taint-rules".to_string(), None, &[]).await
     }
 }
 
@@ -1180,6 +1218,14 @@ impl SystemResource {
         Self { base_url, client }
     }
 
+    pub async fn audit_export(&self, format: Option<&str>, user: Option<&str>, action: Option<&str>, agent: Option<&str>, channel: Option<&str>, from: Option<&str>, to: Option<&str>, limit: Option<&str>) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::GET, &"/api/audit/export".to_string(), None, &[("format", format), ("user", user), ("action", action), ("agent", agent), ("channel", channel), ("from", from), ("to", to), ("limit", limit)]).await
+    }
+
+    pub async fn audit_query(&self, user: Option<&str>, action: Option<&str>, agent: Option<&str>, channel: Option<&str>, from: Option<&str>, to: Option<&str>, limit: Option<&str>) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::GET, &"/api/audit/query".to_string(), None, &[("user", user), ("action", action), ("agent", agent), ("channel", channel), ("from", from), ("to", to), ("limit", limit)]).await
+    }
+
     pub async fn audit_recent(&self) -> Result<Value> {
         do_req(&self.client, &self.base_url, reqwest::Method::GET, &"/api/audit/recent".to_string(), None, &[]).await
     }
@@ -1328,6 +1374,48 @@ impl ToolsResource {
 
     pub async fn invoke_tool(&self, name: &str, data: Value, agent_id: Option<&str>) -> Result<Value> {
         do_req(&self.client, &self.base_url, reqwest::Method::POST, &format!("/api/tools/{}/invoke", name), Some(data), &[("agent_id", agent_id)]).await
+    }
+}
+
+// ── Users ──
+
+#[derive(Debug, Clone)]
+pub struct UsersResource {
+    base_url: String,
+    client: Client,
+}
+
+impl UsersResource {
+    fn new(base_url: String, client: Client) -> Self {
+        Self { base_url, client }
+    }
+
+    pub async fn list_users(&self) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::GET, &"/api/users".to_string(), None, &[]).await
+    }
+
+    pub async fn create_user(&self, data: Value) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::POST, &"/api/users".to_string(), Some(data), &[]).await
+    }
+
+    pub async fn import_users(&self, data: Value) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::POST, &"/api/users/import".to_string(), Some(data), &[]).await
+    }
+
+    pub async fn get_user(&self, name: &str) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::GET, &format!("/api/users/{}", name), None, &[]).await
+    }
+
+    pub async fn update_user(&self, name: &str, data: Value) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::PUT, &format!("/api/users/{}", name), Some(data), &[]).await
+    }
+
+    pub async fn delete_user(&self, name: &str) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::DELETE, &format!("/api/users/{}", name), None, &[]).await
+    }
+
+    pub async fn rotate_user_key(&self, name: &str) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::POST, &format!("/api/users/{}/rotate-key", name), None, &[]).await
     }
 }
 

@@ -55,7 +55,10 @@ impl OpenAIDriver {
         request_timeout_secs: Option<u64>,
     ) -> Self {
         let client = match proxy_url {
-            Some(url) => librefang_http::proxied_client_with_override(url),
+            Some(url) => librefang_http::proxied_client_with_override(url).unwrap_or_else(|e| {
+                tracing::warn!(url, error = %e, "Invalid per-provider proxy URL, using global proxy");
+                librefang_http::proxied_client()
+            }),
             None => librefang_http::proxied_client(),
         };
         Self {
@@ -96,7 +99,10 @@ impl OpenAIDriver {
             deployment
         );
         let client = match proxy_url {
-            Some(url) => librefang_http::proxied_client_with_override(url),
+            Some(url) => librefang_http::proxied_client_with_override(url).unwrap_or_else(|e| {
+                tracing::warn!(url, error = %e, "Invalid per-provider proxy URL, using global proxy");
+                librefang_http::proxied_client()
+            }),
             None => librefang_http::proxied_client(),
         };
         Self {
@@ -119,6 +125,44 @@ impl OpenAIDriver {
     /// True if the base URL points to Moonshot/Kimi.
     fn is_moonshot(&self) -> bool {
         self.base_url.contains("moonshot")
+    }
+
+    /// Stable provider tag used by [`crate::shared_rate_guard`].
+    ///
+    /// Derived from the host of `base_url` so that `api.openai.com`,
+    /// `api.groq.com`, `nous-portal.example` each get their own lockout
+    /// file. Falls back to `"openai-compat"` when the URL cannot be parsed.
+    fn shared_guard_provider(&self) -> &'static str {
+        // We map known hosts to short stable strings. Unknown hosts fall
+        // back to "openai-compat" — they still get isolated by key-id-hash
+        // even when the provider tag collides.
+        let url = self.base_url.to_ascii_lowercase();
+        if url.contains("openai.com") {
+            "openai"
+        } else if url.contains("groq.com") {
+            "groq"
+        } else if url.contains("openrouter") {
+            "openrouter"
+        } else if url.contains("nous") {
+            "nous"
+        } else if url.contains("moonshot") {
+            "moonshot"
+        } else if url.contains("deepseek") {
+            "deepseek"
+        } else if url.contains("dashscope") {
+            "dashscope"
+        } else if url.contains("byteplus") {
+            "byteplus"
+        } else if url.contains("azure") {
+            "azure-openai"
+        } else {
+            "openai-compat"
+        }
+    }
+
+    /// 16-hex key identifier for [`crate::shared_rate_guard`].
+    fn shared_guard_key_id(&self) -> String {
+        crate::shared_rate_guard::key_id_hash(self.api_key.as_str())
     }
 
     /// Upload a file to Moonshot's `/v1/files` endpoint and return the file ID.
@@ -500,6 +544,33 @@ struct OaiPromptTokensDetails {
     cached_tokens: u64,
 }
 
+/// Strip trailing assistant messages that would trigger "prefill not supported"
+/// errors on the Copilot proxy for Claude models.
+/// Only strips assistant messages that have no tool_calls (tool call messages
+/// are part of the protocol and must stay). Checks the model name to only
+/// apply for Claude models which enforce this restriction.
+fn strip_trailing_empty_assistant(messages: &mut Vec<OaiMessage>, model: &str) {
+    let is_claude = model.contains("claude");
+
+    while messages.last().is_some_and(|m| {
+        m.role == "assistant"
+            && m.tool_calls.is_none()
+            && if is_claude {
+                // Claude via Copilot: strip any trailing assistant without tool_calls
+                true
+            } else {
+                // Other models: only strip truly empty messages
+                match &m.content {
+                    None => true,
+                    Some(OaiMessageContent::Text(t)) => t.trim().is_empty(),
+                    _ => false,
+                }
+            }
+    }) {
+        messages.pop();
+    }
+}
+
 impl OpenAIDriver {
     /// Build the `OaiRequest` from a `CompletionRequest`.
     ///
@@ -632,9 +703,26 @@ impl OpenAIDriver {
                         }
                     }
                     if !parts.is_empty() && !has_tool_results {
+                        // session_repair already coalesced adjacent Text
+                        // blocks at the message-content layer, so `parts`
+                        // contains at most one Text run plus any Image /
+                        // File parts. If the whole thing collapses to a
+                        // single Text part we send it as a plain string —
+                        // maximally compatible with the long tail of
+                        // OpenAI-compatible backends whose multi-part
+                        // handling is shaky even at size 1.
+                        let content = if parts.len() == 1 {
+                            if let OaiContentPart::Text { text } = &parts[0] {
+                                OaiMessageContent::Text(text.clone())
+                            } else {
+                                OaiMessageContent::Parts(parts)
+                            }
+                        } else {
+                            OaiMessageContent::Parts(parts)
+                        };
                         oai_messages.push(OaiMessage {
                             role: "user".to_string(),
-                            content: Some(OaiMessageContent::Parts(parts)),
+                            content: Some(content),
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: None,
@@ -726,6 +814,8 @@ impl OpenAIDriver {
             })
             .collect();
 
+        strip_trailing_empty_assistant(&mut oai_messages, &request.model);
+
         // Guard: an empty message list would produce an unparseable API response
         // (typically "EOF while parsing a value at line 1 column 0").
         if oai_messages.is_empty() {
@@ -812,6 +902,12 @@ impl LlmDriver for OpenAIDriver {
         }
         let mut oai_request = self.build_request(&request)?;
 
+        // Cross-process / cross-restart rate-limit guard. A previously
+        // recorded 429 short-circuits before any HTTP work.
+        let guard_provider = self.shared_guard_provider();
+        let guard_key_id = self.shared_guard_key_id();
+        crate::shared_rate_guard::pre_request_check(guard_provider, &guard_key_id, "OpenAI")?;
+
         let max_retries = 3;
         for attempt in 0..=max_retries {
             let url = match &self.url_query {
@@ -847,9 +943,13 @@ impl LlmDriver for OpenAIDriver {
             for (k, v) in &self.extra_headers {
                 req_builder = req_builder.header(k, v);
             }
-            if let Some(secs) = self.request_timeout_secs {
-                req_builder = req_builder.timeout(std::time::Duration::from_secs(secs));
-            }
+            // Per-request timeout takes priority; fall back to driver-level config,
+            // then a 300 s default so the daemon never waits indefinitely.
+            let timeout_secs = request
+                .timeout_secs
+                .or(self.request_timeout_secs)
+                .unwrap_or(300);
+            req_builder = req_builder.timeout(std::time::Duration::from_secs(timeout_secs));
 
             let resp = req_builder
                 .send()
@@ -858,14 +958,16 @@ impl LlmDriver for OpenAIDriver {
 
             let status = resp.status().as_u16();
             if status == 429 {
+                // Persist the lockout (honors RPH > RPM > retry-after >
+                // 5min default precedence) and reuse the parsed
+                // retry-after for the in-process backoff.
+                let retry_after = crate::shared_rate_guard::record_429_from_headers(
+                    guard_provider,
+                    &guard_key_id,
+                    resp.headers(),
+                    &format!("HTTP 429 from {}", self.base_url),
+                );
                 if attempt < max_retries {
-                    let retry_after = resp
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .map(std::time::Duration::from_secs)
-                        .unwrap_or(std::time::Duration::ZERO);
                     let delay = standard_retry_delay(attempt + 1, retry_after);
                     warn!(
                         status,
@@ -876,7 +978,7 @@ impl LlmDriver for OpenAIDriver {
                     continue;
                 }
                 return Err(LlmError::RateLimited {
-                    retry_after_ms: 5000,
+                    retry_after_ms: retry_after.as_millis().min(u64::MAX as u128) as u64,
                     message: None,
                 });
             }
@@ -914,10 +1016,17 @@ impl LlmDriver for OpenAIDriver {
                 {
                     warn!(model = %oai_request.model, "Stripping temperature for this model");
                     oai_request.temperature = None;
+                    // Small backoff before retrying so we don't tight-loop on a
+                    // misconfigured request (100 ms × attempt, max ~300 ms).
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * (attempt as u64 + 1),
+                    ))
+                    .await;
                     continue;
                 }
 
-                // GPT-5 / o-series: switch from max_tokens to max_completion_tokens
+                // GPT-5 / o-series: switch from max_tokens to max_completion_tokens.
+                // Add a small backoff to avoid a tight retry loop (#3758).
                 if status == 400
                     && body.contains("max_tokens")
                     && (body.contains("unsupported_parameter")
@@ -929,6 +1038,12 @@ impl LlmDriver for OpenAIDriver {
                     warn!(model = %oai_request.model, "Switching to max_completion_tokens for this model");
                     oai_request.max_tokens = None;
                     oai_request.max_completion_tokens = Some(val);
+                    // Backoff before retry: 100 ms × attempt number (capped by max_retries=3
+                    // so the total extra wait is at most ~300 ms per switch attempt).
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * (attempt as u64 + 1),
+                    ))
+                    .await;
                     continue;
                 }
 
@@ -949,6 +1064,11 @@ impl LlmDriver for OpenAIDriver {
                     } else {
                         oai_request.max_tokens = Some(cap);
                     }
+                    // Small backoff to prevent a tight retry loop.
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * (attempt as u64 + 1),
+                    ))
+                    .await;
                     continue;
                 }
 
@@ -971,6 +1091,11 @@ impl LlmDriver for OpenAIDriver {
                     );
                     oai_request.tools.clear();
                     oai_request.tool_choice = None;
+                    // Small backoff to prevent a tight retry loop.
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * (attempt as u64 + 1),
+                    ))
+                    .await;
                     continue;
                 }
 
@@ -1128,7 +1253,7 @@ impl LlmDriver for OpenAIDriver {
                 }
             };
 
-            let mut usage = oai_response
+            let usage = oai_response
                 .usage
                 .map(|u| {
                     let cached = u
@@ -1145,16 +1270,10 @@ impl LlmDriver for OpenAIDriver {
                 })
                 .unwrap_or_default();
 
-            // Guard: if the model returned content but usage is missing/zero
-            // (common with local LLMs like LM Studio, Ollama), set a synthetic
-            // non-zero output_tokens so the agent loop doesn't misclassify
-            // this as a "silent failure" and loop unnecessarily.
-            if !content.is_empty() && usage.input_tokens == 0 && usage.output_tokens == 0 {
-                debug!(
-                    "Response has content but no usage stats — setting synthetic output_tokens=1"
-                );
-                usage.output_tokens = 1;
-            }
+            // Note: if the model returned content but usage is missing/zero
+            // (common with local LLMs like LM Studio, Ollama), we leave
+            // output_tokens as 0 to accurately reflect unknown usage rather
+            // than reporting a fake count that would corrupt cost tracking.
 
             debug!(
                 prompt_tokens = usage.input_tokens,
@@ -1189,6 +1308,15 @@ impl LlmDriver for OpenAIDriver {
         let mut oai_request = self.build_request(&request)?;
         oai_request.stream = true;
         oai_request.stream_options = Some(serde_json::json!({"include_usage": true}));
+
+        // Cross-process / cross-restart rate-limit guard (streaming path).
+        let guard_provider = self.shared_guard_provider();
+        let guard_key_id = self.shared_guard_key_id();
+        crate::shared_rate_guard::pre_request_check(
+            guard_provider,
+            &guard_key_id,
+            "OpenAI streaming",
+        )?;
 
         // Retry loop for the initial HTTP request
         let max_retries = 3;
@@ -1226,9 +1354,13 @@ impl LlmDriver for OpenAIDriver {
             for (k, v) in &self.extra_headers {
                 req_builder = req_builder.header(k, v);
             }
-            if let Some(secs) = self.request_timeout_secs {
-                req_builder = req_builder.timeout(std::time::Duration::from_secs(secs));
-            }
+            // Per-request timeout takes priority; fall back to driver-level config,
+            // then a 300 s default so the daemon never waits indefinitely.
+            let timeout_secs = request
+                .timeout_secs
+                .or(self.request_timeout_secs)
+                .unwrap_or(300);
+            req_builder = req_builder.timeout(std::time::Duration::from_secs(timeout_secs));
 
             let resp = req_builder
                 .send()
@@ -1237,14 +1369,13 @@ impl LlmDriver for OpenAIDriver {
 
             let status = resp.status().as_u16();
             if status == 429 {
+                let retry_after = crate::shared_rate_guard::record_429_from_headers(
+                    guard_provider,
+                    &guard_key_id,
+                    resp.headers(),
+                    &format!("HTTP 429 (stream) from {}", self.base_url),
+                );
                 if attempt < max_retries {
-                    let retry_after = resp
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .map(std::time::Duration::from_secs)
-                        .unwrap_or(std::time::Duration::ZERO);
                     let delay = standard_retry_delay(attempt + 1, retry_after);
                     warn!(
                         status,
@@ -1255,7 +1386,7 @@ impl LlmDriver for OpenAIDriver {
                     continue;
                 }
                 return Err(LlmError::RateLimited {
-                    retry_after_ms: 5000,
+                    retry_after_ms: retry_after.as_millis().min(u64::MAX as u128) as u64,
                     message: None,
                 });
             }
@@ -1396,9 +1527,16 @@ impl LlmDriver for OpenAIDriver {
             let mut cached_prompt_tokens: u64 = 0;
             let mut chunk_count: u32 = 0;
             let mut sse_line_count: u32 = 0;
+            let mut receiver_dropped = false;
 
             let mut byte_stream = resp.bytes_stream();
             while let Some(chunk_result) = byte_stream.next().await {
+                if receiver_dropped {
+                    tracing::debug!(
+                        "streaming receiver dropped; cancelling OpenAI-compatible LLM stream"
+                    );
+                    break;
+                }
                 let chunk = chunk_result.map_err(|e| LlmError::Http(e.to_string()))?;
                 chunk_count += 1;
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -1466,15 +1604,24 @@ impl LlmDriver for OpenAIDriver {
                                 for action in think_filter.process(text) {
                                     match action {
                                         FilterAction::EmitText(t) => {
-                                            let _ =
-                                                tx.send(StreamEvent::TextDelta { text: t }).await;
+                                            if tx
+                                                .send(StreamEvent::TextDelta { text: t })
+                                                .await
+                                                .is_err()
+                                            {
+                                                receiver_dropped = true;
+                                            }
                                         }
                                         FilterAction::EmitThinking(t) => {
                                             // Route think content the same way as
                                             // reasoning_content deltas.
-                                            let _ = tx
+                                            if tx
                                                 .send(StreamEvent::ThinkingDelta { text: t })
-                                                .await;
+                                                .await
+                                                .is_err()
+                                            {
+                                                receiver_dropped = true;
+                                            }
                                         }
                                     }
                                 }
@@ -1485,22 +1632,30 @@ impl LlmDriver for OpenAIDriver {
                         if let Some(reasoning) = delta["reasoning_content"].as_str() {
                             if !reasoning.is_empty() {
                                 reasoning_content.push_str(reasoning);
-                                let _ = tx
+                                if tx
                                     .send(StreamEvent::ThinkingDelta {
                                         text: reasoning.to_string(),
                                     })
-                                    .await;
+                                    .await
+                                    .is_err()
+                                {
+                                    receiver_dropped = true;
+                                }
                             }
                         } else if let Some(reasoning) = delta["reasoning"].as_str() {
                             // Fallback: Ollama and some local servers expose the reasoning
                             // field instead of reasoning_content.
                             if !reasoning.is_empty() {
                                 reasoning_content.push_str(reasoning);
-                                let _ = tx
+                                if tx
                                     .send(StreamEvent::ThinkingDelta {
                                         text: reasoning.to_string(),
                                     })
-                                    .await;
+                                    .await
+                                    .is_err()
+                                {
+                                    receiver_dropped = true;
+                                }
                             }
                         }
 
@@ -1523,23 +1678,31 @@ impl LlmDriver for OpenAIDriver {
                                     // Name (sent in first chunk)
                                     if let Some(name) = func["name"].as_str() {
                                         tool_accum[idx].1 = name.to_string();
-                                        let _ = tx
+                                        if tx
                                             .send(StreamEvent::ToolUseStart {
                                                 id: tool_accum[idx].0.clone(),
                                                 name: name.to_string(),
                                             })
-                                            .await;
+                                            .await
+                                            .is_err()
+                                        {
+                                            receiver_dropped = true;
+                                        }
                                     }
 
                                     // Arguments delta
                                     if let Some(args) = func["arguments"].as_str() {
                                         tool_accum[idx].2.push_str(args);
                                         if !args.is_empty() {
-                                            let _ = tx
+                                            if tx
                                                 .send(StreamEvent::ToolInputDelta {
                                                     text: args.to_string(),
                                                 })
-                                                .await;
+                                                .await
+                                                .is_err()
+                                            {
+                                                receiver_dropped = true;
+                                            }
                                         }
                                     }
                                 }
@@ -1556,13 +1719,26 @@ impl LlmDriver for OpenAIDriver {
 
             // Flush any remaining buffered content from the think filter
             // (e.g. partial tag at stream end, or unclosed think block).
-            for action in think_filter.flush() {
-                match action {
-                    FilterAction::EmitText(t) => {
-                        let _ = tx.send(StreamEvent::TextDelta { text: t }).await;
-                    }
-                    FilterAction::EmitThinking(t) => {
-                        let _ = tx.send(StreamEvent::ThinkingDelta { text: t }).await;
+            // The receiver may have already disconnected mid-stream; if so we
+            // skip the flush. We don't update `receiver_dropped` again here
+            // because nothing after this block reads it.
+            if !receiver_dropped {
+                for action in think_filter.flush() {
+                    match action {
+                        FilterAction::EmitText(t) => {
+                            if tx.send(StreamEvent::TextDelta { text: t }).await.is_err() {
+                                break;
+                            }
+                        }
+                        FilterAction::EmitThinking(t) => {
+                            if tx
+                                .send(StreamEvent::ThinkingDelta { text: t })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -1657,6 +1833,19 @@ impl LlmDriver for OpenAIDriver {
             }
 
             for (id, name, arguments) in &tool_accum {
+                // Skip malformed tool calls (empty ID or name can happen if
+                // streaming chunks arrive out of order or are dropped by proxy,
+                // e.g. the GitHub Copilot proxy occasionally drops the function
+                // name chunk). Replaying these to the API yields
+                // "tool call must have a tool call ID and function name" errors.
+                if id.is_empty() || name.is_empty() {
+                    warn!(
+                        tool_id = %id,
+                        tool_name = %name,
+                        "Skipping tool call with empty ID or name from streaming response"
+                    );
+                    continue;
+                }
                 let input: serde_json::Value = match parse_tool_args(arguments) {
                     Ok(v) => ensure_object(v),
                     Err(e) => {
@@ -1681,6 +1870,8 @@ impl LlmDriver for OpenAIDriver {
                     input: input.clone(),
                 });
 
+                // Receiver-drop here is non-recoverable but we still build the
+                // final response below so the caller (if present) gets it.
                 let _ = tx
                     .send(StreamEvent::ToolUseEnd {
                         id: id.clone(),
@@ -1691,6 +1882,11 @@ impl LlmDriver for OpenAIDriver {
             }
 
             let stop_reason = match finish_reason.as_deref() {
+                // If the upstream said "tool_calls" but we filtered them all
+                // out (e.g. Copilot proxy dropped function-name chunks),
+                // downgrade to EndTurn so the agent loop doesn't stage an
+                // empty tool-use turn that nothing can execute.
+                Some("tool_calls") if tool_calls.is_empty() => StopReason::EndTurn,
                 Some("stop") => StopReason::EndTurn,
                 Some("tool_calls") => StopReason::ToolUse,
                 Some("length") => StopReason::MaxTokens,
@@ -1703,15 +1899,6 @@ impl LlmDriver for OpenAIDriver {
                 }
             };
 
-            // Guard: if the model returned content but usage is missing/zero
-            // (common with local LLMs like LM Studio, Ollama), set a synthetic
-            // non-zero output_tokens so the agent loop doesn't misclassify
-            // this as a "silent failure" and loop unnecessarily.
-            if !content.is_empty() && usage.input_tokens == 0 && usage.output_tokens == 0 {
-                debug!("Stream has content but no usage stats — setting synthetic output_tokens=1");
-                usage.output_tokens = 1;
-            }
-
             debug!(
                 prompt_tokens = usage.input_tokens,
                 completion_tokens = usage.output_tokens,
@@ -1719,6 +1906,9 @@ impl LlmDriver for OpenAIDriver {
                 "OpenAI-compatible usage (stream)"
             );
 
+            // Best-effort: send ContentComplete even if the receiver dropped
+            // mid-stream — the caller still needs the usage data to update
+            // cost tracking.
             let _ = tx
                 .send(StreamEvent::ContentComplete { stop_reason, usage })
                 .await;
@@ -1735,6 +1925,10 @@ impl LlmDriver for OpenAIDriver {
             status: 0,
             message: "Max retries exceeded".to_string(),
         })
+    }
+
+    fn family(&self) -> crate::llm_driver::LlmFamily {
+        crate::llm_driver::LlmFamily::OpenAi
     }
 }
 
@@ -2107,6 +2301,7 @@ mod tests {
             system: None,
             thinking: Some(librefang_types::config::ThinkingConfig::default()),
             prompt_caching: false,
+            cache_ttl: None,
             response_format: None,
             timeout_secs: None,
             extra_body: None,
@@ -2134,6 +2329,7 @@ mod tests {
             system: None,
             thinking: None,
             prompt_caching: false,
+            cache_ttl: None,
             response_format: None,
             timeout_secs: None,
             extra_body: None,
@@ -2161,6 +2357,7 @@ mod tests {
             system: None,
             thinking: Some(librefang_types::config::ThinkingConfig::default()),
             prompt_caching: false,
+            cache_ttl: None,
             response_format: None,
             timeout_secs: None,
             extra_body: None,
@@ -2253,7 +2450,7 @@ mod tests {
         assert!(!rejects_temperature("gpt-4o-mini"));
         assert!(!rejects_temperature("gpt-5"));
         assert!(!rejects_temperature("gpt-5-2025-06-01"));
-        assert!(!rejects_temperature("claude-sonnet-4-20250514"));
+        assert!(!rejects_temperature("plain-model-placeholder"));
         assert!(!rejects_temperature("llama-3.3-70b-versatile"));
         assert!(!rejects_temperature("deepseek-chat"));
     }
@@ -2591,5 +2788,97 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.get("extra_body").is_none());
+    }
+
+    fn make_msg(role: &str, content: Option<&str>, has_tool_calls: bool) -> OaiMessage {
+        OaiMessage {
+            role: role.to_string(),
+            content: content.map(|c| OaiMessageContent::Text(c.to_string())),
+            tool_calls: if has_tool_calls {
+                Some(vec![OaiToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: OaiFunction {
+                        name: "test".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }])
+            } else {
+                None
+            },
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn test_strip_trailing_empty_assistant_non_claude_keeps_non_empty() {
+        // For non-Claude models, a trailing assistant with non-empty text must be kept
+        // (otherwise the agent loop would never terminate).
+        let mut msgs = vec![
+            make_msg("user", Some("hi"), false),
+            make_msg("assistant", Some("hello there"), false),
+        ];
+        strip_trailing_empty_assistant(&mut msgs, "gpt-4o");
+        assert_eq!(
+            msgs.len(),
+            2,
+            "non-empty assistant should survive for non-Claude"
+        );
+    }
+
+    #[test]
+    fn test_strip_trailing_empty_assistant_non_claude_strips_empty() {
+        let mut msgs = vec![
+            make_msg("user", Some("hi"), false),
+            make_msg("assistant", Some("   "), false),
+            make_msg("assistant", None, false),
+        ];
+        strip_trailing_empty_assistant(&mut msgs, "gpt-4o");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    #[test]
+    fn test_strip_trailing_empty_assistant_claude_strips_non_empty() {
+        // Claude via Copilot: strip any trailing assistant without tool_calls,
+        // even if it has non-empty text — Anthropic rejects assistant prefill.
+        let mut msgs = vec![
+            make_msg("user", Some("hi"), false),
+            make_msg("assistant", Some("partial response"), false),
+        ];
+        strip_trailing_empty_assistant(&mut msgs, "claude-3-5-sonnet");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    #[test]
+    fn test_strip_trailing_empty_assistant_keeps_tool_calls() {
+        // Assistant messages with tool_calls are protocol-essential and must stay
+        // for both Claude and non-Claude models.
+        let mut claude_msgs = vec![
+            make_msg("user", Some("hi"), false),
+            make_msg("assistant", None, true),
+        ];
+        strip_trailing_empty_assistant(&mut claude_msgs, "claude-3-5-sonnet");
+        assert_eq!(claude_msgs.len(), 2);
+
+        let mut gpt_msgs = vec![
+            make_msg("user", Some("hi"), false),
+            make_msg("assistant", None, true),
+        ];
+        strip_trailing_empty_assistant(&mut gpt_msgs, "gpt-4o");
+        assert_eq!(gpt_msgs.len(), 2);
+    }
+
+    #[test]
+    fn test_strip_trailing_empty_assistant_claude_keeps_user_last() {
+        let mut msgs = vec![
+            make_msg("assistant", Some("earlier"), false),
+            make_msg("user", Some("now"), false),
+        ];
+        strip_trailing_empty_assistant(&mut msgs, "claude-3-opus");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs.last().unwrap().role, "user");
     }
 }

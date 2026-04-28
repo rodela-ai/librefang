@@ -7,10 +7,10 @@ description = "Build automation for the LibreFang workspace"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml_edit = "0.25"
 regex = "1"
 chrono = "0.4"
 base64 = { workspace = true }
+sha2 = { workspace = true }
 librefang-migrate = { path = "../crates/librefang-migrate" }
