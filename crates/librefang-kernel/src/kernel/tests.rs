@@ -4922,12 +4922,7 @@ fn agent_concurrency_falls_back_to_config_default_when_unset() {
 
     let (kernel, _dir) = minimal_kernel("concurrency-default-fallback");
     // default_per_agent = 1 (KernelConfig default)
-    let expected = kernel
-        .config
-        .load()
-        .queue
-        .concurrency
-        .default_per_agent;
+    let expected = kernel.config.load().queue.concurrency.default_per_agent;
 
     let agent_id = kernel
         .spawn_agent_inner(
@@ -5074,7 +5069,11 @@ fn session_mode_persistent_plus_cap_two_is_clamped_preventing_parallel_fires() {
     let (kernel, _dir) = minimal_kernel("persistent-session-no-parallel");
     let agent_id = kernel
         .spawn_agent_inner(
-            concurrency_manifest("persistent-parallel-agent", SessionMode::Persistent, Some(2)),
+            concurrency_manifest(
+                "persistent-parallel-agent",
+                SessionMode::Persistent,
+                Some(2),
+            ),
             None,
             None,
             None,
