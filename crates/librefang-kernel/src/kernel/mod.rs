@@ -2907,10 +2907,6 @@ impl LibreFangKernel {
                 warn!("Failed to load cron jobs: {e}");
             }
         }
-        // Warn about any jobs that missed fires while the daemon was offline,
-        // and reschedule them to fire immediately on the next tick (#3828).
-        cron_scheduler.warn_missed_fires();
-
         // Initialize trigger engine and reload persisted triggers
         let trigger_engine = TriggerEngine::with_config(&config.triggers, &config.home_dir);
         match trigger_engine.load() {
@@ -4576,6 +4572,7 @@ system_prompt = "You are a helpful assistant."
             prompt_caching: false,
             timeout_secs: Some(10),
             agent_id: Some(agent_id.to_string()),
+            cache_ttl: None,
         };
         let response = driver.complete(request).await.map_err(|e| {
             KernelError::LibreFang(LibreFangError::Internal(format!(
