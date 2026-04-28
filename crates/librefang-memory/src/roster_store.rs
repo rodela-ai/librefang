@@ -16,7 +16,7 @@ impl RosterStore {
     /// Create a new roster store, initialising the table if needed.
     pub fn new(conn: Arc<Mutex<Connection>>) -> Self {
         {
-            let c = conn.lock().unwrap();
+            let c = conn.lock().unwrap_or_else(|p| p.into_inner());
             c.execute_batch(
                 "CREATE TABLE IF NOT EXISTS group_roster (
                     channel_type TEXT NOT NULL,
@@ -46,8 +46,8 @@ impl RosterStore {
         if chat_id.is_empty() || user_id.is_empty() {
             return;
         }
-        let c = self.conn.lock().unwrap();
-        let _ = c.execute(
+        let c = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = c.execute(
             "INSERT INTO group_roster (channel_type, chat_id, user_id, display_name, username, first_seen, last_seen)
              VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s','now'), strftime('%s','now'))
              ON CONFLICT(channel_type, chat_id, user_id) DO UPDATE SET
@@ -55,12 +55,14 @@ impl RosterStore {
                username = COALESCE(excluded.username, group_roster.username),
                last_seen = strftime('%s','now')",
             rusqlite::params![channel, chat_id, user_id, display_name, username],
-        );
+        ) {
+            tracing::warn!(channel, chat_id, user_id, "roster upsert failed: {e}");
+        }
     }
 
     /// List all members of a group chat, ordered by display name.
     pub fn members(&self, channel: &str, chat_id: &str) -> Vec<(String, String, Option<String>)> {
-        let c = self.conn.lock().unwrap();
+        let c = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let mut stmt = c
             .prepare(
                 "SELECT user_id, display_name, username FROM group_roster
@@ -82,16 +84,23 @@ impl RosterStore {
 
     /// Remove a single member from the roster.
     pub fn remove_member(&self, channel: &str, chat_id: &str, user_id: &str) {
-        let c = self.conn.lock().unwrap();
-        let _ = c.execute(
+        let c = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = c.execute(
             "DELETE FROM group_roster WHERE channel_type = ?1 AND chat_id = ?2 AND user_id = ?3",
             rusqlite::params![channel, chat_id, user_id],
-        );
+        ) {
+            tracing::warn!(
+                channel,
+                chat_id,
+                user_id,
+                "roster remove_member failed: {e}"
+            );
+        }
     }
 
     /// Count the members in a group chat.
     pub fn member_count(&self, channel: &str, chat_id: &str) -> usize {
-        let c = self.conn.lock().unwrap();
+        let c = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         c.query_row(
             "SELECT COUNT(*) FROM group_roster WHERE channel_type = ?1 AND chat_id = ?2",
             rusqlite::params![channel, chat_id],
