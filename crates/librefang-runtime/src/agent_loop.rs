@@ -181,6 +181,19 @@ fn clamp_max_history(requested: usize, agent: &str) -> usize {
     }
 }
 
+/// Run session repair on `session.messages` before persisting on failure paths.
+///
+/// When the agent loop exits via circuit breaker, max iterations, or timeout,
+/// the session history may contain orphaned `ToolUse` blocks with no matching
+/// `ToolResult`.  Providers that enforce strict pairing (Moonshot, OpenAI)
+/// then return 400 on next load, making the session permanently broken.
+///
+/// This helper replaces `session.messages` with the repaired copy so the
+/// persisted history is always well-formed.
+fn repair_session_before_save(session: &mut Session) {
+    session.messages = crate::session_repair::validate_and_repair(&session.messages);
+}
+
 /// Maximum consecutive iterations where every executed tool failed before
 /// the loop exits with `RepeatedToolFailures`. Catches expensive wheel-spinning
 /// when the LLM cannot fix a tool call (bad auth, permanent 404, etc.).
@@ -799,6 +812,7 @@ async fn execute_single_tool_call(
                 warn!(tool = %tool_call.name, "Circuit breaker triggered");
             }
             if !ctx.opts.is_fork {
+                repair_session_before_save(ctx.session);
                 if let Err(e) = ctx.memory.save_session_async(ctx.session).await {
                     warn!("Failed to save session on circuit break: {e}");
                 }
@@ -3860,6 +3874,7 @@ pub async fn run_agent_loop(
     // Fork turns skip — they're ephemeral and must not pollute canonical
     // session history even when the loop bailed out.
     if !opts.is_fork {
+        repair_session_before_save(session);
         if let Err(e) = memory.save_session_async(session).await {
             warn!("Failed to save session on max iterations: {e}");
         }
@@ -5286,6 +5301,7 @@ pub async fn run_agent_loop_streaming(
     }
 
     if !opts.is_fork {
+        repair_session_before_save(session);
         if let Err(e) = memory.save_session_async(session).await {
             warn!("Failed to save session on max iterations: {e}");
         }
