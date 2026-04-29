@@ -3001,10 +3001,6 @@ impl LibreFangKernel {
                 warn!("Failed to load cron jobs: {e}");
             }
         }
-        // Warn about any jobs that missed fires while the daemon was offline,
-        // and reschedule them to fire immediately on the next tick (#3828).
-        cron_scheduler.warn_missed_fires();
-
         // Initialize trigger engine and reload persisted triggers
         let trigger_engine = TriggerEngine::with_config(&config.triggers, &config.home_dir);
         match trigger_engine.load() {
@@ -4628,6 +4624,52 @@ system_prompt = "You are a helpful assistant."
         check!(wecom, "wecom");
 
         None
+    }
+
+    /// Lightweight LLM call for classification tasks (reply-intent, routing, etc.).
+    ///
+    /// Resolves the agent's LLM driver and sends a minimal completion request
+    /// with NO tools, NO history, NO agent loop — just a system prompt and a
+    /// user message. Returns the raw LLM text response.
+    ///
+    /// Cost: ~100-200 tokens (system + user + response). Orders of magnitude
+    /// cheaper than `send_message` which runs the full agent loop.
+    pub async fn classify_text(
+        &self,
+        agent_id: AgentId,
+        system_prompt: &str,
+        user_message: &str,
+        max_tokens: u32,
+    ) -> KernelResult<String> {
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::LibreFang(LibreFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+        let driver = self.resolve_driver(&entry.manifest)?;
+        let request = librefang_runtime::llm_driver::CompletionRequest {
+            model: entry.manifest.model.model.clone(),
+            messages: vec![librefang_types::message::Message {
+                role: librefang_types::message::Role::User,
+                content: librefang_types::message::MessageContent::Text(user_message.to_string()),
+                pinned: false,
+                timestamp: None,
+            }],
+            tools: vec![],
+            max_tokens,
+            temperature: 0.0, // Deterministic for classification
+            system: Some(system_prompt.to_string()),
+            thinking: None,
+            extra_body: None,
+            response_format: None,
+            prompt_caching: false,
+            timeout_secs: Some(10),
+            agent_id: Some(agent_id.to_string()),
+        };
+        let response = driver.complete(request).await.map_err(|e| {
+            KernelError::LibreFang(LibreFangError::Internal(format!(
+                "classify_text LLM call failed: {e}"
+            )))
+        })?;
+        Ok(response.text())
     }
 
     /// Send an ephemeral "side question" to an agent (`/btw` command).
