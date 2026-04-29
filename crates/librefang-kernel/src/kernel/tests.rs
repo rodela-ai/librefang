@@ -4748,6 +4748,27 @@ fn mcp_summary_inner_tool_list_is_sorted() {
     );
 }
 
+#[test]
+fn mcp_summary_cache_key_is_order_independent() {
+    let order_a = vec![
+        "filesystem".to_string(),
+        "github".to_string(),
+        "weather".to_string(),
+    ];
+    let order_b = vec![
+        "weather".to_string(),
+        "filesystem".to_string(),
+        "github".to_string(),
+    ];
+
+    assert_eq!(
+        super::mcp_summary_cache_key(&order_a),
+        super::mcp_summary_cache_key(&order_b),
+        "cache key must be insertion-order-independent"
+    );
+    assert_eq!(super::mcp_summary_cache_key(&[]), "*");
+}
+
 // ─── resolve_dispatch_session_id ──────────────────────────────────────────
 //
 // Backstop for the session-id-in-failure-log change: ensures the kernel

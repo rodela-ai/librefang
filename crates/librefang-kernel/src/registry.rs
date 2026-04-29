@@ -140,6 +140,24 @@ impl AgentRegistry {
         entries
     }
 
+    /// Projects `(name, state_debug, model)` per agent, sorted by name for prompt-cache stability.
+    pub fn peer_agents_summary(&self) -> Vec<(String, String, String)> {
+        let mut entries: Vec<(String, String, String)> = self
+            .agents
+            .iter()
+            .map(|e| {
+                let v = e.value();
+                (
+                    v.name.clone(),
+                    format!("{:?}", v.state),
+                    v.manifest.model.model.clone(),
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
     /// Add a child agent ID to a parent's children list.
     pub fn add_child(&self, parent_id: AgentId, child_id: AgentId) {
         if let Some(mut entry) = self.agents.get_mut(&parent_id) {
@@ -674,6 +692,23 @@ mod tests {
 
         let names: Vec<String> = registry.list().iter().map(|e| e.name.clone()).collect();
         assert_eq!(names, vec!["alpha", "mu", "zeta"]);
+    }
+
+    #[test]
+    fn test_peer_agents_summary_is_sorted_and_projects_three_fields() {
+        let registry = AgentRegistry::new();
+        registry.register(test_entry("zeta")).unwrap();
+        registry.register(test_entry("alpha")).unwrap();
+        registry.register(test_entry("mu")).unwrap();
+
+        let summary = registry.peer_agents_summary();
+        let names: Vec<&str> = summary.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mu", "zeta"]);
+        for (name, state_debug, model) in &summary {
+            assert!(!name.is_empty());
+            assert!(!state_debug.is_empty());
+            assert!(!model.is_empty());
+        }
     }
 
     #[test]
