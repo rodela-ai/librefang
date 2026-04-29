@@ -5954,13 +5954,24 @@ bot_token_env = \"DISCORD_BOT_TOKEN\"
 
     #[test]
     fn write_secret_env_value_with_newline_is_rejected() {
+        // Implementation tightened to reject newlines in the value rather
+        // than escape them — escape-into-single-line was the old behaviour
+        // (see this test's previous name) but it left a real injection
+        // surface for callers that didn't expect dotenv parsers to honour
+        // backslash sequences.  Now we fail-closed: caller must sanitise
+        // before passing.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("secrets.env");
         let err = write_secret_env(&path, "API_KEY", "val\nwith\nnewlines").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(
             err.to_string().contains("newline"),
-            "error should mention newlines: {err}"
+            "error should mention newlines, got: {err}"
+        );
+        // No file should have been written.
+        assert!(
+            !path.exists(),
+            "secrets.env must not be created on validation error"
         );
     }
 }

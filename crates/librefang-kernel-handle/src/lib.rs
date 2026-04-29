@@ -84,16 +84,6 @@ pub trait KernelHandle: Send + Sync {
     /// When `peer_id` is `Some`, only returns keys within that peer's namespace.
     fn memory_list(&self, peer_id: Option<&str>) -> Result<Vec<String>, String>;
 
-    /// Search shared memory entries whose key or value contains `query` (case-insensitive).
-    fn memory_search(
-        &self,
-        query: &str,
-        peer_id: Option<&str>,
-    ) -> Result<Vec<(String, serde_json::Value)>, String> {
-        let _ = (query, peer_id);
-        Ok(Vec::new())
-    }
-
     /// Find agents by query (matches on name substring, tag, or tool name; case-insensitive).
     fn find_agents(&self, query: &str) -> Vec<AgentInfo>;
 
@@ -630,37 +620,6 @@ pub trait KernelHandle: Send + Sync {
         Err("Goal system not available".to_string())
     }
 
-    /// Upsert a member into the persistent group roster.
-    fn roster_upsert(
-        &self,
-        _channel: &str,
-        _chat_id: &str,
-        _user_id: &str,
-        _display_name: &str,
-        _username: Option<&str>,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// List members of a group chat from the persistent roster.
-    fn roster_members(
-        &self,
-        _channel: &str,
-        _chat_id: &str,
-    ) -> Result<Vec<serde_json::Value>, String> {
-        Ok(Vec::new())
-    }
-
-    /// Remove a member from the persistent group roster.
-    fn roster_remove_member(
-        &self,
-        _channel: &str,
-        _chat_id: &str,
-        _user_id: &str,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
     /// Run a forked agent turn that collapses to a single text response —
     /// the "structured-output via forked call" primitive. Used by the
     /// proactive memory extractor so its LLM call shares the parent
@@ -689,6 +648,37 @@ pub trait KernelHandle: Send + Sync {
         _allowed_tools: Option<Vec<String>>,
     ) -> Result<String, String> {
         Err("run_forked_agent_oneshot not available in this KernelHandle".to_string())
+    }
+
+    /// Upsert a group roster member (channel bridge → persistent storage).
+    fn roster_upsert(
+        &self,
+        _channel: &str,
+        _chat_id: &str,
+        _user_id: &str,
+        _display_name: &str,
+        _username: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// List group roster members for a (channel, chat_id) pair.
+    fn roster_members(
+        &self,
+        _channel: &str,
+        _chat_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Remove a member from the group roster.
+    fn roster_remove_member(
+        &self,
+        _channel: &str,
+        _chat_id: &str,
+        _user_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
     }
 
     /// Fire an `agent:step` external hook event.

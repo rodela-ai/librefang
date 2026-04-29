@@ -396,7 +396,54 @@ impl CronScheduler {
         count
     }
 
-
+    /// Warn about cron fires that were missed while the daemon was offline.
+    ///
+    /// Should be called immediately after [`Self::load`] on daemon startup.
+    /// Any enabled job whose `next_run` is more than 60 seconds in the past
+    /// is considered to have missed at least one fire during downtime. The
+    /// method logs a warning with the estimated missed-fire count and
+    /// immediately reschedules the job to fire on the next tick (by setting
+    /// `next_run = now`) so the scheduler can catch up without further delay.
+    ///
+    /// The 60-second grace window prevents false positives for jobs that
+    /// were just about to fire when the daemon stopped.
+    pub fn warn_missed_fires(&self) {
+        let now = Utc::now();
+        for mut entry in self.jobs.iter_mut() {
+            let meta = entry.value_mut();
+            if !meta.job.enabled {
+                continue;
+            }
+            if let Some(next_run) = meta.job.next_run {
+                let grace = Duration::seconds(60);
+                if next_run < now - grace {
+                    let overdue_secs = (now - next_run).num_seconds();
+                    // Estimate how many fires were skipped based on schedule interval.
+                    let interval_secs: i64 = match &meta.job.schedule {
+                        CronSchedule::Every { every_secs } => *every_secs as i64,
+                        CronSchedule::At { .. } => overdue_secs, // one-shot: effectively 1 missed fire
+                        CronSchedule::Cron { .. } => {
+                            // For cron expressions, approximate with the gap between
+                            // `next_run` and what `next_run` would have been after one cycle.
+                            let hypothetical_next =
+                                compute_next_run_after(&meta.job.schedule, next_run);
+                            (hypothetical_next - next_run).num_seconds().max(1)
+                        }
+                    };
+                    let missed_count = (overdue_secs / interval_secs).max(1);
+                    warn!(
+                        agent_id = %meta.job.agent_id,
+                        job_id = %meta.job.id,
+                        missed_count,
+                        overdue_secs,
+                        "cron job missed fires during daemon downtime; firing now"
+                    );
+                    // Reschedule to fire immediately on the next tick.
+                    meta.job.next_run = Some(now);
+                }
+            }
+        }
+    }
 
     /// Remove all cron jobs belonging to a specific agent.
     ///
@@ -475,7 +522,13 @@ impl CronScheduler {
     /// (iterates up to 1440 times per job to avoid pathological inputs).
     /// `At` one-shot jobs that have already passed are silently ignored
     /// (they would have been removed on successful execution anyway).
-    pub fn warn_missed_fires(&self, since: chrono::DateTime<Utc>) {
+    ///
+    /// Distinct from [`Self::warn_missed_fires`] (no-arg), which both
+    /// logs and reschedules overdue jobs for catch-up firing. Both were
+    /// independently introduced as fixes for #3828 in PRs #3906 and
+    /// #3923 and ended up colliding on the same name; this one is the
+    /// since-windowed log-only variant.
+    pub fn log_missed_fires_since(&self, since: chrono::DateTime<Utc>) {
         let now = Utc::now();
         if since >= now {
             return;
@@ -544,12 +597,27 @@ impl CronScheduler {
 
     /// Record a skipped execution for a job (e.g. agent was Suspended).
     ///
-    /// Sets `last_status` to `"skipped"` without touching error counters or
-    /// removing one-shot jobs — the job remains scheduled for its next run.
+    /// Sets `last_status` to `"skipped"` without touching error counters.
+    ///
+    /// For recurring jobs the job remains scheduled at its next_run.
+    /// For one_shot jobs (At schedule, manual one-shot) the only
+    /// scheduled fire has now passed, so the job is removed from the
+    /// scheduler — otherwise compute_next_run_after pre-advances
+    /// next_run to far-future and the job lingers in jobs.json
+    /// forever, surfacing in /api/cron as inert garbage.  Audit of
+    /// #3923 caught this; remove on skip the same way record_success
+    /// does for one_shot.
     pub fn record_skipped(&self, id: CronJobId) {
-        if let Some(mut meta) = self.jobs.get_mut(&id) {
+        let should_remove = if let Some(mut meta) = self.jobs.get_mut(&id) {
             meta.last_status = Some("skipped: agent suspended".to_string());
             debug!(job_id = %id, "Cron job skipped (agent suspended)");
+            meta.one_shot
+        } else {
+            false
+        };
+        if should_remove {
+            self.jobs.remove(&id);
+            debug!(job_id = %id, "Removed one-shot cron job after skip");
         }
     }
 

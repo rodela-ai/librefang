@@ -4116,7 +4116,12 @@ async fn test_push_notification_health_check_failed_falls_back_to_alert_channels
     kernel.channel_adapters.insert("test".to_string(), adapter);
 
     kernel
-        .push_notification("agent-xyz", "health_check_failed", "agent unresponsive")
+        .push_notification(
+            "agent-xyz",
+            "health_check_failed",
+            "agent unresponsive",
+            None,
+        )
         .await;
 
     let recorded = sent.lock().unwrap().clone();
@@ -4165,7 +4170,12 @@ async fn test_push_notification_health_check_failed_agent_rule_overrides_alert_c
     kernel.channel_adapters.insert("test".to_string(), adapter);
 
     kernel
-        .push_notification("worker-7", "health_check_failed", "agent unresponsive")
+        .push_notification(
+            "worker-7",
+            "health_check_failed",
+            "agent unresponsive",
+            None,
+        )
         .await;
 
     let recorded = sent.lock().unwrap().clone();
@@ -4199,7 +4209,12 @@ async fn test_push_notification_health_check_failed_no_targets_when_unconfigured
     kernel.channel_adapters.insert("test".to_string(), adapter);
 
     kernel
-        .push_notification("agent-xyz", "health_check_failed", "agent unresponsive")
+        .push_notification(
+            "agent-xyz",
+            "health_check_failed",
+            "agent unresponsive",
+            None,
+        )
         .await;
 
     assert!(
@@ -4245,12 +4260,119 @@ async fn test_push_notification_unknown_event_type_yields_no_targets() {
     kernel.channel_adapters.insert("test".to_string(), adapter);
 
     kernel
-        .push_notification("agent-xyz", "totally_made_up_event", "should not deliver")
+        .push_notification(
+            "agent-xyz",
+            "totally_made_up_event",
+            "should not deliver",
+            None,
+        )
         .await;
 
     assert!(
         sent.lock().unwrap().is_empty(),
         "unknown event_type must not deliver to any global channel"
+    );
+
+    kernel.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_push_notification_appends_session_suffix_when_provided() {
+    // Operator alerts for session-scoped events (task_completed,
+    // task_failed, tool_failure) must include `[session=<uuid>]` so
+    // operators can correlate the alert with the failing session's
+    // history. Companion to #3260, which added session_id to the
+    // `Agent loop failed` warn log.
+    let dir = tempfile::tempdir().unwrap();
+    let home_dir = dir.path().to_path_buf();
+    std::fs::create_dir_all(home_dir.join("data")).unwrap();
+
+    let mut config = KernelConfig {
+        home_dir: home_dir.clone(),
+        data_dir: home_dir.join("data"),
+        ..KernelConfig::default()
+    };
+    config.notification = NotificationConfig {
+        approval_channels: Vec::new(),
+        alert_channels: vec![NotificationTarget {
+            channel_type: "test".to_string(),
+            recipient: "ops".to_string(),
+            thread_id: None,
+        }],
+        agent_rules: Vec::new(),
+    };
+
+    let kernel = LibreFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let adapter = Arc::new(RecordingChannelAdapter::new("test"));
+    let sent = adapter.sent.clone();
+    kernel.channel_adapters.insert("test".to_string(), adapter);
+
+    let session_id = SessionId::new();
+    kernel
+        .push_notification(
+            "agent-xyz",
+            "tool_failure",
+            "Agent \"x\" exited after 3 consecutive tool failures",
+            Some(&session_id),
+        )
+        .await;
+
+    let recorded = sent.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 1, "exactly one alert delivered");
+    let expected =
+        format!("ops:Agent \"x\" exited after 3 consecutive tool failures [session={session_id}]");
+    assert_eq!(
+        recorded[0], expected,
+        "session-scoped alert must include [session=<uuid>] suffix"
+    );
+
+    kernel.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_push_notification_omits_session_suffix_for_agent_level_alerts() {
+    // health_check_failed is agent-level, not session-scoped — the
+    // call site passes None and the delivered message must NOT carry a
+    // `[session=…]` suffix that would mislead operators into thinking
+    // a specific session was at fault.
+    let dir = tempfile::tempdir().unwrap();
+    let home_dir = dir.path().to_path_buf();
+    std::fs::create_dir_all(home_dir.join("data")).unwrap();
+
+    let mut config = KernelConfig {
+        home_dir: home_dir.clone(),
+        data_dir: home_dir.join("data"),
+        ..KernelConfig::default()
+    };
+    config.notification = NotificationConfig {
+        approval_channels: Vec::new(),
+        alert_channels: vec![NotificationTarget {
+            channel_type: "test".to_string(),
+            recipient: "ops".to_string(),
+            thread_id: None,
+        }],
+        agent_rules: Vec::new(),
+    };
+
+    let kernel = LibreFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let adapter = Arc::new(RecordingChannelAdapter::new("test"));
+    let sent = adapter.sent.clone();
+    kernel.channel_adapters.insert("test".to_string(), adapter);
+
+    kernel
+        .push_notification(
+            "agent-xyz",
+            "health_check_failed",
+            "Agent \"x\" is unresponsive",
+            None,
+        )
+        .await;
+
+    let recorded = sent.lock().unwrap().clone();
+    assert_eq!(
+        recorded,
+        vec!["ops:Agent \"x\" is unresponsive".to_string()],
+        "agent-level alert must not carry a session suffix"
     );
 
     kernel.shutdown();
@@ -4624,6 +4746,128 @@ fn mcp_summary_inner_tool_list_is_sorted() {
         close_pos < create_pos && create_pos < search_pos,
         "Inner tool list must be sorted; got: {summary}"
     );
+}
+
+#[test]
+fn mcp_summary_cache_key_is_order_independent() {
+    let order_a = vec![
+        "filesystem".to_string(),
+        "github".to_string(),
+        "weather".to_string(),
+    ];
+    let order_b = vec![
+        "weather".to_string(),
+        "filesystem".to_string(),
+        "github".to_string(),
+    ];
+
+    assert_eq!(
+        super::mcp_summary_cache_key(&order_a),
+        super::mcp_summary_cache_key(&order_b),
+        "cache key must be insertion-order-independent"
+    );
+    assert_eq!(super::mcp_summary_cache_key(&[]), "*");
+}
+
+#[test]
+fn available_tools_mcp_section_is_sorted_across_connect_orders() {
+    // Regression for #3765: connect / hot-reload order of MCP servers must
+    // not mutate the LLM tool definition list, otherwise provider prompt
+    // caches miss on every daemon restart.
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("librefang-mcp-order-test");
+    std::fs::create_dir_all(home.join("data")).unwrap();
+    let cfg = KernelConfig {
+        home_dir: home.clone(),
+        data_dir: home.join("data"),
+        ..KernelConfig::default()
+    };
+
+    let kernel = LibreFangKernel::boot_with_config(cfg).expect("kernel should boot");
+    let manifest = AgentManifest {
+        name: "mcp-order".to_string(),
+        description: "agent for mcp order regression".to_string(),
+        author: "test".to_string(),
+        module: "builtin:chat".to_string(),
+        ..Default::default()
+    };
+    let agent_id = kernel.spawn_agent(manifest).expect("spawn should succeed");
+
+    // Order A: connect filesystem before github before weather.
+    {
+        let mut tools = kernel.mcp_tools_ref().lock().unwrap();
+        tools.clear();
+        tools.push(librefang_types::tool::ToolDefinition {
+            name: "mcp_filesystem_read_file".to_string(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        });
+        tools.push(librefang_types::tool::ToolDefinition {
+            name: "mcp_github_create_issue".to_string(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        });
+        tools.push(librefang_types::tool::ToolDefinition {
+            name: "mcp_weather_forecast".to_string(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        });
+    }
+    kernel
+        .mcp_generation
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let names_a: Vec<String> = kernel
+        .available_tools(agent_id)
+        .iter()
+        .filter(|t| t.name.starts_with("mcp_"))
+        .map(|t| t.name.clone())
+        .collect();
+
+    // Order B: same set, scrambled connect order.
+    {
+        let mut tools = kernel.mcp_tools_ref().lock().unwrap();
+        tools.clear();
+        tools.push(librefang_types::tool::ToolDefinition {
+            name: "mcp_weather_forecast".to_string(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        });
+        tools.push(librefang_types::tool::ToolDefinition {
+            name: "mcp_github_create_issue".to_string(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        });
+        tools.push(librefang_types::tool::ToolDefinition {
+            name: "mcp_filesystem_read_file".to_string(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        });
+    }
+    kernel
+        .mcp_generation
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let names_b: Vec<String> = kernel
+        .available_tools(agent_id)
+        .iter()
+        .filter(|t| t.name.starts_with("mcp_"))
+        .map(|t| t.name.clone())
+        .collect();
+
+    assert_eq!(
+        names_a, names_b,
+        "MCP tool list must be byte-identical across connect orders (#3765)"
+    );
+    assert_eq!(
+        names_a,
+        vec![
+            "mcp_filesystem_read_file".to_string(),
+            "mcp_github_create_issue".to_string(),
+            "mcp_weather_forecast".to_string(),
+        ],
+        "MCP tools must be sorted lexicographically by name"
+    );
+
+    kernel.shutdown();
 }
 
 // ─── resolve_dispatch_session_id ──────────────────────────────────────────
@@ -5093,4 +5337,342 @@ fn session_mode_persistent_plus_cap_two_is_clamped_preventing_parallel_fires() {
     );
 
     kernel.shutdown();
+}
+
+// ─── spawn_agent error path unit tests ──────────────────────────────────────────
+// These tests verify error handling without requiring an LLM API key.
+// See issue #3816: kernel/mod.rs has zero unit tests.
+//
+// NOTE: The current kernel implementation allows empty/invalid names.
+// This is a bug - it should validate agent names before spawning.
+// The tests document the current (buggy) behavior for now.
+// A follow-up should add proper validation.
+
+#[test]
+fn spawn_agent_allows_empty_name() {
+    // BUG: kernel accepts empty name - should reject
+    let tmp = tempfile::tempdir().unwrap();
+    let home_dir = tmp.path().join("librefang-kernel-empty-name-test");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    let config = KernelConfig {
+        home_dir: home_dir.clone(),
+        data_dir: home_dir.join("data"),
+        ..KernelConfig::default()
+    };
+    let kernel = LibreFangKernel::boot_with_config(config).expect("Kernel should boot");
+
+    let manifest = AgentManifest {
+        name: "".to_string(),
+        ..Default::default()
+    };
+
+    let result = kernel.spawn_agent(manifest);
+    // Current (buggy) behavior: accepts empty name
+    assert!(result.is_ok(), "BUG: empty name was accepted: {result:?}");
+
+    kernel.shutdown();
+}
+
+#[test]
+fn spawn_agent_allows_special_chars_in_name() {
+    // BUG: kernel accepts special chars - should reject
+    let tmp = tempfile::tempdir().unwrap();
+    let home_dir = tmp.path().join("librefang-kernel-invalid-name-test");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    let config = KernelConfig {
+        home_dir: home_dir.clone(),
+        data_dir: home_dir.join("data"),
+        ..KernelConfig::default()
+    };
+    let kernel = LibreFangKernel::boot_with_config(config).expect("Kernel should boot");
+
+    let manifest = AgentManifest {
+        name: "invalid/name".to_string(),
+        ..Default::default()
+    };
+
+    let result = kernel.spawn_agent(manifest);
+    // Current (buggy) behavior: accepts '/' in name
+    assert!(
+        result.is_ok(),
+        "BUG: name with '/' was accepted: {result:?}"
+    );
+
+    kernel.shutdown();
+}
+
+#[test]
+fn spawn_agent_rejects_duplicate_name() {
+    // This works correctly: registry rejects duplicates by name
+    let tmp = tempfile::tempdir().unwrap();
+    let home_dir = tmp.path().join("librefang-kernel-dup-name-test");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    let config = KernelConfig {
+        home_dir: home_dir.clone(),
+        data_dir: home_dir.join("data"),
+        ..KernelConfig::default()
+    };
+    let kernel = LibreFangKernel::boot_with_config(config).expect("Kernel should boot");
+
+    let manifest = AgentManifest {
+        name: "duplicate-test-agent".to_string(),
+        module: "builtin:chat".to_string(),
+        ..Default::default()
+    };
+
+    // First spawn should succeed
+    let _first_id = kernel
+        .spawn_agent(manifest.clone())
+        .expect("First spawn should succeed");
+
+    // Second spawn with same name should fail (registry rejects duplicates)
+    let second_result = kernel.spawn_agent(manifest);
+    assert!(
+        second_result.is_err(),
+        "Duplicate name should be rejected, got: {second_result:?}"
+    );
+
+    kernel.shutdown();
+}
+
+#[test]
+fn spawn_agent_with_parent_rejects_unregistered_parent() {
+    use librefang_types::error::LibreFangError;
+    let tmp = tempfile::tempdir().unwrap();
+    let home_dir = tmp.path().join("librefang-kernel-unregistered-parent");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    let config = KernelConfig {
+        home_dir: home_dir.clone(),
+        data_dir: home_dir.join("data"),
+        ..KernelConfig::default()
+    };
+    let kernel = LibreFangKernel::boot_with_config(config).expect("Kernel should boot");
+
+    let parent_id = AgentId::from_name("non-existent-parent");
+    let manifest = AgentManifest {
+        name: "child-agent".to_string(),
+        module: "builtin:chat".to_string(),
+        ..Default::default()
+    };
+
+    let result = kernel.spawn_agent_with_parent(manifest, Some(parent_id));
+    assert!(
+        matches!(
+            result,
+            Err(KernelError::LibreFang(LibreFangError::Internal(ref e)))
+            if e.contains("not registered")
+        ),
+        "Unregistered parent should be rejected, got: {result:?}"
+    );
+
+    kernel.shutdown();
+}
+
+// ─── cron_create peer_id unit tests ──────────────────────────────────────────
+// Test cron_create peer_id extraction. See issue #2970.
+// The actual peer_id is extracted at line 16311 in mod.rs: job_json["peer_id"].as_str()
+
+#[test]
+fn cron_create_extracts_peer_id_from_job_json() {
+    use serde_json::json;
+
+    let job_json = json!({
+        "name": "test-cron",
+        "schedule": { "cron": "0 * * * *" },
+        "action": { "send_message": "test message" },
+        "peer_id": "test-peer-123"
+    });
+
+    let peer_id = job_json["peer_id"].as_str().map(|s| s.to_string());
+    assert_eq!(peer_id, Some("test-peer-123".to_string()));
+}
+
+#[test]
+fn cron_create_handles_missing_peer_id() {
+    use serde_json::json;
+
+    let job_json = json!({
+        "name": "test-cron",
+        "schedule": { "cron": "0 * * * *" },
+        "action": { "send_message": "test message" }
+    });
+
+    let peer_id = job_json["peer_id"].as_str().map(|s| s.to_string());
+    assert_eq!(peer_id, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn injection_senders_two_sessions_one_agent_do_not_collide() {
+    let kernel = boot_kernel_for_display_tests();
+    let agent_id = register_test_agent(&kernel, "twin");
+
+    let session_a = SessionId::new();
+    let session_b = SessionId::new();
+
+    let _rx_a = kernel.setup_injection_channel(agent_id, session_a);
+    let _rx_b = kernel.setup_injection_channel(agent_id, session_b);
+
+    // Both senders must be live concurrently (second insert used to overwrite the first).
+    assert!(
+        kernel
+            .injection_senders
+            .contains_key(&(agent_id, session_a)),
+        "session A sender lost under (agent, session) keying"
+    );
+    assert!(
+        kernel
+            .injection_senders
+            .contains_key(&(agent_id, session_b)),
+        "session B sender lost under (agent, session) keying"
+    );
+
+    // Targeted inject must reach exactly one session — the other's mpsc
+    // receiver still holds at-zero queue depth.
+    kernel
+        .inject_message_for_session(agent_id, Some(session_a), "hello A")
+        .await
+        .expect("inject A");
+
+    let queued_a = _rx_a.lock().await.try_recv();
+    let queued_b = _rx_b.lock().await.try_recv();
+    assert!(queued_a.is_ok(), "session A must have received");
+    assert!(
+        matches!(queued_b, Err(tokio::sync::mpsc::error::TryRecvError::Empty)),
+        "session B must NOT have received a session-A inject"
+    );
+
+    // Untargeted inject (None session_id) broadcasts to both sessions.
+    kernel
+        .inject_message_for_session(agent_id, None, "broadcast")
+        .await
+        .expect("inject broadcast");
+
+    assert!(_rx_a.lock().await.try_recv().is_ok());
+    assert!(_rx_b.lock().await.try_recv().is_ok());
+
+    kernel.teardown_injection_channel(agent_id, session_a);
+    kernel.teardown_injection_channel(agent_id, session_b);
+    kernel.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn injection_teardown_only_removes_target_session() {
+    let kernel = boot_kernel_for_display_tests();
+    let agent_id = register_test_agent(&kernel, "twin2");
+
+    let session_a = SessionId::new();
+    let session_b = SessionId::new();
+
+    let _rx_a = kernel.setup_injection_channel(agent_id, session_a);
+    let _rx_b = kernel.setup_injection_channel(agent_id, session_b);
+
+    // Tearing down session A must NOT clear session B's sender.
+    kernel.teardown_injection_channel(agent_id, session_a);
+    assert!(!kernel
+        .injection_senders
+        .contains_key(&(agent_id, session_a)));
+    assert!(kernel
+        .injection_senders
+        .contains_key(&(agent_id, session_b)));
+
+    kernel.teardown_injection_channel(agent_id, session_b);
+    kernel.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Session label generation — pure-function helpers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn extract_label_seed_returns_none_when_no_user_message() {
+    use librefang_types::message::Message;
+    let messages = vec![Message::assistant("Hi")];
+    assert!(extract_label_seed(&messages).is_none());
+}
+
+#[test]
+fn extract_label_seed_returns_none_when_no_assistant_reply_yet() {
+    use librefang_types::message::Message;
+    let messages = vec![Message::user("Hello")];
+    assert!(extract_label_seed(&messages).is_none());
+}
+
+#[test]
+fn extract_label_seed_returns_none_for_empty_text_blocks() {
+    use librefang_types::message::Message;
+    // Whitespace-only content is treated as empty so the seed is None.
+    let messages = vec![Message::user("   "), Message::assistant("\n\t")];
+    assert!(extract_label_seed(&messages).is_none());
+}
+
+#[test]
+fn extract_label_seed_picks_first_user_and_assistant_text() {
+    use librefang_types::message::Message;
+    let messages = vec![
+        Message::user("hello world"),
+        Message::assistant("hi back"),
+        Message::user("ignored second"),
+        Message::assistant("ignored too"),
+    ];
+    let (u, a) = extract_label_seed(&messages).expect("seed");
+    assert_eq!(u, "hello world");
+    assert_eq!(a, "hi back");
+}
+
+#[test]
+fn extract_label_seed_concatenates_text_blocks() {
+    use librefang_types::message::{ContentBlock, Message};
+    let user_msg = Message::user_with_blocks(vec![
+        ContentBlock::Text {
+            text: "hello".to_string(),
+            provider_metadata: None,
+        },
+        ContentBlock::Text {
+            text: "world".to_string(),
+            provider_metadata: None,
+        },
+    ]);
+    let messages = vec![user_msg, Message::assistant("ack")];
+    let (u, a) = extract_label_seed(&messages).expect("seed");
+    assert_eq!(u, "hello world");
+    assert_eq!(a, "ack");
+}
+
+#[test]
+fn sanitize_session_title_strips_quotes_and_prefix() {
+    assert_eq!(
+        sanitize_session_title("\"Refactor login flow\""),
+        "Refactor login flow"
+    );
+    assert_eq!(
+        sanitize_session_title("Title: Plan the rollout"),
+        "Plan the rollout"
+    );
+    assert_eq!(
+        sanitize_session_title("'Backup script audit'"),
+        "Backup script audit"
+    );
+}
+
+#[test]
+fn sanitize_session_title_keeps_only_first_line() {
+    let raw = "Quick fix\nExtra commentary the model added";
+    assert_eq!(sanitize_session_title(raw), "Quick fix");
+}
+
+#[test]
+fn sanitize_session_title_caps_at_60_chars() {
+    let long = "a".repeat(200);
+    let out = sanitize_session_title(&long);
+    assert!(
+        out.chars().count() <= 60,
+        "got {} chars",
+        out.chars().count()
+    );
+}
+
+#[test]
+fn sanitize_session_title_handles_empty() {
+    assert_eq!(sanitize_session_title(""), "");
+    assert_eq!(sanitize_session_title("   \n  "), "");
 }

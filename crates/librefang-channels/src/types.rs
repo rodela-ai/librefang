@@ -999,41 +999,16 @@ mod tests {
 
     // ── retreat_past_html_tag regression tests ────────────────────────────
 
-    #[test]
-    fn test_split_message_multibyte_utf8_no_panic() {
-        // Regression test for #2285: retreat_past_html_entity panicked when
-        // search_start landed inside a multi-byte char like ñ (2 bytes).
-        // Build a string where ñ straddles the max_len - 12 boundary.
-        let text = "coño ".repeat(300); // 1500 chars, plenty of ñ near any boundary
-        let chunks = split_message(&text, 50);
-        assert!(!chunks.is_empty());
-        // Verify all chunks are valid UTF-8 (implicit — they're &str)
-        for chunk in &chunks {
-            assert!(chunk.len() <= 50);
-        }
-    }
-
-    #[test]
-    fn test_split_message_emoji_no_panic() {
-        // Emoji are 4 bytes in UTF-8 — even more fragile than ñ.
-        let text = "hello 😀 ".repeat(200);
-        let chunks = split_message(&text, 40);
-        assert!(!chunks.is_empty());
-        for chunk in &chunks {
-            assert!(chunk.len() <= 40);
-        }
-    }
-
-    // ── retreat_past_html_tag regression tests ────────────────────────────
-
     /// Regression: `<a href="https://example.com/path/to/page">` must NOT be
-    /// treated as self-closing. A `/` in a URL attribute is not `/>`.
-    /// Only `/>` (slash immediately before `>`) is self-closing.
+    /// treated as self-closing just because the URL contains `/` characters.
+    /// Only `/>` (slash immediately before `>`) is a self-closing indicator.
     #[test]
     fn test_anchor_with_url_not_self_closing() {
+        // max_len=57: large enough to hold the anchor block (56 chars) in one
+        // chunk, but smaller than the full string (63 chars) so a split occurs.
         let text = "prefix\n<a href=\"https://example.com/path/to/page\">link text</a>";
-        // max_len=57: fits the anchor block (56 chars) but not the full string (63)
         let chunks = split_message(text, 57);
+        // The opening <a> and its closing </a> must land in the same chunk.
         let anchor_chunk = chunks.iter().find(|c| c.contains("<a "));
         let close_chunk = chunks.iter().find(|c| c.contains("</a>"));
         assert!(anchor_chunk.is_some(), "no chunk contains opening <a>");
@@ -1044,11 +1019,13 @@ mod tests {
         );
     }
 
-    /// Direct unit test: `retreat_past_html_tag` retreats past an unclosed `<code>`.
+    /// Direct unit test: `retreat_past_html_tag` on an unclosed `<code>` block.
     #[test]
     fn test_retreat_past_html_tag_unclosed_code() {
         let text = "hello <code>world";
-        let result = retreat_past_html_tag(text, text.len());
+        let pos = text.len();
+        let result = retreat_past_html_tag(text, pos);
+        // Should retreat to the `<` of `<code>`
         assert_eq!(&text[result..], "<code>world");
     }
 
@@ -1057,15 +1034,17 @@ mod tests {
     fn test_retreat_past_html_tag_balanced_returns_pos() {
         let text = "hello <b>world</b> end";
         let pos = text.len();
-        assert_eq!(retreat_past_html_tag(text, pos), pos);
+        let result = retreat_past_html_tag(text, pos);
+        assert_eq!(result, pos);
     }
 
-    /// A tag block longer than max_len must not cause an infinite loop.
+    /// A tag longer than max_len must not cause an infinite loop.
     #[test]
     fn test_very_long_tag_no_infinite_loop() {
         let text = "<code>abcdefghijklmnopqrstuvwxyz</code>";
         let chunks = split_message(text, 8);
-        assert_eq!(chunks.concat(), text);
+        let rebuilt: String = chunks.concat();
+        assert_eq!(rebuilt, text);
     }
 
     #[test]

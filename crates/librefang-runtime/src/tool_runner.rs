@@ -329,7 +329,6 @@ pub struct ToolExecContext<'a> {
     pub process_registry: Option<&'a crate::process_registry::ProcessRegistry>,
     pub sender_id: Option<&'a str>,
     pub channel: Option<&'a str>,
-    pub chat_id: Option<&'a str>,
     /// Optional checkpoint manager.  When `Some`, a snapshot is taken
     /// automatically before every `file_write` and `apply_patch` call.
     /// Snapshot failures are non-fatal (logged as warnings only).
@@ -405,7 +404,6 @@ pub async fn execute_tool_raw(
         process_registry: _,
         sender_id,
         channel: _,
-        chat_id: _,
         checkpoint_manager,
         interrupt,
         dangerous_command_checker,
@@ -802,10 +800,6 @@ pub async fn execute_tool_raw(
         "memory_store" => tool_memory_store(input, *kernel, *sender_id),
         "memory_recall" => tool_memory_recall(input, *kernel, *sender_id),
         "memory_list" => tool_memory_list(*kernel, *sender_id),
-        "memory_search" => tool_memory_search(input, *kernel, *sender_id),
-
-        // Group roster tool
-        "group_members" => tool_group_members(input, *kernel),
 
         // Collaboration tools
         "agent_find" => tool_agent_find(input, *kernel),
@@ -1160,7 +1154,6 @@ pub async fn execute_tool(
     process_registry: Option<&crate::process_registry::ProcessRegistry>,
     sender_id: Option<&str>,
     channel: Option<&str>,
-    chat_id: Option<&str>,
     checkpoint_manager: Option<&Arc<crate::checkpoint_manager::CheckpointManager>>,
     interrupt: Option<crate::interrupt::SessionInterrupt>,
     session_id: Option<&str>,
@@ -1346,7 +1339,6 @@ pub async fn execute_tool(
         process_registry,
         sender_id,
         channel,
-        chat_id,
         checkpoint_manager,
         interrupt,
         dangerous_command_checker,
@@ -1618,36 +1610,6 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {},
-            }),
-        },
-        ToolDefinition {
-            name: "memory_search".to_string(),
-            description: "Search shared memory for entries whose key or value contains the query (case-insensitive substring match). Use this when you need to find a memory but don't remember the exact key.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "The search term to look for in keys and values" }
-                },
-                "required": ["query"]
-            }),
-        },
-        // --- Group roster tool ---
-        ToolDefinition {
-            name: "group_members".to_string(),
-            description: "List the known members of a group chat. Returns the roster of people seen in a specific channel and chat. Use this when you need to know who is in the group.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "channel": {
-                        "type": "string",
-                        "description": "Channel type (e.g. 'telegram', 'discord')"
-                    },
-                    "chat_id": {
-                        "type": "string",
-                        "description": "The chat/group ID"
-                    }
-                },
-                "required": ["channel", "chat_id"]
             }),
         },
         // --- Collaboration tools ---
@@ -2026,7 +1988,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "name": { "type": "string", "description": "Job name (max 128 chars, alphanumeric + spaces/hyphens/underscores)" },
                     "schedule": {
                         "type": "object",
-                        "description": "Schedule. One of:\n- {\"kind\":\"at\",\"at\":\"2025-01-01T00:00:00Z\"} — one-shot at a UTC timestamp (tz not applicable).\n- {\"kind\":\"every\",\"every_secs\":300} — recurring every N seconds (tz not applicable).\n- {\"kind\":\"cron\",\"expr\":\"0 */6 * * *\",\"tz\":\"Europe/Madrid\"} — 5-field cron expression. REQUIRED: set `tz` to an IANA timezone name (e.g. \"Europe/Madrid\", \"America/New_York\", \"Asia/Tokyo\") so the expression is interpreted in the user's local wall-clock time. If the user explicitly asked for UTC, set `tz` to \"UTC\". If you do not know the user's timezone, ASK THEM before calling this tool — cron_create will reject cron schedules without a tz."
+                        "description": "Schedule: {\"kind\":\"at\",\"at\":\"2025-01-01T00:00:00Z\"} or {\"kind\":\"every\",\"every_secs\":300} or {\"kind\":\"cron\",\"expr\":\"0 */6 * * *\",\"tz\":\"America/New_York\"}. For cron schedules, always include \"tz\" (IANA timezone, e.g. \"Asia/Shanghai\", \"Europe/London\") so the schedule runs in the user's local time. Omitting tz defaults to UTC."
                     },
                     "action": {
                         "type": "object",
@@ -3387,46 +3349,6 @@ fn tool_memory_list(
         return Ok("No entries found in shared memory.".to_string());
     }
     Ok(serde_json::to_string_pretty(&keys).unwrap_or_else(|_| format!("{:?}", keys)))
-}
-
-fn tool_memory_search(
-    input: &serde_json::Value,
-    kernel: Option<&Arc<dyn KernelHandle>>,
-    peer_id: Option<&str>,
-) -> Result<String, String> {
-    let kh = require_kernel(kernel)?;
-    let query = input["query"].as_str().ok_or("Missing 'query' parameter")?;
-    let results = kh.memory_search(query, peer_id)?;
-    if results.is_empty() {
-        return Ok(format!("No memory entries found matching '{query}'."));
-    }
-    let display: Vec<serde_json::Value> = results
-        .into_iter()
-        .map(|(k, v)| serde_json::json!({"key": k, "value": v}))
-        .collect();
-    Ok(serde_json::to_string_pretty(&display).unwrap_or_else(|_| format!("{:?}", display)))
-}
-
-// ---------------------------------------------------------------------------
-// Group roster tool
-// ---------------------------------------------------------------------------
-
-fn tool_group_members(
-    input: &serde_json::Value,
-    kernel: Option<&Arc<dyn KernelHandle>>,
-) -> Result<String, String> {
-    let kh = require_kernel(kernel)?;
-    let channel = input["channel"]
-        .as_str()
-        .ok_or("Missing 'channel' parameter")?;
-    let chat_id = input["chat_id"]
-        .as_str()
-        .ok_or("Missing 'chat_id' parameter")?;
-    let members = kh.roster_members(channel, chat_id)?;
-    if members.is_empty() {
-        return Ok("No known members for this chat yet.".to_string());
-    }
-    serde_json::to_string_pretty(&members).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -6823,7 +6745,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
 
@@ -6877,7 +6798,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
 
@@ -6904,7 +6824,6 @@ mod tests {
         assert!(names.contains(&"memory_store"));
         assert!(names.contains(&"memory_recall"));
         assert!(names.contains(&"memory_list"));
-        assert!(names.contains(&"memory_search"));
         // 6 collaboration tools
         assert!(names.contains(&"agent_find"));
         assert!(names.contains(&"task_post"));
@@ -7017,7 +6936,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -7058,7 +6976,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -7096,7 +7013,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -7134,7 +7050,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -7321,7 +7236,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
         assert!(!result.is_error, "got error: {}", result.content);
@@ -7368,7 +7282,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
         assert!(!result.is_error, "got error: {}", result.content);
@@ -7418,7 +7331,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
         assert!(!result.is_error, "got error: {}", result.content);
@@ -7468,7 +7380,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
         assert!(result.is_error);
@@ -7521,7 +7432,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
         assert!(result.is_error);
@@ -7576,7 +7486,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
         assert!(!result.is_error, "got error: {}", result.content);
@@ -7628,7 +7537,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
         assert!(result.is_error, "expected denial, got: {}", result.content);
@@ -7685,7 +7593,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
         assert!(
@@ -7746,7 +7653,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
         // Must NOT be blocked by read-only check. It may be blocked by exec policy
@@ -7785,7 +7691,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -7822,7 +7727,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -7859,7 +7763,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -7897,7 +7800,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -7936,7 +7838,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -8001,7 +7902,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -8044,7 +7944,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -8095,7 +7994,6 @@ mod tests {
             None,
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -8147,7 +8045,6 @@ mod tests {
             None,
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -8212,7 +8109,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
 
@@ -8275,7 +8171,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
 
@@ -8338,7 +8233,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
 
@@ -8396,7 +8290,6 @@ mod tests {
             None,
             None,
             None,
-            None, // available_tools
         )
         .await;
 
@@ -8447,7 +8340,6 @@ mod tests {
             None,
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -8645,7 +8537,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -8705,7 +8596,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -8924,7 +8814,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -8969,7 +8858,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -9014,7 +8902,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -9068,7 +8955,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -9126,7 +9012,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -9227,7 +9112,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -9271,7 +9155,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -9324,7 +9207,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -9367,7 +9249,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -9410,7 +9291,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -9452,7 +9332,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -9494,7 +9373,6 @@ mod tests {
             None, // process_registry
             None, // sender_id
             None, // channel
-            None, // chat_id
             None, // checkpoint_manager
             None, // interrupt
             None, // session_id
@@ -9723,30 +9601,6 @@ mod tests {
         ) -> Result<Vec<librefang_types::memory::GraphMatch>, String> {
             Err("not used".to_string())
         }
-    }
-
-    #[test]
-    fn cron_create_schema_documents_tz_requirement() {
-        let tools = builtin_tool_definitions();
-        let cron_create = tools
-            .iter()
-            .find(|t| t.name == "cron_create")
-            .expect("cron_create tool must exist");
-        let schedule_desc = cron_create.input_schema["properties"]["schedule"]["description"]
-            .as_str()
-            .expect("schedule description must be a string");
-        assert!(
-            schedule_desc.contains("IANA"),
-            "schedule description must mention IANA: {schedule_desc}"
-        );
-        assert!(
-            schedule_desc.contains("Europe/Madrid"),
-            "schedule description must give an IANA example: {schedule_desc}"
-        );
-        assert!(
-            schedule_desc.contains("tz"),
-            "schedule description must mention the tz field: {schedule_desc}"
-        );
     }
 
     #[test]

@@ -1189,7 +1189,6 @@ pub async fn invoke_tool(
         Some(state.kernel.process_registry()),
         None, // sender_id
         None, // channel
-        None, // chat_id
         None, // checkpoint_manager — snapshotting is wired into agent loops
         None, // interrupt — no session to cancel
         None, // session_id
@@ -1617,7 +1616,15 @@ pub async fn list_approvals(
     Query(pagination): Query<PaginationParams>,
 ) -> impl IntoResponse {
     let pending = state.kernel.approvals().list_pending();
-    let recent = state.kernel.approvals().list_recent(50);
+    // Pull the full in-memory recent buffer (capped at
+    // MAX_RECENT_APPROVALS = 100 by approval.rs), not a hard-coded 50.
+    // The earlier limit meant `total` reported pending + 50 even when
+    // the buffer held more, so a frontend asking for `offset=50` got
+    // an empty page despite `total > offset` — pagination contract
+    // broken (audit of #3958).  The buffer cap is the real bound;
+    // surfacing the full set here lets the skip/take below paginate
+    // over the actual window the server can serve.
+    let recent = state.kernel.approvals().list_recent(usize::MAX);
 
     let registry_agents = state.kernel.agent_registry().list();
     let agent_name_for = |agent_id: &str| {
@@ -2745,14 +2752,29 @@ pub async fn totp_revoke(
             }
         }
     } else {
+        // TOTP replay check first (#3952).  Most damaging path of all:
+        // a single replayed code disables 2FA entirely.  approve_request
+        // and totp_confirm both check this; totp_revoke was missed.
+        if state.kernel.approvals().is_totp_code_used(&body.code) {
+            // Don't count toward the lockout — the code itself isn't
+            // wrong, it's already-spent.  Return the same 400 shape so
+            // the caller can't distinguish "already used" from "wrong".
+            return ApiErrorResponse::bad_request("TOTP code already used. Wait for a new code.")
+                .into_json_tuple();
+        }
         match state.kernel.vault_get("totp_secret") {
             Some(secret) => {
-                librefang_kernel::approval::ApprovalManager::verify_totp_code_with_issuer(
+                let ok = librefang_kernel::approval::ApprovalManager::verify_totp_code_with_issuer(
                     &secret,
                     &body.code,
                     &totp_issuer,
                 )
-                .unwrap_or(false)
+                .unwrap_or(false);
+                if ok {
+                    // Mark consumption only after a true verify.
+                    state.kernel.approvals().record_totp_code_used(&body.code);
+                }
+                ok
             }
             None => false,
         }
@@ -2775,16 +2797,43 @@ pub async fn totp_revoke(
         .into_json_tuple();
     }
 
-    // Remove TOTP data from vault
-    // vault_set to empty/false markers (vault doesn't expose remove via kernel helper)
-    if let Err(e) = state.kernel.vault_set("totp_confirmed", "false") {
-        tracing::warn!("Failed to clear totp_confirmed in vault during TOTP revocation: {e}");
-    }
+    // #3633: clearing must not be best-effort and must avoid creating a
+    // partial state that BYPASSES 2FA on login. The login gate
+    // (server.rs ~334) reads `if totp_enrolled && totp_confirmed` to decide
+    // whether to prompt for a TOTP code, so:
+    //   * `totp_confirmed=false` alone is enough to disable 2FA on login,
+    //     even if `totp_secret` is still present.
+    // An earlier fail-fast version cleared `totp_confirmed` first and
+    // returned 500 if `totp_secret` then failed to wipe — that
+    // simultaneously told the user "TOTP is still active, retry" while
+    // actually disabling 2FA. To prevent that, we:
+    //   1. Wipe `totp_secret` and `totp_recovery_codes` FIRST so the
+    //      verify path is dead before we ever flip the `totp_confirmed`
+    //      flag. Even if writing the flag later fails, secret/recovery are
+    //      already gone, so a retry is purely a state-flag fix and 2FA is
+    //      effectively disabled either way.
+    //   2. Attempt every write (collect-all, not fail-fast) so a transient
+    //      failure on field N doesn't leave fields >N untouched on retry.
+    //   3. Aggregate failures into a single 500 with all field errors.
+    let mut failures: Vec<String> = Vec::new();
     if let Err(e) = state.kernel.vault_set("totp_secret", "") {
-        tracing::warn!("Failed to clear totp_secret in vault during TOTP revocation: {e}");
+        tracing::error!("totp_revoke: failed to clear totp_secret: {e}");
+        failures.push(format!("totp_secret: {e}"));
     }
     if let Err(e) = state.kernel.vault_set("totp_recovery_codes", "[]") {
-        tracing::warn!("Failed to clear totp_recovery_codes in vault during TOTP revocation: {e}");
+        tracing::error!("totp_revoke: failed to clear totp_recovery_codes: {e}");
+        failures.push(format!("totp_recovery_codes: {e}"));
+    }
+    if let Err(e) = state.kernel.vault_set("totp_confirmed", "false") {
+        tracing::error!("totp_revoke: failed to clear totp_confirmed: {e}");
+        failures.push(format!("totp_confirmed: {e}"));
+    }
+    if !failures.is_empty() {
+        return ApiErrorResponse::internal(format!(
+            "TOTP revocation partially failed; the secret and recovery codes have been wiped first so 2FA is no longer verifiable, but vault state is inconsistent. Retry. Details: {}",
+            failures.join("; ")
+        ))
+        .into_json_tuple();
     }
 
     (

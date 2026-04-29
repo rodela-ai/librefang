@@ -294,8 +294,8 @@ class _AgentsResource(_Resource):
 
 class _ApprovalsResource(_Resource):
 
-    def list_approvals(self):
-        return self._c._request("GET", "/api/approvals")
+    def list_approvals(self, limit: Any = None, offset: Any = None):
+        return self._c._request("GET", "/api/approvals", None, query={"limit": limit, "offset": offset})
 
     def create_approval(self, **data):
         return self._c._request("POST", "/api/approvals", data)
@@ -561,7 +561,7 @@ class _ModelsResource(_Resource):
     def catalog_update(self):
         return self._c._request("POST", "/api/catalog/update")
 
-    def list_models(self):
+    def list_all_models(self):
         return self._c._request("GET", "/api/models")
 
     def list_aliases(self):
@@ -725,8 +725,8 @@ class _SessionsResource(_Resource):
     def find_session_by_label(self, id: str, label: str):
         return self._c._request("GET", f"/api/agents/{id}/sessions/by-label/{label}")
 
-    def list_sessions(self):
-        return self._c._request("GET", "/api/sessions")
+    def list_sessions(self, limit: Any = None, offset: Any = None):
+        return self._c._request("GET", "/api/sessions", None, query={"limit": limit, "offset": offset})
 
     def session_cleanup(self):
         return self._c._request("POST", "/api/sessions/cleanup")
