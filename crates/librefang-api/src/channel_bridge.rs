@@ -50,26 +50,42 @@ fn sanitize_channel_error(err: &str) -> String {
 /// Some providers emit tool calls as plain text (recovered by
 /// `agent_loop::recover_text_tool_calls`). These should not be
 /// forwarded to the user through streaming channels.
+///
+/// Long responses (>2000 chars) only match start-of-text patterns.
+/// The `contains()`-based patterns are skipped for long text because
+/// natural language responses that discuss tools (e.g. explaining how
+/// `agent_send` works) will naturally contain tool-call-like substrings
+/// without being leaked tool calls. Real leaked tool calls are compact.
 fn looks_like_tool_call(text: &str) -> bool {
     let t = text.trim();
-    // JSON-style tool calls (may appear at start of text)
-    t.starts_with("[{")
+    // Start-of-text patterns: safe regardless of length — a response that
+    // literally begins with a JSON tool call array is always a leak.
+    if t.starts_with("[{")
         || t.starts_with("functions.")
         || t.starts_with("{\"type\":\"function\"")
         || (t.starts_with('[') && t.contains("'type': 'text'"))
-        || contains_bare_json_tool_call(t)
-        // Tag-based patterns — use contains() because tool call tags may
-        // appear after natural language preamble
-        || t.contains("<function=")
-        || t.contains("<function>")
-        || t.contains("<function ")
-        || t.contains("<tool>")
-        || t.contains("[TOOL_CALL]")
-        || t.contains("<tool_call>")
-        // Pattern 4: markdown code block containing a tool call
-        || contains_markdown_tool_call(t)
-        // Pattern 5: backtick-wrapped tool call
-        || contains_backtick_tool_call(t)
+    {
+        return true;
+    }
+
+    // For shorter text, apply deeper heuristics.  Long responses are
+    // natural language that may reference tools; filtering them silently
+    // drops legitimate answers.
+    const MAX_HEURISTIC_LEN: usize = 2000;
+    t.len() <= MAX_HEURISTIC_LEN
+        && (contains_bare_json_tool_call(t)
+            // Tag-based patterns — use contains() because tool call tags may
+            // appear after natural language preamble
+            || t.contains("<function=")
+            || t.contains("<function>")
+            || t.contains("<function ")
+            || t.contains("<tool>")
+            || t.contains("[TOOL_CALL]")
+            || t.contains("<tool_call>")
+            // Pattern 4: markdown code block containing a tool call
+            || contains_markdown_tool_call(t)
+            // Pattern 5: backtick-wrapped tool call
+            || contains_backtick_tool_call(t))
 }
 
 fn contains_markdown_tool_call(text: &str) -> bool {
@@ -435,7 +451,7 @@ fn start_stream_text_bridge_with_status(
                         if saw_tool_use {
                             debug!("Streaming bridge: filtered tool-use-adjacent text");
                         } else if looks_like_tool_call(&iter_buf) {
-                            debug!("Streaming bridge: filtered leaked tool call text at ContentComplete");
+                            warn!("Streaming bridge: filtered leaked tool call text at ContentComplete (len={})", iter_buf.len());
                         } else if librefang_runtime::silent_response::is_silent_response(&iter_buf)
                         {
                             debug!(
@@ -508,7 +524,10 @@ fn start_stream_text_bridge_with_status(
 
         if !iter_buf.is_empty() && !saw_tool_use {
             if looks_like_tool_call(&iter_buf) {
-                debug!("Streaming bridge: filtered leaked tool call text in final flush");
+                warn!(
+                    "Streaming bridge: filtered leaked tool call text in final flush (len={})",
+                    iter_buf.len()
+                );
             } else if librefang_runtime::silent_response::is_silent_response(&iter_buf) {
                 debug!("Streaming bridge: suppressed NO_REPLY sentinel in final flush");
             } else {
