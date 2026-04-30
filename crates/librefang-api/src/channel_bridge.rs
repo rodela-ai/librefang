@@ -1633,6 +1633,10 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         Some(self.kernel.event_bus_ref().subscribe_all())
     }
 
+    fn record_consumer_lag(&self, n: u64, context: &'static str) {
+        self.kernel.event_bus_ref().record_consumer_lag(n, context);
+    }
+
     async fn reset_session(&self, agent_id: AgentId) -> Result<String, String> {
         self.kernel
             .reset_session(agent_id)
@@ -4397,5 +4401,20 @@ mod tests {
             msg.contains("safety filter"),
             "expected safety-filter msg, got: {msg}"
         );
+    }
+
+    /// `KernelBridgeAdapter::record_consumer_lag` must forward to
+    /// `EventBus::record_consumer_lag`, which increments `dropped_count`.
+    /// This test exercises the EventBus path directly (constructing a full
+    /// kernel in a unit test would be prohibitively expensive) and mirrors
+    /// the assertion in `event_bus::tests::record_consumer_lag_increments_dropped_count`.
+    #[test]
+    fn test_event_bus_record_consumer_lag_increments_dropped_count() {
+        let bus = librefang_kernel::event_bus::EventBus::new();
+        assert_eq!(bus.dropped_count(), 0);
+        bus.record_consumer_lag(5, "test-context");
+        assert_eq!(bus.dropped_count(), 5);
+        bus.record_consumer_lag(3, "test-context");
+        assert_eq!(bus.dropped_count(), 8);
     }
 }
