@@ -11870,6 +11870,16 @@ system_prompt = "You are a helpful assistant."
                 });
             }
 
+            // Per-fire timeout cap (#3446): one stuck send_message_full
+            // must NOT pin Lane::Trigger permits indefinitely.
+            let fire_timeout_s = self
+                .config
+                .load()
+                .queue
+                .concurrency
+                .trigger_fire_timeout_secs;
+            let fire_timeout = std::time::Duration::from_secs(fire_timeout_s);
+
             if !dispatches.is_empty() {
                 // CRITICAL: tokio task-locals do NOT propagate across
                 // tokio::spawn.  Without re-establishing the
@@ -11921,8 +11931,15 @@ system_prompt = "You are a helpful assistant."
                                 .and_then(|w| w.upgrade())
                                 .map(|arc| arc as Arc<dyn KernelHandle>);
                             let home_channel = kernel.resolve_agent_home_channel(aid);
-                            if let Err(e) = kernel
-                                .send_message_full(
+                            // Bound permit-hold duration so a stuck LLM
+                            // call cannot pin Lane::Trigger kernel-wide.
+                            // Note: timeout drops this future on expiry,
+                            // but any tokio::spawn'd child tasks inside
+                            // send_message_full are NOT cancelled — they
+                            // run to completion independently.
+                            match tokio::time::timeout(
+                                fire_timeout,
+                                kernel.send_message_full(
                                     aid,
                                     &msg,
                                     handle,
@@ -11931,10 +11948,21 @@ system_prompt = "You are a helpful assistant."
                                     mode_override,
                                     None,
                                     session_id_override,
-                                )
-                                .await
+                                ),
+                            )
+                            .await
                             {
-                                warn!(agent = %aid, "Trigger dispatch failed: {e}");
+                                Ok(Ok(_)) => {}
+                                Ok(Err(e)) => {
+                                    warn!(agent = %aid, "Trigger dispatch failed: {e}");
+                                }
+                                Err(_) => {
+                                    warn!(
+                                        agent = %aid,
+                                        timeout_secs = fire_timeout.as_secs(),
+                                        "Trigger dispatch timed out; releasing lane permit"
+                                    );
+                                }
                             }
                         }
                     });

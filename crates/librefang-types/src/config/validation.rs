@@ -175,6 +175,7 @@ impl KernelConfig {
                     "subagent_lane",
                     "trigger_lane",
                     "default_per_agent",
+                    "trigger_fire_timeout_secs",
                 ],
             ),
             (
@@ -940,6 +941,10 @@ impl KernelConfig {
         }
         if self.queue.concurrency.default_per_agent == 0 {
             self.queue.concurrency.default_per_agent = 1;
+        }
+        // Trigger-fire timeout: 0 means "infinite hold on Lane::Trigger" (#3446)
+        if self.queue.concurrency.trigger_fire_timeout_secs == 0 {
+            self.queue.concurrency.trigger_fire_timeout_secs = 300;
         }
 
         // Triggers: max_per_event must be >= 1 (0 would prevent any trigger from firing)
