@@ -166,8 +166,10 @@ impl PluginEventBus {
         // a fresh process that immediately sees lag would only bump the
         // counter and stay silent for the first 10 s — defeating the
         // "make lag visible" goal of #3630.
-        let warmup =
-            std::time::Instant::now() - std::time::Duration::from_secs(LAG_WARN_INTERVAL_SECS + 1);
+        // checked_sub: CLOCK_MONOTONIC can be <(LAG_WARN_INTERVAL_SECS+1) s on boot; fallback forfeits warmup, not correctness.
+        let warmup = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(LAG_WARN_INTERVAL_SECS + 1))
+            .unwrap_or_else(std::time::Instant::now);
         Self {
             tx,
             dropped_count: std::sync::atomic::AtomicU64::new(0),
@@ -4630,6 +4632,19 @@ mod tests {
         assert_eq!(bus.dropped_count(), 7);
         bus.record_consumer_lag(3, "test");
         assert_eq!(bus.dropped_count(), 10);
+    }
+
+    /// Warmup regression guard: first lag burst must advance `last_drop_warn` (#3630).
+    #[tokio::test]
+    async fn plugin_bus_first_lag_burst_advances_warn_timestamp() {
+        let bus = PluginEventBus::new(8);
+        let before = *bus.last_drop_warn.lock().unwrap();
+        bus.record_consumer_lag(1, "test_first_burst");
+        let after = *bus.last_drop_warn.lock().unwrap();
+        assert!(
+            after > before,
+            "first lag burst must advance last_drop_warn — warmup regression"
+        );
     }
 
     #[tokio::test]

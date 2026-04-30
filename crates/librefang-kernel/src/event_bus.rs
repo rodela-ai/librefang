@@ -58,7 +58,10 @@ impl EventBus {
         // would silence the first 10 s of lag — a fresh process that
         // immediately sees backlog would only bump dropped_count and stay
         // quiet, defeating the "make lag visible" goal of #3630.
-        let warmup = std::time::Instant::now() - std::time::Duration::from_secs(11);
+        // checked_sub: CLOCK_MONOTONIC can be <11 s on boot; fallback forfeits warmup, not correctness.
+        let warmup = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(11))
+            .unwrap_or_else(std::time::Instant::now);
         Self {
             sender,
             agent_channels: DashMap::new(),
@@ -302,6 +305,19 @@ mod tests {
         assert_eq!(bus.dropped_count(), 7);
         bus.record_consumer_lag(3, "test");
         assert_eq!(bus.dropped_count(), 10);
+    }
+
+    /// Warmup regression guard: first lag burst must advance `last_drop_warn` (#3630).
+    #[tokio::test]
+    async fn first_lag_burst_after_construction_advances_warn_timestamp() {
+        let bus = EventBus::new();
+        let before = *bus.last_drop_warn.lock().unwrap();
+        bus.record_consumer_lag(1, "test_first_burst");
+        let after = *bus.last_drop_warn.lock().unwrap();
+        assert!(
+            after > before,
+            "first lag burst must advance last_drop_warn — warmup regression"
+        );
     }
 
     #[tokio::test]
