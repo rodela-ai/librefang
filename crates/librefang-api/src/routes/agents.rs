@@ -379,7 +379,7 @@ pub async fn spawn_agent(
             tracing::warn!("Spawn failed: {e}");
             let t = ErrorTranslator::new(l);
             let (status, code) = match &e {
-                librefang_kernel::error::KernelError::LibreFang(
+                crate::error::KernelError::LibreFang(
                     librefang_types::error::LibreFangError::AgentAlreadyExists(_),
                 ) => (StatusCode::CONFLICT, "agent_already_exists"),
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "spawn_failed"),
@@ -1786,7 +1786,7 @@ pub async fn send_message(
                     .unwrap_or(StatusCode::BAD_REQUEST)
                     .into_response();
             }
-            Err(e) => Err(librefang_kernel::error::KernelError::LibreFang(
+            Err(e) => Err(crate::error::KernelError::LibreFang(
                 librefang_types::error::LibreFangError::Internal(format!("task panicked: {e}")),
             )),
         }
@@ -1817,7 +1817,7 @@ pub async fn send_message(
                     .unwrap_or(StatusCode::BAD_REQUEST)
                     .into_response();
             }
-            Err(e) => Err(librefang_kernel::error::KernelError::LibreFang(
+            Err(e) => Err(crate::error::KernelError::LibreFang(
                 librefang_types::error::LibreFangError::Internal(format!("task panicked: {e}")),
             )),
         }
@@ -2286,7 +2286,7 @@ pub async fn kill_agent(
             // caller's intent ("agent {id} should be gone") is satisfied.
             if matches!(
                 e,
-                librefang_kernel::error::KernelError::LibreFang(
+                crate::error::KernelError::LibreFang(
                     librefang_types::error::LibreFangError::AgentNotFound(_)
                 )
             ) {
@@ -3155,7 +3155,7 @@ pub async fn export_session_trajectory(
     // not need to import `librefang_kernel::trajectory` directly (#3744).
     let bundle = match state.kernel.export_session_trajectory(agent_id, session_id) {
         Ok(b) => b,
-        Err(librefang_kernel::error::KernelError::LibreFang(
+        Err(crate::error::KernelError::LibreFang(
             librefang_types::error::LibreFangError::AgentNotFound(_),
         )) => {
             return (
@@ -3164,7 +3164,7 @@ pub async fn export_session_trajectory(
             )
                 .into_response();
         }
-        Err(librefang_kernel::error::KernelError::LibreFang(
+        Err(crate::error::KernelError::LibreFang(
             librefang_types::error::LibreFangError::Memory(msg),
         )) if msg.contains("not found") || msg.contains("does not belong") => {
             return (
@@ -4721,10 +4721,8 @@ fn hand_override_nullable_string(raw: Option<String>) -> Option<Option<String>> 
 ///   the requested agent id — kernel has no dedicated variant, so we match
 ///   on the single well-known prefix emitted by the kernel)
 /// - everything else → 500
-fn map_hand_runtime_override_err(
-    err: &librefang_kernel::error::KernelError,
-) -> (StatusCode, String) {
-    use librefang_kernel::error::KernelError;
+fn map_hand_runtime_override_err(err: &crate::error::KernelError) -> (StatusCode, String) {
+    use crate::error::KernelError;
     use librefang_types::error::LibreFangError;
     match err {
         KernelError::LibreFang(LibreFangError::AgentNotFound(_)) => {
@@ -6066,7 +6064,7 @@ pub async fn inject_message(
             Json(serde_json::json!({"injected": injected})),
         )
             .into_response(),
-        Err(librefang_kernel::error::KernelError::Backpressure(msg)) => {
+        Err(crate::error::KernelError::Backpressure(msg)) => {
             // Stable machine-readable code so clients can distinguish this
             // from other 503s without substring-matching the message body.
             ApiErrorResponse::internal(msg)
@@ -6254,7 +6252,7 @@ mod tests {
 
     #[test]
     fn test_map_hand_runtime_override_err_maps_not_found_and_conflict() {
-        use librefang_kernel::error::KernelError;
+        use crate::error::KernelError;
         use librefang_types::error::LibreFangError;
 
         let not_found =
