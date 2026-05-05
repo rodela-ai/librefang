@@ -2748,6 +2748,8 @@ async fn generate_search_queries(
         timeout_secs: Some(15),
         extra_body: None,
         agent_id: None,
+        session_id: None,
+        step_id: None,
     };
 
     let response =
@@ -3682,6 +3684,8 @@ pub async fn run_agent_loop(
                 Some(manifest.model.extra_params.clone())
             },
             agent_id: Some(agent_id_str.clone()),
+            session_id: Some(session.id.to_string()),
+            step_id: Some(iteration.to_string()),
         };
 
         // Notify phase: Thinking
@@ -5090,6 +5094,8 @@ pub async fn run_agent_loop_streaming(
                 Some(manifest.model.extra_params.clone())
             },
             agent_id: Some(agent_id_str.clone()),
+            session_id: Some(session.id.to_string()),
+            step_id: Some(iteration.to_string()),
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent

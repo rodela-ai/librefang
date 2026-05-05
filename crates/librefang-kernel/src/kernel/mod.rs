@@ -2831,6 +2831,7 @@ impl LibreFangKernel {
             mcp_bridge: Some(mcp_bridge_cfg.clone()),
             proxy_url: default_proxy_url.clone(),
             request_timeout_secs: default_request_timeout_secs,
+            emit_caller_trace_headers: config.telemetry.emit_caller_trace_headers,
         };
         // Primary driver failure is non-fatal: the dashboard should remain accessible
         // even if the LLM provider is misconfigured. Users can fix config via dashboard.
@@ -2868,6 +2869,7 @@ impl LibreFangKernel {
                     mcp_bridge: Some(mcp_bridge_cfg.clone()),
                     proxy_url: default_proxy_url.clone(),
                     request_timeout_secs: default_request_timeout_secs,
+                    emit_caller_trace_headers: config.telemetry.emit_caller_trace_headers,
                 };
                 match drivers::create_driver(&profile_config) {
                     Ok(profile_driver) => {
@@ -2977,6 +2979,7 @@ impl LibreFangKernel {
                                 .provider_request_timeout_secs
                                 .get(provider)
                                 .copied(),
+                            emit_caller_trace_headers: config.telemetry.emit_caller_trace_headers,
                         };
                         match drivers::create_driver(&auto_config) {
                             Ok(d) => {
@@ -3037,6 +3040,7 @@ impl LibreFangKernel {
                     .provider_request_timeout_secs
                     .get(&fb.provider)
                     .copied(),
+                emit_caller_trace_headers: config.telemetry.emit_caller_trace_headers,
             };
             match drivers::create_driver(&fb_config) {
                 Ok(d) => {
@@ -7676,6 +7680,8 @@ system_prompt = "You are a helpful assistant."
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            session_id: None,
+            step_id: None,
         };
 
         let result = match tokio::time::timeout(
@@ -8523,6 +8529,8 @@ system_prompt = "You are a helpful assistant."
                 timeout_secs: None,
                 extra_body: None,
                 agent_id: None,
+                session_id: None,
+                step_id: None,
             };
             let (complexity, routed_model) = router.select_model(&probe);
             // Check if the routed model's provider has a valid API key.
@@ -12469,6 +12477,8 @@ system_prompt = "You are a helpful assistant."
                 timeout_secs: None,
                 extra_body: None,
                 agent_id: Some(agent_id.to_string()),
+                session_id: Some(session_id.0.to_string()),
+                step_id: None,
             };
 
             let resp = match tokio::time::timeout(
@@ -12550,6 +12560,8 @@ system_prompt = "You are a helpful assistant."
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            session_id: None,
+            step_id: None,
         };
 
         let result = match tokio::time::timeout(
@@ -14937,6 +14949,7 @@ system_prompt = "You are a helpful assistant."
                     .provider_request_timeout_secs
                     .get(agent_provider)
                     .copied(),
+                emit_caller_trace_headers: cfg.telemetry.emit_caller_trace_headers,
             };
 
             match self.driver_cache.get_or_create(&driver_config) {
@@ -15026,6 +15039,7 @@ system_prompt = "You are a helpful assistant."
                         .provider_request_timeout_secs
                         .get(&fb_provider)
                         .copied(),
+                    emit_caller_trace_headers: cfg.telemetry.emit_caller_trace_headers,
                 };
                 match self.driver_cache.get_or_create(&config) {
                     Ok(d) => chain.push((d, strip_provider_prefix(&fb.model, &fb_provider))),
@@ -16217,6 +16231,8 @@ system_prompt = "You are a helpful assistant."
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            session_id: None,
+            step_id: None,
         };
 
         let start = std::time::Instant::now();
