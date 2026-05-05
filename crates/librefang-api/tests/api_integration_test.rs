@@ -1198,7 +1198,10 @@ async fn test_invalid_agent_id_returns_400() {
         .unwrap();
     assert_eq!(resp.status(), 400);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("Invalid"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Invalid"));
 
     // Kill invalid ID
     let resp = client
@@ -1836,7 +1839,10 @@ async fn test_get_tool_not_found() {
     assert_eq!(resp.status(), 404);
 
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("not found"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("not found"));
 }
 
 // ---------------------------------------------------------------------------
