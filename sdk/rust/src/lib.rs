@@ -2348,6 +2348,10 @@ impl ModelsResource {
         do_req(&self.client, &self.base_url, reqwest::Method::POST, &format!("/api/providers/{}/enable", name), None, &[]).await
     }
 
+    pub async fn enable_provider(&self, name: &str) -> Result<Value> {
+        do_req(&self.client, &self.base_url, reqwest::Method::POST, &format!("/api/providers/{}/enable", name), None, &[]).await
+    }
+
     pub async fn set_provider_key(&self, name: &str, data: Value) -> Result<Value> {
         do_req(
             &self.client,
