@@ -330,6 +330,10 @@ async fn resolve_manifest(
         }
     }
 
+    if req.template.is_some() {
+        manifest.workspace = None;
+    }
+
     let name = manifest.name.clone();
     Ok(ResolvedManifest { manifest, name })
 }
