@@ -341,6 +341,7 @@ impl LibreFangKernel {
                 messages: Vec::new(),
                 context_window_tokens: 0,
                 label: None,
+                model_override: None,
                 messages_generation: 0,
                 last_repaired_generation: None,
             });
@@ -467,6 +468,19 @@ impl LibreFangKernel {
                     manifest.model.base_url.clone_from(&dm.base_url);
                 }
             }
+        }
+
+        // Apply per-session model override (#4898). Runs after default-model
+        // resolution so it takes precedence over both the manifest default and
+        // the global default override. Running here (in the kernel dispatcher)
+        // means every downstream consumer — billing, router, metering — sees
+        // the effective model, not just the agent loop.
+        if let Some(override_str) = session.model_override.as_deref() {
+            librefang_runtime::agent_loop::apply_session_model_override_to_manifest(
+                &mut manifest,
+                override_str,
+            )
+            .map_err(KernelError::LibreFang)?;
         }
 
         // Backfill thinking config from global config if per-agent is not set
