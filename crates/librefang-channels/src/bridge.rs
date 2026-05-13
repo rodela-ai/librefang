@@ -1420,6 +1420,7 @@ impl BridgeManager {
         let mut shutdown = self.shutdown_rx.clone();
         let handle = self.handle.clone();
         let adapters = self.adapters.clone();
+        let router = self.router.clone();
 
         let task = tokio::spawn(async move {
             loop {
@@ -1441,6 +1442,42 @@ impl BridgeManager {
                         match result {
                             Ok(event) => {
                                 if let librefang_types::event::EventPayload::ApprovalRequested(approval) = &event.payload {
+                                    // Parse the requesting agent's UUID once.
+                                    // The event ships `agent_id` as a String for
+                                    // wire stability; the router stores `AgentId`
+                                    // (UUID-wrapped). A malformed value here
+                                    // means we cannot scope safely — drop the
+                                    // event rather than fall back to the pre-fix
+                                    // broadcast behaviour (#4985).
+                                    let requesting_agent = match uuid::Uuid::parse_str(&approval.agent_id) {
+                                        Ok(u) => AgentId(u),
+                                        Err(e) => {
+                                            // ERROR (not WARN): a malformed
+                                            // agent_id here means some
+                                            // `require_approval` caller is
+                                            // emitting a non-UUID string,
+                                            // which silently swallows every
+                                            // approval from that source —
+                                            // exactly the failure mode #4875
+                                            // was about. Operators need to
+                                            // notice this in logs.
+                                            // Metrics counter intentionally
+                                            // not added: librefang-channels
+                                            // does not currently depend on
+                                            // the `metrics` crate, and per
+                                            // PR #4994 review guidance we
+                                            // do not introduce a new dep
+                                            // for a single counter.
+                                            error!(
+                                                request_id = %approval.request_id,
+                                                agent_id = %approval.agent_id,
+                                                error = %e,
+                                                "ApprovalRequested.agent_id is not a valid UUID — dropping notification (cannot scope to bound adapter)"
+                                            );
+                                            continue;
+                                        }
+                                    };
+
                                     let short_id = &approval.request_id[..8.min(approval.request_id.len())];
                                     let msg = format!(
                                         "Approval required for agent {}\n\
@@ -1455,6 +1492,73 @@ impl BridgeManager {
                                     );
 
                                     for adapter in &adapters {
+                                        // #4985 / PR #4994 follow-up: scope
+                                        // delivery to adapters bound to the
+                                        // requesting agent. We build the same
+                                        // channel key the bridge boot stores
+                                        // in `channel_defaults` — bare
+                                        // `<channel_type>` for single-bot
+                                        // adapters (`account_id().is_none()`),
+                                        // account-qualified
+                                        // `<channel_type>:<account_id>` for
+                                        // multi-bot adapters
+                                        // (`account_id().is_some()`).
+                                        //
+                                        // Crucially, when the adapter exposes
+                                        // an `account_id`, ONLY the qualified
+                                        // key counts. A bare-key fallback in
+                                        // mixed configs (one single-bot
+                                        // adapter + one multi-bot adapter
+                                        // both on the same channel type)
+                                        // would point the multi-bot
+                                        // adapter's qualified miss at the
+                                        // single-bot adapter's default,
+                                        // leaking the approval into the
+                                        // multi-bot adapter's chat. The
+                                        // resolver's "qualified > bare"
+                                        // precedence is for inbound routing
+                                        // where the same physical message
+                                        // can fall through; the approval
+                                        // listener has no such fallback
+                                        // semantics — each adapter must
+                                        // match on its own configured key.
+                                        let channel_type = adapter.channel_type();
+                                        let ct_str = channel_type_str(&channel_type);
+                                        let bound_agent = match adapter.account_id() {
+                                            Some(aid) => {
+                                                router.channel_default(&format!("{ct_str}:{aid}"))
+                                            }
+                                            None => router.channel_default(ct_str),
+                                        };
+
+                                        match bound_agent {
+                                            Some(bound) if bound == requesting_agent => {}
+                                            Some(_) => {
+                                                debug!(
+                                                    adapter = adapter.name(),
+                                                    account_id = adapter.account_id().unwrap_or(""),
+                                                    request_id = %approval.request_id,
+                                                    requesting_agent = %requesting_agent,
+                                                    "Adapter bound to a different agent — skipping approval broadcast"
+                                                );
+                                                continue;
+                                            }
+                                            None => {
+                                                // No default agent on this
+                                                // channel = no bound recipient
+                                                // we can attribute the
+                                                // approval to. Suppress rather
+                                                // than leak (#4985).
+                                                debug!(
+                                                    adapter = adapter.name(),
+                                                    account_id = adapter.account_id().unwrap_or(""),
+                                                    request_id = %approval.request_id,
+                                                    "Adapter has no bound default agent — skipping approval broadcast"
+                                                );
+                                                continue;
+                                            }
+                                        }
+
                                         let recipients = adapter.notification_recipients();
                                         if recipients.is_empty() {
                                             debug!(
