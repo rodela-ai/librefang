@@ -217,6 +217,16 @@ pub struct AgentLoopResult {
     /// Multiple notify_owner calls in the same turn are concatenated with
     /// "\n\n" by the tool handler before being placed here.
     pub owner_notice: Option<String>,
+    /// The provider slot that actually served the LLM request (#4807
+    /// review nit 10). When a fallback wrapper (`FallbackDriver` /
+    /// `FallbackChain`) picks an alternative provider because the
+    /// nominated one was exhausted, this field carries the slot that
+    /// did the work. The kernel's `UsageRecord` construction sites
+    /// honour this value so billing attributes spend to the actual
+    /// provider, not the nominator. `None` when no fallover happened
+    /// (the call hit the originally nominated provider or no slot at
+    /// all is identifiable — e.g. CLI drivers).
+    pub actual_provider: Option<String>,
 }
 
 #[derive(Debug, Clone)]

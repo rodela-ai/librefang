@@ -52,6 +52,7 @@ impl LlmDriver for EmptyAfterToolUseDriver {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                actual_provider: None,
             })
         } else {
             // Second call: LLM returns EndTurn with EMPTY text (the bug)
@@ -64,6 +65,7 @@ impl LlmDriver for EmptyAfterToolUseDriver {
                     output_tokens: 0,
                     ..Default::default()
                 },
+                actual_provider: None,
             })
         }
     }
@@ -106,6 +108,7 @@ impl LlmDriver for FailThenTextDriver {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                actual_provider: None,
             })
         } else {
             Ok(CompletionResponse {
@@ -120,6 +123,7 @@ impl LlmDriver for FailThenTextDriver {
                     output_tokens: 5,
                     ..Default::default()
                 },
+                actual_provider: None,
             })
         }
     }
@@ -150,6 +154,7 @@ impl LlmDriver for AlwaysFailingToolDriver {
                 output_tokens: 5,
                 ..Default::default()
             },
+            actual_provider: None,
         })
     }
 }
@@ -170,6 +175,7 @@ impl LlmDriver for EmptyMaxTokensDriver {
                 output_tokens: 0,
                 ..Default::default()
             },
+            actual_provider: None,
         })
     }
 }
@@ -192,6 +198,7 @@ impl LlmDriver for NormalDriver {
                 output_tokens: 8,
                 ..Default::default()
             },
+            actual_provider: None,
         })
     }
 }
@@ -216,6 +223,7 @@ impl LlmDriver for DirectiveDriver {
                 output_tokens: 8,
                 ..Default::default()
             },
+            actual_provider: None,
         })
     }
 }
@@ -593,6 +601,7 @@ impl LlmDriver for MultiToolCycleDriver {
                     output_tokens: 3,
                     ..Default::default()
                 },
+                actual_provider: None,
             })
         } else {
             Ok(CompletionResponse {
@@ -607,6 +616,7 @@ impl LlmDriver for MultiToolCycleDriver {
                     output_tokens: 8,
                     ..Default::default()
                 },
+                actual_provider: None,
             })
         }
     }
@@ -631,6 +641,7 @@ impl LlmDriver for FoldSummaryDriver {
                 output_tokens: 8,
                 ..Default::default()
             },
+            actual_provider: None,
         })
     }
 }
@@ -1364,6 +1375,7 @@ impl LlmDriver for EmptyThenNormalDriver {
                     output_tokens: 0,
                     ..Default::default()
                 },
+                actual_provider: None,
             })
         } else {
             // Second call (retry): normal response
@@ -1379,6 +1391,7 @@ impl LlmDriver for EmptyThenNormalDriver {
                     output_tokens: 8,
                     ..Default::default()
                 },
+                actual_provider: None,
             })
         }
     }
@@ -1400,6 +1413,7 @@ impl LlmDriver for AlwaysEmptyDriver {
                 output_tokens: 0,
                 ..Default::default()
             },
+            actual_provider: None,
         })
     }
 }

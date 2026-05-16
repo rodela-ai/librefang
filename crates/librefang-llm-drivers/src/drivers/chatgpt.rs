@@ -883,6 +883,7 @@ impl ChatGptDriver {
             stop_reason,
             tool_calls,
             usage,
+            actual_provider: None,
         })
     }
 

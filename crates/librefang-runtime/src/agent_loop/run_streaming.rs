@@ -312,6 +312,9 @@ pub async fn run_agent_loop_streaming(
 
     let mut total_usage = TokenUsage::default();
     let final_response;
+    // Track the slot that actually served the most recent LLM call (#4807
+    // review nit 10). See run_agent_loop for rationale.
+    let mut last_actual_provider: Option<String> = None;
     // Accumulated text from intermediate tool_use iterations — see the
     // matching declaration in run_agent_loop for full rationale.
     let mut accumulated_text = String::new();
@@ -782,6 +785,11 @@ pub async fn run_agent_loop_streaming(
         let mut response = stream_result.response;
 
         accumulate_token_usage(&mut total_usage, &response.usage);
+        // Track actual-serving slot for billing attribution (#4807
+        // review nit 10).
+        if let Some(ref p) = response.actual_provider {
+            last_actual_provider = Some(p.clone());
+        }
 
         // Snapshot prompt tokens for the next iteration's should_compress check.
         // Some drivers (gemini_cli, codex_cli) return input_tokens = 0.  Fall
@@ -1034,6 +1042,7 @@ pub async fn run_agent_loop_streaming(
                         directives: reply_directives_from_parsed(parsed_directives_s),
                         new_messages_start,
                         owner_notice: pending_owner_notice.take(),
+                        actual_provider: last_actual_provider.clone(),
                     },
                 )
                 .await;
@@ -1350,6 +1359,7 @@ pub async fn run_agent_loop_streaming(
                         latency_ms: 0,
                         new_messages_start,
                         owner_notice: None,
+                        actual_provider: None,
                     });
                 }
                 let text = response.text();

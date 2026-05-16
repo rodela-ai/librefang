@@ -39,6 +39,9 @@ pub(super) struct FinalizeEndTurnResultData {
     /// Accumulated owner notices captured during this turn via the
     /// `notify_owner` tool. Multiple invocations join with "\n\n".
     pub(super) owner_notice: Option<String>,
+    /// Provider slot that actually served the LLM request (#4807 nit
+    /// 10). Carried through to [`AgentLoopResult::actual_provider`].
+    pub(super) actual_provider: Option<String>,
 }
 
 pub(super) struct EndTurnRetryContext<'a> {
@@ -99,6 +102,7 @@ pub(super) fn build_silent_agent_loop_result(
         new_messages_start,
         skill_evolution_suggested: false,
         owner_notice: None,
+        actual_provider: None,
     }
 }
 
@@ -353,6 +357,7 @@ pub(super) async fn finalize_successful_end_turn(
         new_messages_start: end_turn.new_messages_start,
         skill_evolution_suggested: tool_call_count >= 5,
         owner_notice: end_turn.owner_notice.clone(),
+        actual_provider: end_turn.actual_provider,
     })
 }
 

@@ -458,6 +458,7 @@ async fn test_summary_engine_compact_called_once_on_threshold_cross() {
                     output_tokens: 20,
                     ..Default::default()
                 },
+                actual_provider: None,
             })
         }
     }

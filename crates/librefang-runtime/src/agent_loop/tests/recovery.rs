@@ -609,6 +609,7 @@ impl LlmDriver for TextToolCallDriver {
                     output_tokens: 15,
                     ..Default::default()
                 },
+                actual_provider: None,
             })
         } else {
             // After tool result, return normal response
@@ -624,6 +625,7 @@ impl LlmDriver for TextToolCallDriver {
                     output_tokens: 12,
                     ..Default::default()
                 },
+                actual_provider: None,
             })
         }
     }

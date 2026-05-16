@@ -570,6 +570,12 @@ pub async fn run_agent_loop(
 
     let mut total_usage = TokenUsage::default();
     let final_response;
+    // Track the slot that actually served the most recent LLM call —
+    // populated by `FallbackDriver` / `FallbackChain` on chain failover
+    // (#4807 review nit 10). The kernel reads this off `AgentLoopResult`
+    // and stamps the matching `UsageRecord.provider` so billing rolls
+    // up against the slot that did the work.
+    let mut last_actual_provider: Option<String> = None;
     // Accumulate text content from intermediate tool_use iterations. A turn
     // that yields a tool_use response may also carry user-facing text (e.g.
     // "Looking that up for you..." before a memory_store call). Without this
@@ -970,6 +976,13 @@ pub async fn run_agent_loop(
         let mut response = call_with_retry(&*driver, request, Some(provider_name), None).await?;
 
         accumulate_token_usage(&mut total_usage, &response.usage);
+        // Track the actual-serving slot for billing attribution (#4807
+        // review nit 10). FallbackDriver / FallbackChain stamp this on
+        // chain failover; otherwise it stays None and billing falls
+        // back to the manifest-nominated provider.
+        if let Some(ref p) = response.actual_provider {
+            last_actual_provider = Some(p.clone());
+        }
 
         // Snapshot prompt tokens for the next iteration's should_compress check.
         // This is the per-turn input cost, NOT a running sum — we deliberately
@@ -1233,6 +1246,7 @@ pub async fn run_agent_loop(
                         directives: reply_directives_from_parsed(parsed_directives),
                         new_messages_start,
                         owner_notice: pending_owner_notice.take(),
+                        actual_provider: last_actual_provider.clone(),
                     },
                 )
                 .await;
@@ -1520,6 +1534,7 @@ pub async fn run_agent_loop(
                         latency_ms: 0,
                         new_messages_start,
                         owner_notice: None,
+                        actual_provider: None,
                     });
                 }
                 // Model hit token limit — add partial response and continue
