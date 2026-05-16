@@ -343,6 +343,56 @@ impl LibreFangKernel {
             "ok",
         );
 
+        // Reconcile declarative `[[triggers]]` from the manifest (#5014).
+        // Runs before the proactive auto-register pass so manifest entries
+        // are visible to `agent_has_pattern` and the proactive path does
+        // not duplicate a trigger an operator already declared explicitly.
+        //
+        // Cross-agent name resolution caveat: the resolver closure below
+        // looks up `target_agent` names against the *current* registry
+        // snapshot. If agent A is spawned at runtime and its manifest
+        // references agent B by name, but B has not been spawned yet,
+        // the resolver returns `None` and the trigger registers with
+        // `target_agent = None` (with a WARN log naming the unresolved
+        // string). The trigger will still fire on its owner; to wire it
+        // up to B, the operator must `POST /api/agents/A/reload` after
+        // B is spawned so reconcile re-runs against the now-populated
+        // registry. The boot path in `boot.rs` avoids this race by
+        // reconciling once after the full agent registry has been
+        // restored from disk, so cold-start ordering of manifests does
+        // not matter.
+        if !entry.manifest.triggers.is_empty()
+            || matches!(
+                entry.manifest.reconcile_orphans,
+                librefang_types::agent::OrphanPolicy::Warn
+                    | librefang_types::agent::OrphanPolicy::Delete
+            )
+        {
+            let report = self.workflows.triggers.reconcile_manifest_triggers(
+                agent_id,
+                &entry.manifest.triggers,
+                entry.manifest.reconcile_orphans,
+                |target_name| self.agents.registry.find_by_name(target_name).map(|e| e.id),
+            );
+            if report.mutated() {
+                if let Err(e) = self.workflows.triggers.persist() {
+                    warn!(
+                        agent = %name,
+                        "Failed to persist trigger reconcile on spawn: {e}"
+                    );
+                }
+                info!(
+                    agent = %name,
+                    created = report.created,
+                    updated = report.updated,
+                    deleted = report.deleted,
+                    skipped = report.skipped,
+                    orphans_kept = report.orphans_kept,
+                    "Reconciled manifest triggers"
+                );
+            }
+        }
+
         // For proactive agents spawned at runtime, auto-register triggers.
         // Skip any pattern already present (e.g. reloaded from trigger_jobs.json on restart).
         if let ScheduleMode::Proactive { conditions } = &entry.manifest.schedule {
