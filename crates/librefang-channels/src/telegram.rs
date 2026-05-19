@@ -269,7 +269,9 @@ pub struct TelegramAdapter {
     /// Base URL for Telegram Bot API (supports proxies/mirrors).
     api_base_url: String,
     /// Bot username (without @), populated from `getMe` during `start()`.
-    bot_username: std::sync::OnceLock<String>,
+    /// Wrapped in `Arc` so the non-blocking background validation task can
+    /// share ownership and set the value after `start()` returns.
+    bot_username: Arc<std::sync::OnceLock<String>>,
     /// Optional account identifier for multi-bot routing.
     account_id: Option<String>,
     /// Thread-based agent routing: thread_id -> agent name.
@@ -343,7 +345,7 @@ impl TelegramAdapter {
             allowed_users: allowed_users.into(),
             poll_interval,
             api_base_url,
-            bot_username: std::sync::OnceLock::new(),
+            bot_username: Arc::new(std::sync::OnceLock::new()),
             account_id: None,
             thread_routes: HashMap::new(),
             initial_backoff: Duration::from_secs(1),
@@ -1877,83 +1879,145 @@ impl ChannelAdapter for TelegramAdapter {
         Pin<Box<dyn Stream<Item = ChannelMessage> + Send>>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        // Validate token with up to 3 attempts (5 s backoff) so a transient
-        // network hiccup at daemon startup does not permanently prevent the
-        // Telegram bridge from coming up (#5111).
-        let bot_name = {
-            let mut result = None;
-            let mut last_err = String::new();
-            for attempt in 1..=3u32 {
-                match self.validate_token().await {
-                    Ok(name) => {
-                        result = Some(name);
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = e.to_string();
-                        if attempt < 3 {
-                            tracing::warn!(
-                                "Telegram validate_token attempt {attempt}/3 failed: {e}, retrying in 5s"
-                            );
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        }
-                    }
-                }
-            }
-            match result {
-                Some(name) => name,
-                None => {
-                    return Err(format!(
-                        "Telegram validate_token failed after 3 attempts: {last_err}"
-                    )
-                    .into())
-                }
-            }
-        };
-        let _ = self.bot_username.set(bot_name.clone());
-        info!("Telegram bot @{bot_name} connected");
-
-        // Clear any existing webhook to avoid 409 Conflict during getUpdates polling.
-        // This is necessary when the daemon restarts — the old polling session may
-        // still be active on Telegram's side for ~30s, causing 409 errors.
+        // Spawn a background task to validate the bot token and finish startup
+        // control-plane calls (deleteWebhook, setMyCommands) with exponential
+        // backoff. Startup returns immediately so a transient network hiccup at
+        // daemon boot does not block the channel bridge for up to 15 s (#5111).
         //
-        // IMPORTANT: do NOT set drop_pending_updates=true here. For a messaging
-        // adapter, silently discarding user messages queued while the daemon was
-        // down is a data-loss bug. The Telegram API default (false) preserves the
-        // backlog, and the first getUpdates call after startup will pick up every
-        // update that accumulated during downtime.
-        {
-            let delete_url = format!(
-                "{}/bot{}/deleteWebhook",
-                self.api_base_url,
-                self.token.as_str()
-            );
-            match self
-                .client
-                .post(&delete_url)
-                .json(&serde_json::json!({"drop_pending_updates": false}))
-                .timeout(STARTUP_API_TIMEOUT)
-                .send()
-                .await
-            {
-                Ok(_) => info!("Telegram: cleared webhook, polling mode active"),
-                Err(e) => warn!("Telegram: deleteWebhook failed (non-fatal): {e}"),
-            }
-        }
-
-        // Register bot commands in the Telegram menu.
-        // Use explicitly configured commands, or fall back to built-in defaults.
+        // Backoff schedule: 2 s → 4 s → 8 s → 16 s → 30 s (5 attempts max).
+        // On success the OnceLock is populated and polling starts resolving
+        // @mention filtering correctly. On exhaustion the adapter stays
+        // registered in degraded mode (polling works but bot_username is None,
+        // so group-mention detection is skipped) and will re-validate on the
+        // next hot-reload cycle.
         let effective_commands = if self.commands.is_empty() {
             builtin_bot_commands()
         } else {
             self.commands.clone()
         };
-        match self.api_set_my_commands(&effective_commands).await {
-            Ok(()) => info!(
-                "Telegram: registered {} bot command(s)",
-                effective_commands.len()
-            ),
-            Err(e) => warn!("Telegram: failed to register bot commands: {e}"),
+        {
+            let token_bg = self.token.clone();
+            let client_bg = self.client.clone();
+            let api_base_bg = self.api_base_url.clone();
+            let bot_username_bg = self.bot_username.clone();
+            let commands_bg = effective_commands.clone();
+            let mut shutdown_bg = self.shutdown_rx.clone();
+            tokio::spawn(async move {
+                const BACKOFF_SECS: [u64; 5] = [2, 4, 8, 16, 30];
+                let mut bot_name = None;
+                for (attempt, &delay) in BACKOFF_SECS.iter().enumerate() {
+                    if *shutdown_bg.borrow() {
+                        return;
+                    }
+                    let url = format!("{}/bot{}/getMe", api_base_bg, token_bg.as_str());
+                    match client_bg.get(&url).send().await {
+                        Ok(resp) => match resp.json::<serde_json::Value>().await {
+                            Ok(body) if body["ok"].as_bool() == Some(true) => {
+                                let name = body["result"]["username"]
+                                    .as_str()
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                bot_name = Some(name);
+                                break;
+                            }
+                            Ok(body) => {
+                                let desc = body["description"]
+                                    .as_str()
+                                    .unwrap_or("unknown error")
+                                    .to_string();
+                                let is_auth_err = body["error_code"]
+                                    .as_u64()
+                                    .map(|c| c == 401 || c == 403)
+                                    .unwrap_or(false);
+                                if is_auth_err {
+                                    error!(
+                                        "Telegram validate_token: permanent auth error ({}), \
+                                             adapter will stay degraded",
+                                        desc
+                                    );
+                                    return;
+                                }
+                                warn!(
+                                    "Telegram validate_token attempt {}/{} failed: {desc}, \
+                                         retrying in {delay}s",
+                                    attempt + 1,
+                                    BACKOFF_SECS.len()
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Telegram validate_token attempt {}/{} parse error: {e}, \
+                                         retrying in {delay}s",
+                                    attempt + 1,
+                                    BACKOFF_SECS.len()
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            warn!(
+                                "Telegram validate_token attempt {}/{} network error: {e}, \
+                                 retrying in {delay}s",
+                                attempt + 1,
+                                BACKOFF_SECS.len()
+                            );
+                        }
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
+                        _ = shutdown_bg.changed() => return,
+                    }
+                }
+
+                let name = match bot_name {
+                    Some(n) => n,
+                    None => {
+                        error!(
+                            "Telegram validate_token failed after {} attempts — adapter \
+                             will stay in degraded mode until next reload",
+                            BACKOFF_SECS.len()
+                        );
+                        return;
+                    }
+                };
+
+                let _ = bot_username_bg.set(name.clone());
+                info!("Telegram bot @{name} connected");
+
+                // Clear any existing webhook to avoid 409 Conflict during
+                // getUpdates polling. IMPORTANT: do NOT set
+                // drop_pending_updates=true — silently discarding queued user
+                // messages is a data-loss bug. The Telegram API default (false)
+                // preserves the backlog.
+                let delete_url = format!("{}/bot{}/deleteWebhook", api_base_bg, token_bg.as_str());
+                match client_bg
+                    .post(&delete_url)
+                    .json(&serde_json::json!({"drop_pending_updates": false}))
+                    .timeout(STARTUP_API_TIMEOUT)
+                    .send()
+                    .await
+                {
+                    Ok(_) => info!("Telegram: cleared webhook, polling mode active"),
+                    Err(e) => warn!("Telegram: deleteWebhook failed (non-fatal): {e}"),
+                }
+
+                // Register bot commands in the Telegram command menu.
+                let url = format!("{}/bot{}/setMyCommands", api_base_bg, token_bg.as_str());
+                let commands_json: Vec<serde_json::Value> = commands_bg
+                    .iter()
+                    .map(
+                        |c| serde_json::json!({"command": c.command, "description": c.description}),
+                    )
+                    .collect();
+                match client_bg
+                    .post(&url)
+                    .json(&serde_json::json!({"commands": commands_json}))
+                    .send()
+                    .await
+                {
+                    Ok(_) => info!("Telegram: registered {} bot command(s)", commands_bg.len()),
+                    Err(e) => warn!("Telegram: failed to register bot commands: {e}"),
+                }
+            });
         }
 
         let (tx, rx) = mpsc::channel::<ChannelMessage>(256);
@@ -6258,5 +6322,230 @@ mod tests {
         assert!(!is_ogg_opus(&opus_page[..35]));
         assert!(!is_ogg_opus(b"OggS"));
         assert!(!is_ogg_opus(&[]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-blocking startup tests (#5166)
+    //
+    // Verify that `start()` returns Ok within a tight deadline even when the
+    // Telegram Bot API is unavailable or returns errors.  The validate_token
+    // retry loop runs in a background task; startup must not block.
+    // -----------------------------------------------------------------------
+
+    /// Measure the wall-clock time `start()` takes and assert it is well under
+    /// 100 ms even when the mock server responds with a transient 500.
+    #[tokio::test]
+    async fn start_returns_immediately_when_validate_token_fails() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Mock server: getMe → 500 (simulates network/server transient error)
+        // getUpdates and everything else → hang (never respond) so polling
+        // doesn't interfere with our timing assertion.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        // Allow getUpdates to return empty so the polling loop doesn't stall.
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/bot[^/]+/getUpdates$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": []})),
+            )
+            .mount(&server)
+            .await;
+        // deleteWebhook — success so background task doesn't error-log.
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/bot[^/]+/deleteWebhook$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": true})),
+            )
+            .mount(&server)
+            .await;
+
+        let adapter = TelegramAdapter::new(
+            "test-token".to_string(),
+            vec![],
+            Duration::from_millis(100),
+            Some(server.uri()),
+        );
+
+        let start_time = std::time::Instant::now();
+        let result = adapter.start().await;
+        let elapsed = start_time.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "start() must return Ok even with failing getMe"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "start() blocked for {elapsed:?} — must return within 200ms regardless of \
+             validate_token outcome (non-blocking retry, #5166)"
+        );
+    }
+
+    /// When the mock server answers getMe with a valid bot response, start()
+    /// still returns immediately (background task completes quickly).
+    #[tokio::test]
+    async fn start_returns_immediately_when_validate_token_succeeds() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"id": 123456, "username": "testbot", "is_bot": true}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/bot[^/]+/getUpdates$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": []})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/bot[^/]+/deleteWebhook$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": true})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/bot[^/]+/setMyCommands$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": true})),
+            )
+            .mount(&server)
+            .await;
+
+        let adapter = TelegramAdapter::new(
+            "test-token".to_string(),
+            vec![],
+            Duration::from_millis(100),
+            Some(server.uri()),
+        );
+
+        let start_time = std::time::Instant::now();
+        let result = adapter.start().await;
+        let elapsed = start_time.elapsed();
+
+        assert!(result.is_ok(), "start() must return Ok when getMe succeeds");
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "start() took {elapsed:?} — must return within 200ms (#5166)"
+        );
+    }
+
+    /// Verify background retry: after a transient failure, the background task
+    /// eventually calls getMe a second time with a working server.
+    #[tokio::test]
+    async fn background_retry_validates_token_after_transient_failure() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // First call: 500 (transient). Subsequent calls: success.
+        // wiremock doesn't have stateful matching, so we use a high-priority
+        // catch-all success mock and a one-shot 500 that fires first.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .with_priority(1) // higher priority fires first
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/bot[^/]+/getMe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"id": 1, "username": "retrybot", "is_bot": true}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/bot[^/]+/getUpdates$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok":true,"result":[]})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/bot[^/]+/deleteWebhook$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok":true,"result":true})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/bot[^/]+/setMyCommands$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok":true,"result":true})),
+            )
+            .mount(&server)
+            .await;
+
+        let adapter = TelegramAdapter::new(
+            "test-token".to_string(),
+            vec![],
+            Duration::from_millis(50),
+            Some(server.uri()),
+        );
+
+        // start() must return immediately.
+        let start_time = std::time::Instant::now();
+        let result = adapter.start().await;
+        let elapsed = start_time.elapsed();
+        assert!(result.is_ok());
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "start() blocked for {elapsed:?} (#5166)"
+        );
+
+        // Background task fires after 2s backoff. Wait up to 5s for getMe to
+        // succeed and bot_username to be populated.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if adapter.bot_username.get().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "bot_username was never set after background retry — \
+                     validate_token did not succeed within 5s"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            adapter.bot_username.get().map(|s| s.as_str()),
+            Some("retrybot")
+        );
+
+        // Ensure getMe was called at least twice (first fail, then success).
+        let received = server.received_requests().await.unwrap_or_default();
+        let get_me_calls = received
+            .iter()
+            .filter(|r| r.url.path().ends_with("/getMe"))
+            .count();
+        assert!(
+            get_me_calls >= 2,
+            "expected at least 2 getMe calls (1 fail + 1 success), got {get_me_calls}"
+        );
     }
 }

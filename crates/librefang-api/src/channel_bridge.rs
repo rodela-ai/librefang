@@ -9,6 +9,21 @@ use librefang_channels::router::AgentRouter;
 use librefang_channels::sidecar::SidecarAdapter;
 use librefang_channels::types::{ChannelAdapter, SenderContext};
 
+/// Returns `true` when an adapter startup error is a permanent authentication
+/// failure (bad token, revoked credentials) rather than a transient network
+/// or server hiccup. Permanent errors warrant removing the adapter from the
+/// kernel registry; transient errors should keep it registered for retry.
+fn is_permanent_auth_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("invalid token")
+        || lower.contains("token revoked")
+        || lower.contains("permanent auth error")
+}
+
 /// Sanitize LLM/driver errors into user-friendly messages for channel delivery.
 ///
 /// Prevents raw technical details (stack traces, driver internals, status codes)
@@ -3977,13 +3992,32 @@ pub async fn start_channel_bridge_with_config(
                 started_names.push(name);
             }
             Err(e) => {
-                // Keep the adapter registered so it can be retried on the
-                // next hot-reload cycle — removing it on transient startup
-                // failures (e.g. network blip during token validation) would
-                // make it permanently unavailable until the daemon restarts
-                // (#5111).
-                warn!("Failed to start {name} bridge (will retry on next reload): {e}");
-                started_names.push(name);
+                let err_str = e.to_string();
+                if is_permanent_auth_error(&err_str) {
+                    // Permanent auth failure (bad token / revoked credentials):
+                    // remove the adapter from the kernel registry so agents
+                    // don't attempt to route through a channel that will never
+                    // recover without a config change.
+                    error!(
+                        "Failed to start {name} bridge: permanent auth error — \
+                         removing adapter. Fix credentials and reload. Error: {e}"
+                    );
+                    kernel.channel_adapters_ref().remove(&name);
+                    if let Some(ref aid) = account_id {
+                        kernel
+                            .channel_adapters_ref()
+                            .remove(&format!("{name}:{aid}"));
+                    }
+                } else {
+                    // Transient failure (network blip, timeout, etc.): keep the
+                    // adapter registered so it can be retried on the next
+                    // hot-reload cycle (#5111).
+                    warn!(
+                        "Failed to start {name} bridge (transient — will retry on \
+                         next reload): {e}"
+                    );
+                    started_names.push(name);
+                }
             }
         }
     }
