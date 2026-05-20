@@ -2,41 +2,46 @@
 
 ## LINE
 
+LINE 现以 `librefang.sidecar.adapters.line` Python sidecar 形式发布（进程内 Rust 适配器已在 sidecar 迁移中移除）。sidecar **自身运行 HTTP Webhook 服务器**，因此你在 LINE Developers Console 注册的 URL 需要指向 sidecar 的主机/端口，而非 LibreFang API 端口。
+
 ### 前置条件
 
 - LINE Messaging API 频道（从 [LINE Developers Console](https://developers.line.biz/en/docs/messaging-api/) 创建）
-- 可公网访问的 webhook URL
+- 运行 sidecar 的机器上已安装 `librefang` Python SDK
+- 指向 sidecar 的公网可达 Webhook URL（通常做法：在 sidecar 的 `LINE_WEBHOOK_PORT` 前部署 HTTPS 反向代理）
 
 ### 设置步骤
 
 1. 前往 [LINE Developers Console](https://developers.line.biz/console/)，创建新的 Messaging API 频道。
 2. 记录 **Channel Secret** 并签发 **Channel Access Token**。
-3. 设置环境变量：
+3. 将两个凭据写入 `~/.librefang/secrets.env`（也可通过仪表板的 "Set API Key" 按钮设置，会写入同一文件）：
 
 ```bash
-export LINE_CHANNEL_SECRET=your-secret        # 环境变量
-export LINE_ACCESS_TOKEN=your-access-token
-librefang vault set LINE_CHANNEL_SECRET       # 加密金库（推荐）
-librefang vault set LINE_ACCESS_TOKEN
-librefang config set-key line                 # .env 文件
-# 或通过仪表板 "Set API Key" 按钮设置          # secrets.env
+LINE_CHANNEL_SECRET=your-secret
+LINE_CHANNEL_ACCESS_TOKEN=your-access-token
 ```
 
-4. 添加到配置文件：
+4. 在 `config.toml` 中声明 sidecar：
 
 ```toml
-[channels.line]
-channel_secret_env = "LINE_CHANNEL_SECRET"
-access_token_env = "LINE_ACCESS_TOKEN"
+[[sidecar_channels]]
+name = "line"
+command = "python3"
+args = ["-m", "librefang.sidecar.adapters.line"]
+channel_type = "line"
 default_agent = "assistant"
+[sidecar_channels.env]
+LINE_WEBHOOK_PORT = "9090"
+# LINE_WEBHOOK_PATH = "/webhook"
+# LINE_ACCOUNT_ID = "production"   # 可选，多账号路由 Key
 ```
 
-5. 在 LINE Developers Console 中将 webhook URL 设置为 LibreFang 实例的地址（例如 `https://your-domain.com:4545/channels/line/webhook`）。
-6. 重启守护进程。
+5. 在 LINE Developers Console 中将 Webhook URL 设为 sidecar 主机地址（例如 `https://your-sidecar-host:9090/webhook`）。
+6. 重启守护进程 —— supervisor 会拉起 sidecar，sidecar 通过 `GET /v2/bot/info` 在启动时校验 access token，然后开始接收 Webhook POST。
 
 ### 工作原理
 
-LINE 适配器在主 API 服务器（默认端口 4545）上注册 webhook 路由，接收来自 LINE Messaging API 的消息事件。每个请求通过 Channel Secret 的 HMAC-SHA256 签名进行验证。响应通过 LINE Reply API 或 Push API 发送。
+sidecar 作为 LibreFang 的被监管子进程运行。它在 `LINE_WEBHOOK_PORT`（默认 `9090`）+ `LINE_WEBHOOK_PATH`（默认 `/webhook`）上提供独立的 HTTP Webhook，对每个入站 POST 验证 `X-Line-Signature` 与原始请求字节的 HMAC-SHA256（缺失 → 400，不匹配 → 401），并通过 stdio 上的换行分隔 JSON-RPC 将解析后的 `message` 事件转发给内核。出站经由 `POST /v2/bot/message/push` 以 Bearer access token 发送；429 响应会遵守 `Retry-After`，分块级别的 fail-open 确保单个被限流的分块不会导致剩余多段回复全部丢失。
 
 ---
 
@@ -111,42 +116,45 @@ default_agent = "assistant"
 
 ---
 
-## QQ
+## QQ（Sidecar）
+
+QQ 已从进程内 Rust 适配器迁移到进程外 Python sidecar（`librefang.sidecar.adapters.qq`）。
 
 ### 前置条件
 
-- 在 [QQ 机器人平台](https://bot.q.qq.com/wiki/) 注册的 QQ Bot
-- App ID 和令牌
+- 在 [QQ 机器人平台](https://bot.q.qq.com/wiki/) 注册的 QQ Bot，并拿到 App ID 与 App Secret。
+- Python 3 + `librefang` SDK（`pip install -e sdk/python`）。
 
 ### 设置步骤
 
-1. 前往 [QQ 机器人平台](https://bot.q.qq.com/)，注册 Bot 应用。
-2. 记录 App ID 和令牌。
-3. 设置环境变量：
+1. 在 QQ 开放平台注册 Bot，记录 `App ID` 和 `App Secret`。
+2. 把密钥写入 `~/.librefang/secrets.env`：
 
 ```bash
-export QQ_APP_ID=your-app-id                 # 环境变量
-export QQ_TOKEN=your-bot-token
-librefang vault set QQ_APP_ID                # 加密金库（推荐）
-librefang vault set QQ_TOKEN
-librefang config set-key qq                   # .env 文件
-# 或通过仪表板 "Set API Key" 按钮设置          # secrets.env
+QQ_APP_SECRET=your-app-secret
 ```
 
-4. 添加到配置文件：
+3. 在 `~/.librefang/config.toml` 中声明 sidecar：
 
 ```toml
-[channels.qq]
-app_id_env = "QQ_APP_ID"
-token_env = "QQ_TOKEN"
+[[sidecar_channels]]
+name = "qq"
+command = "python3"
+args = ["-m", "librefang.sidecar.adapters.qq"]
+channel_type = "qq"
 default_agent = "assistant"
+[sidecar_channels.env]
+QQ_APP_ID = "your-app-id"
+# QQ_ALLOWED_USERS = "openid-1,openid-2"   # 可选
+# QQ_ACCOUNT_ID = "prod-bot"               # 可选
+# QQ_INTENTS = "1073746435"                # 可选，覆盖 intents bitmask
 ```
 
-5. 重启守护进程。
+4. 重启守护进程。
 
 ### 工作原理
 
-QQ 适配器通过 WebSocket 连接到 QQ Bot API 接收实时消息。它使用应用凭证认证，监听已授权频道和子频道中的消息事件，并通过 QQ Bot REST API 发送响应。
+Sidecar 先调 `https://bots.qq.com/app/getAppAccessToken` 拿 access token，再通过 `GET /gateway` 发现 WebSocket 网关，然后用 HELLO → IDENTIFY → READY 流程建立持久 WS 连接并周期发心跳。入站 `MESSAGE_CREATE` / `AT_MESSAGE_CREATE` / `DIRECT_MESSAGE_CREATE` / `GROUP_AT_MESSAGE_CREATE` / `C2C_MESSAGE_CREATE` 事件转发给内核；出站回复走 `POST {api_base}{reply_endpoint}`，把入站 `msg_id` 作为被动回复目标。
 
 ---
 
