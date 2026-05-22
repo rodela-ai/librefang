@@ -4363,6 +4363,7 @@ version = "2026.5.17-beta.12"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "chrono-tz",
@@ -4480,6 +4481,7 @@ dependencies = [
  "dashmap",
  "dirs 6.0.0",
  "futures",
+ "hex",
  "librefang-http",
  "librefang-llm-driver",
  "librefang-types",
@@ -4618,6 +4620,7 @@ dependencies = [
  "r2d2",
  "r2d2_sqlite",
  "rand 0.10.1",
+ "regex",
  "regex-lite",
  "reqwest",
  "rusqlite",
