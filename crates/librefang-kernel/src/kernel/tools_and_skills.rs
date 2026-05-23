@@ -107,6 +107,14 @@ impl LibreFangKernel {
         // `skills.disabled`/`skills.extra_dirs` config — all of which
         // still override this default (Step 4 blocklist + Stable mode
         // both short-circuit in evolve handlers).
+        //
+        // When the agent has both `auto_evolve = false` AND
+        // `skill_workshop.enabled = false`, neither self-evolution path
+        // is reachable, so injecting these ~8 tools wastes prompt tokens.
+        // Gate the default-available set on at least one path being on.
+        let evolve_enabled = entry.as_ref().map_or(true, |e| {
+            e.manifest.auto_evolve || e.manifest.skill_workshop.enabled
+        });
         fn is_default_available_tool(name: &str) -> bool {
             matches!(
                 name,
@@ -123,12 +131,13 @@ impl LibreFangKernel {
 
         let mut all_tools: Vec<ToolDefinition> = if !tools_unrestricted {
             // Agent declares specific tools — only include matching
-            // builtins, plus the always-available skill-evolution set.
+            // builtins, plus the always-available skill-evolution set
+            // (when evolution is enabled for this agent).
             all_builtins
                 .into_iter()
                 .filter(|t| {
                     declared_tools.iter().any(|d| glob_matches(d, &t.name))
-                        || is_default_available_tool(&t.name)
+                        || (evolve_enabled && is_default_available_tool(&t.name))
                 })
                 .collect()
         } else {
@@ -142,7 +151,7 @@ impl LibreFangKernel {
                         .into_iter()
                         .filter(|t| {
                             allowed.iter().any(|a| a == "*" || a == &t.name)
-                                || is_default_available_tool(&t.name)
+                                || (evolve_enabled && is_default_available_tool(&t.name))
                         })
                         .collect()
                 }

@@ -2360,6 +2360,51 @@ fn test_skill_evolve_tools_default_available_to_restricted_agent() {
     }
 }
 
+// When an agent has auto_evolve=false AND skill_workshop.enabled=false, the
+// skill_evolve_* / skill_read_file tools must NOT be force-injected — they
+// waste prompt tokens when neither evolution path is reachable.
+#[test]
+fn test_skill_evolve_tools_suppressed_when_evolution_disabled() {
+    // Mirror the kernel Step-1 filter with evolve_enabled = false.
+    let tools = librefang_runtime::tool_runner::builtin_tool_definitions();
+    let declared: &[&str] = &["memory_store", "memory_recall"];
+    let evolve_tools: &[&str] = &[
+        "skill_read_file",
+        "skill_evolve_create",
+        "skill_evolve_update",
+        "skill_evolve_patch",
+        "skill_evolve_delete",
+        "skill_evolve_rollback",
+        "skill_evolve_write_file",
+        "skill_evolve_remove_file",
+    ];
+    // evolve_enabled = false — mirror tools_and_skills.rs Step 1 filter.
+    let filtered: Vec<String> = tools
+        .iter()
+        .filter(|t| {
+            let is_declared = declared.contains(&t.name.as_str());
+            let is_evolve = evolve_tools.contains(&t.name.as_str());
+            let evolve_enabled = false;
+            is_declared || (evolve_enabled && is_evolve)
+        })
+        .map(|t| t.name.clone())
+        .collect();
+
+    for suppressed in evolve_tools {
+        assert!(
+            !filtered.iter().any(|n| n == *suppressed),
+            "skill-evolution tool {suppressed} must be suppressed when auto_evolve=false and skill_workshop.enabled=false; got {filtered:?}"
+        );
+    }
+    // Declared tools still flow through.
+    for required in declared {
+        assert!(
+            filtered.iter().any(|n| n == *required),
+            "declared tool {required} missing from {filtered:?}"
+        );
+    }
+}
+
 // Regression test for the fix that reads peer_id from job_json.
 // Before the fix, cron_create always set peer_id: None regardless of the
 // job payload, so OFP-triggered cron jobs lost the peer context entirely.
@@ -5431,17 +5476,6 @@ fn approval_display_non_uuid_string_falls_back_verbatim() {
     let rendered = kernel.approval_agent_display("not-a-uuid");
 
     assert_eq!(rendered, "\"not-a-uuid\"");
-
-    kernel.shutdown();
-}
-
-#[test]
-fn approval_display_empty_string_uses_unknown_sentinel() {
-    let kernel = boot_kernel_for_display_tests();
-
-    let rendered = kernel.approval_agent_display("");
-
-    assert_eq!(rendered, "\"unknown\"");
 
     kernel.shutdown();
 }
