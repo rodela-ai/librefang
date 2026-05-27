@@ -2740,7 +2740,11 @@ async fn send_response(
         text_len = text.len(),
         "Sending response to channel"
     );
-    let formatted = formatter::format_for_channel(&text, output_format);
+    let formatted = if adapter.owns_formatting() {
+        text
+    } else {
+        formatter::format_for_channel(&text, output_format)
+    };
     let content = ChannelContent::Text(formatted);
 
     let result = if let Some(tid) = thread_id {
