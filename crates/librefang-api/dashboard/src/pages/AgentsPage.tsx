@@ -1290,9 +1290,9 @@ export function AgentsPage() {
         {
           onSuccess: () => {
             addToast(
-              t("agents.detail.auto_evolve_saved", {
-                defaultValue: !autoEvolve ? "Auto-evolve enabled" : "Auto-evolve disabled",
-              }),
+              !autoEvolve
+                ? t("agents.detail.auto_evolve_enabled", { defaultValue: "Auto-evolve enabled" })
+                : t("agents.detail.auto_evolve_disabled", { defaultValue: "Auto-evolve disabled" }),
               "success",
             );
           },
