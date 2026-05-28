@@ -337,6 +337,8 @@ pub(crate) fn enrich_agent_json(
             "color": e.identity.color,
         },
         "web_search_augmentation": e.manifest.web_search_augmentation,
+        "auto_evolve": e.manifest.auto_evolve,
+        "auto_evolve_mode": e.manifest.auto_evolve_mode,
         "parent_agent_id": e.parent.as_ref().map(|p| p.to_string()),
         "children": e.children.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
         "session_id": e.session_id.0.to_string(),

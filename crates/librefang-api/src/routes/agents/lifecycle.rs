@@ -1070,6 +1070,7 @@ pub async fn get_agent(
             "mcp_servers_mode": mcp_servers_mode(&entry.manifest.mcp_servers),
             "fallback_models": entry.manifest.fallback_models,
             "auto_evolve": entry.manifest.auto_evolve,
+            "auto_evolve_mode": entry.manifest.auto_evolve_mode,
             "web_search_augmentation": entry.manifest.web_search_augmentation,
         })),
     )

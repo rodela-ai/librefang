@@ -572,6 +572,9 @@ pub struct PatchAgentConfigRequest {
     /// Web search augmentation mode: "off", "auto", or "always".
     #[schema(value_type = Option<String>)]
     pub web_search_augmentation: Option<librefang_types::agent::WebSearchAugmentationMode>,
+    /// Auto-evolve mode: "controlled" (pending queue) or "free" (auto-apply).
+    #[schema(value_type = Option<String>)]
+    pub auto_evolve_mode: Option<librefang_types::agent::EvolutionMode>,
 }
 
 /// PATCH /api/agents/{id}/config — Hot-update agent name, description, system prompt, and identity.
@@ -834,6 +837,21 @@ pub async fn patch_agent_config(
             .kernel
             .agent_registry()
             .update_web_search_augmentation(agent_id, mode)
+            .is_err()
+        {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": t.t("api-error-agent-not-found")})),
+            );
+        }
+    }
+
+    // Update auto_evolve_mode (controlled / free)
+    if let Some(mode) = req.auto_evolve_mode {
+        if state
+            .kernel
+            .agent_registry()
+            .update_auto_evolve_mode(agent_id, mode)
             .is_err()
         {
             return (
