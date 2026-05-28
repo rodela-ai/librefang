@@ -148,10 +148,15 @@ impl LibreFangKernel {
         };
 
         // Post-filter: when neither evolution path is reachable, strip
-        // skill_evolve_* / skill_read_file from every arm (including the
-        // unfiltered `all_builtins` fallback arms above).
+        // skill_evolve_* / skill_read_file from the unfiltered fallback
+        // arms above.  Critically, do NOT strip a tool that the operator
+        // explicitly listed in `capabilities.tools` — an explicit
+        // declaration is a positive grant that the gate must not override.
         if !evolve_enabled {
-            all_tools.retain(|t| !Self::is_evolve_tool(&t.name));
+            all_tools.retain(|t| {
+                !Self::is_evolve_tool(&t.name)
+                    || declared_tools.iter().any(|d| glob_matches(d, &t.name))
+            });
         }
 
         // Step 2: Add skill-provided tools (filtered by agent's skill allowlist,

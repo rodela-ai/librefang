@@ -2412,6 +2412,69 @@ fn test_skill_evolve_tools_suppressed_when_evolution_disabled() {
     }
 }
 
+// Regression: post-filter must NOT strip evolve tools that the operator
+// explicitly declared in capabilities.tools, even when both auto_evolve=false
+// AND skill_workshop.enabled=false.
+//
+// The bug: the blanket `all_tools.retain(!is_evolve_tool)` ran after the
+// explicit-declaration arm had already admitted the operator-declared tools,
+// silently removing them.  The fix threads `declared_tools` into the retain
+// predicate so explicit grants are honoured regardless of the gate flags.
+#[test]
+fn test_skill_evolve_tool_survives_when_explicitly_declared_and_evolution_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home_dir = tmp
+        .path()
+        .join("librefang-kernel-explicit-evolve-gate-test");
+    std::fs::create_dir_all(home_dir.join("data")).unwrap();
+
+    let config = KernelConfig {
+        home_dir: home_dir.clone(),
+        data_dir: home_dir.join("data"),
+        ..KernelConfig::default()
+    };
+    let kernel = LibreFangKernel::boot_with_config(config).expect("boot");
+
+    // Operator explicitly declares skill_evolve_create alongside a normal
+    // tool.  Both auto_evolve and skill_workshop are off — the gate must
+    // still honour the explicit declaration.
+    let manifest = AgentManifest {
+        name: "explicit-evolve-agent".to_string(),
+        description: "agent with explicit evolve tool and evolution disabled".to_string(),
+        author: "test".to_string(),
+        module: "builtin:chat".to_string(),
+        capabilities: ManifestCapabilities {
+            tools: vec![
+                "skill_evolve_create".to_string(),
+                "memory_store".to_string(),
+            ],
+            ..Default::default()
+        },
+        auto_evolve: false,
+        skill_workshop: librefang_types::agent::SkillWorkshopConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let agent_id = kernel.spawn_agent(manifest).expect("spawn should succeed");
+    let tools = kernel.available_tools(agent_id);
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+    assert!(
+        names.contains(&"skill_evolve_create"),
+        "skill_evolve_create must survive when explicitly declared, even with evolution flags off; \
+         got: {names:?}"
+    );
+    assert!(
+        names.contains(&"memory_store"),
+        "memory_store must survive (declared, non-evolve tool); got: {names:?}"
+    );
+
+    kernel.shutdown();
+}
+
 // Regression test for the fix that reads peer_id from job_json.
 // Before the fix, cron_create always set peer_id: None regardless of the
 // job payload, so OFP-triggered cron jobs lost the peer context entirely.
