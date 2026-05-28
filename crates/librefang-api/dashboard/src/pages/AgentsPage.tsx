@@ -1365,8 +1365,7 @@ export function AgentsPage() {
         group = "Builtin";
       } else {
         const server = tool.mcp_server
-          ?? tool.name.replace(/^mcp_/, "").split("_")[0]
-          ?? "mcp";
+          ?? tool.name.replace(/^mcp_/, "").split("_")[0];
         group = `MCP: ${server}`;
       }
       if (!grouped.has(group)) grouped.set(group, []);
@@ -1432,8 +1431,8 @@ export function AgentsPage() {
           agentId: agent.id,
           payload: {
             capabilities_tools: draft,
-            tool_allowlist: [],
-            tool_blocklist: [],
+            tool_allowlist: agentToolCfg?.tool_allowlist ?? [],
+            tool_blocklist: agentToolCfg?.tool_blocklist ?? [],
           },
         },
         {
@@ -1441,6 +1440,12 @@ export function AgentsPage() {
             addToast(t("agents.detail.tools_saved", { defaultValue: "Saved to agent.toml" }), "success");
             setToolsDraft(null);
             setExpandedToolGroup(null);
+          },
+          onError: (e) => {
+            addToast(
+              toastErr(e, t("agents.tools_save_failed", { defaultValue: "Failed to save tool configuration" })),
+              "error",
+            );
           },
         },
       );
