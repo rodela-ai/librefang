@@ -499,15 +499,6 @@ impl AgentRegistry {
     /// Update an agent's schedule mode (Reactive / Periodic / Proactive /
     /// Continuous). Mutates the manifest only — the kernel-level wrapper
     /// `LibreFangKernel::set_agent_schedule` is what callers should use to
-    pub fn update_auto_evolve(&self, id: AgentId, auto_evolve: bool) -> LibreFangResult<()> {
-        self.with_entry_mut(id, |entry| {
-            entry.manifest.auto_evolve = auto_evolve;
-            entry.last_active = chrono::Utc::now();
-        })?;
-        self.notify_changed();
-        Ok(())
-    }
-
     /// also stop the prior background loop and start the new one so the
     /// runtime actually reflects the change without a daemon restart.
     pub fn update_schedule(
@@ -562,6 +553,16 @@ impl AgentRegistry {
     pub fn update_mcp_servers(&self, id: AgentId, servers: Vec<String>) -> LibreFangResult<()> {
         self.with_entry_mut(id, |entry| {
             entry.manifest.mcp_servers = servers;
+            entry.last_active = chrono::Utc::now();
+        })?;
+        self.notify_changed();
+        Ok(())
+    }
+
+    /// Update an agent's `auto_evolve` flag.
+    pub fn update_auto_evolve(&self, id: AgentId, auto_evolve: bool) -> LibreFangResult<()> {
+        self.with_entry_mut(id, |entry| {
+            entry.manifest.auto_evolve = auto_evolve;
             entry.last_active = chrono::Utc::now();
         })?;
         self.notify_changed();
