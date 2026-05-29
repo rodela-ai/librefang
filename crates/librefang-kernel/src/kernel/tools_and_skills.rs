@@ -116,16 +116,23 @@ impl LibreFangKernel {
             .as_ref()
             .is_none_or(|e| e.manifest.auto_evolve || e.manifest.skill_workshop.enabled);
 
+        // Stash evolve tools before `all_builtins` is consumed by the arms
+        // below.  The single post-filter gate uses this list to inject them
+        // (when enabled) or strip them (when disabled) in one place, rather
+        // than duplicating the condition in every arm.
+        let all_evolve_builtins: Vec<ToolDefinition> = all_builtins
+            .iter()
+            .filter(|t| Self::is_evolve_tool(&t.name))
+            .cloned()
+            .collect();
+
         let mut all_tools: Vec<ToolDefinition> = if !tools_unrestricted {
-            // Agent declares specific tools — only include matching
-            // builtins, plus the always-available skill-evolution set
-            // (when evolution is enabled for this agent).
+            // Agent declares specific tools — only include matching builtins.
+            // Evolve tools are injected / stripped by the single post-filter
+            // below; no per-arm evolve clause is needed here.
             all_builtins
                 .into_iter()
-                .filter(|t| {
-                    declared_tools.iter().any(|d| glob_matches(d, &t.name))
-                        || (evolve_enabled && Self::is_evolve_tool(&t.name))
-                })
+                .filter(|t| declared_tools.iter().any(|d| glob_matches(d, &t.name)))
                 .collect()
         } else {
             // No specific tools declared — fall back to profile or all builtins
@@ -136,10 +143,7 @@ impl LibreFangKernel {
                     let allowed = profile.tools();
                     all_builtins
                         .into_iter()
-                        .filter(|t| {
-                            allowed.iter().any(|a| a == "*" || a == &t.name)
-                                || (evolve_enabled && Self::is_evolve_tool(&t.name))
-                        })
+                        .filter(|t| allowed.iter().any(|a| a == "*" || a == &t.name))
                         .collect()
                 }
                 _ if has_tool_all => all_builtins,
@@ -147,12 +151,23 @@ impl LibreFangKernel {
             }
         };
 
-        // Post-filter: when neither evolution path is reachable, strip
-        // skill_evolve_* / skill_read_file from the unfiltered fallback
-        // arms above.  Critically, do NOT strip a tool that the operator
-        // explicitly listed in `capabilities.tools` — an explicit
-        // declaration is a positive grant that the gate must not override.
-        if !evolve_enabled {
+        // Single evolve-gate: one check, one place.
+        //
+        // When `evolve_enabled` is true, inject any evolve tools that were
+        // filtered out by a profile or capabilities.tools allowlist above,
+        // unless they were already admitted (avoid duplicates).
+        //
+        // When `evolve_enabled` is false, strip evolve tools that slipped
+        // through the unfiltered fallback arms.  An explicit declaration in
+        // `capabilities.tools` is a positive grant that the gate must not
+        // override, so declared evolve tools are always kept.
+        if evolve_enabled {
+            for t in all_evolve_builtins {
+                if !all_tools.iter().any(|existing| existing.name == t.name) {
+                    all_tools.push(t);
+                }
+            }
+        } else {
             all_tools.retain(|t| {
                 !Self::is_evolve_tool(&t.name)
                     || declared_tools.iter().any(|d| glob_matches(d, &t.name))

@@ -2322,6 +2322,10 @@ fn test_stable_mode_freezes_registry_and_skips_review_gate() {
 /// Simulate kernel Step-1 filtering for a restricted agent
 /// (`capabilities.tools = ["memory_store", "memory_recall"]`) using the real
 /// `LibreFangKernel::is_evolve_tool` predicate.
+///
+/// Used by the (T,F), (F,T), and (F,F) matrix tests.  The (T,T) case uses
+/// the real kernel path via `boot_with_config` + `available_tools` — see
+/// `test_skill_evolve_tools_present_when_both_flags_true`.
 fn filter_restricted_builtins(auto_evolve: bool, workshop_enabled: bool) -> Vec<String> {
     let tools = librefang_runtime::tool_runner::builtin_tool_definitions();
     let declared: &[&str] = &["memory_store", "memory_recall"];
@@ -2337,20 +2341,67 @@ fn filter_restricted_builtins(auto_evolve: bool, workshop_enabled: bool) -> Vec<
 }
 
 // (T, T) — both flags on: evolve tools must be present.
+//
+// Uses the real kernel path (`boot_with_config` → `spawn_agent` →
+// `available_tools`) so this test catches regressions in the actual
+// `available_tools` implementation, not just the inline predicate mirror.
 #[test]
 fn test_skill_evolve_tools_present_when_both_flags_true() {
-    let filtered = filter_restricted_builtins(true, true);
-    let tools = librefang_runtime::tool_runner::builtin_tool_definitions();
-    for t in tools
+    let tmp = tempfile::tempdir().unwrap();
+    let home_dir = tmp.path().join("librefang-evolve-matrix-tt");
+    std::fs::create_dir_all(home_dir.join("data")).unwrap();
+
+    let config = KernelConfig {
+        home_dir: home_dir.clone(),
+        data_dir: home_dir.join("data"),
+        ..KernelConfig::default()
+    };
+    let kernel = LibreFangKernel::boot_with_config(config).expect("boot");
+
+    // Restricted agent: only memory tools declared; both evolution paths on.
+    let manifest = AgentManifest {
+        name: "matrix-tt-agent".to_string(),
+        description: "matrix (T,T) test agent".to_string(),
+        author: "test".to_string(),
+        module: "builtin:chat".to_string(),
+        capabilities: ManifestCapabilities {
+            tools: vec!["memory_store".to_string(), "memory_recall".to_string()],
+            ..Default::default()
+        },
+        auto_evolve: true,
+        skill_workshop: librefang_types::agent::SkillWorkshopConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let agent_id = kernel.spawn_agent(manifest).expect("spawn should succeed");
+    let tools = kernel.available_tools(agent_id);
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+    let all_builtins = librefang_runtime::tool_runner::builtin_tool_definitions();
+    for t in all_builtins
         .iter()
         .filter(|t| LibreFangKernel::is_evolve_tool(&t.name))
     {
         assert!(
-            filtered.iter().any(|n| n == &t.name),
-            "evolve tool {} must be present when auto_evolve=true, workshop=true; got {filtered:?}",
+            names.contains(&t.name.as_str()),
+            "evolve tool {} must be present when auto_evolve=true, workshop=true; got {names:?}",
             t.name
         );
     }
+    // Declared non-evolve tools must also be present.
+    assert!(
+        names.contains(&"memory_store"),
+        "memory_store must be present; got {names:?}"
+    );
+    assert!(
+        names.contains(&"memory_recall"),
+        "memory_recall must be present; got {names:?}"
+    );
+
+    kernel.shutdown();
 }
 
 // (T, F) — auto_evolve=true, workshop=false: evolve tools must be present.
