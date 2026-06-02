@@ -655,6 +655,10 @@ _308 PRs from 7 contributors since v2026.5.17-beta.12._
   Either way a recalled memory tool result lost its content, the agent read it as "no answer yet", and re-issued `memory_recall` forever — an endless loop that drained tokens (verified live: a Moonshot/Kimi response that failed the JSON parse triggered exactly this).
   Both cases now keep each block's preview-truncated original content, breaking the loop while still bounding the folded size; the raw unparseable response is no longer applied as a bulk summary.
 
+- **runtime(loop_guard): a blocked tool call is a soft outcome, not a hard error** (#5979) (@DaBlitzStein).
+  When the loop guard blocked a repeated `(tool, params)` call it returned a result with status `Error`, a hard error that aborted the remaining tool batch and counted toward `MAX_CONSECUTIVE_ALL_FAILED`; three consecutive blocks (e.g. an agent re-issuing an identical `memory_recall`) then exited the streaming loop and recorded an agent panic instead of letting the model adjust.
+  The block result is now `Skipped` (a soft status), so it no longer aborts the batch or trips the consecutive-all-failed exit — the block message still steers the model and the genuinely fatal runaway stays caught by the circuit breaker.
+
 - **kernel(cron): day-of-week now follows the POSIX convention (`0` and `7` both mean Sunday)** instead of the `cron` crate's 1-7 mapping (#5966) (@DaBlitzStein).
   Sunday-only schedules like `0 16 * * 0` were previously rejected as unschedulable, and numeric weekday ranges such as `1-5` silently shifted by one day (firing Sun-Thu instead of Mon-Fri).
   The 5/6-field expression is now remapped at the single conversion site before it reaches the crate, so `0`/`7` resolve to Sunday and `1-5` fires Monday through Friday as written.

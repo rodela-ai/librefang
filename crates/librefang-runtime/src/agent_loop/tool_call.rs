@@ -669,12 +669,20 @@ pub(super) async fn precheck_loop_guard(
             } else {
                 warn!(tool = %tool_call.name, "Tool call blocked by loop guard");
             }
+            // A loop-guard block is a soft outcome, not a hard failure: its
+            // whole purpose is to stop a repeating call and let the model pick a
+            // different action. Marking it `Error` made it a hard error that
+            // aborted the remaining tool batch and counted toward
+            // MAX_CONSECUTIVE_ALL_FAILED, killing the turn after three blocks
+            // (#5979). `Skipped` is soft (`is_soft_error()`), so the turn
+            // survives and the block message steers the model; the genuinely
+            // fatal runaway is still caught by the CircuitBreak arm above.
             LoopGuardPrecheck::Blocked(ExecutedToolCall {
                 result: librefang_types::tool::ToolResult {
                     tool_use_id: tool_call.id.clone(),
                     content: msg.clone(),
                     is_error: true,
-                    status: librefang_types::tool::ToolExecutionStatus::Error,
+                    status: librefang_types::tool::ToolExecutionStatus::Skipped,
                     ..Default::default()
                 },
                 final_content: msg.clone(),
@@ -1401,4 +1409,62 @@ pub(super) fn apply_approval_resolution_signal(
         }
     }
     matched
+}
+
+#[cfg(test)]
+mod loop_guard_block_tests {
+    use super::*;
+    use librefang_types::tool::ToolExecutionStatus;
+
+    fn block_result(status: ToolExecutionStatus) -> ContentBlock {
+        // Mirrors the result the `LoopGuardVerdict::Block` arm produces.
+        ContentBlock::ToolResult {
+            tool_use_id: "toolu_1".to_string(),
+            tool_name: "memory_recall".to_string(),
+            content: "Blocked: tool 'memory_recall' called 5 times with identical \
+                      parameters. Try a different approach or different parameters."
+                .to_string(),
+            is_error: true,
+            status,
+            approval_request_id: None,
+        }
+    }
+
+    #[test]
+    fn blocked_call_is_soft_and_does_not_count_as_hard_failure() {
+        // The fix (#5979): a loop-guard block is `Skipped` (soft), so it must
+        // NOT be tallied as a hard error.
+        let summary =
+            ToolResultOutcomeSummary::from_blocks(&[block_result(ToolExecutionStatus::Skipped)]);
+        assert_eq!(summary.hard_error_count, 0);
+        assert_eq!(summary.success_count, 0);
+    }
+
+    #[test]
+    fn consecutive_blocked_only_iterations_do_not_trip_the_panic_exit() {
+        // Three block-only iterations previously reached MAX_CONSECUTIVE_ALL_FAILED
+        // (3) and killed the turn with a recorded panic. With `Skipped`, the
+        // counter never climbs.
+        let mut consecutive_all_failed = 0u32;
+        for _ in 0..5 {
+            let summary = ToolResultOutcomeSummary::from_blocks(&[block_result(
+                ToolExecutionStatus::Skipped,
+            )]);
+            update_consecutive_hard_failures(&mut consecutive_all_failed, summary);
+        }
+        assert_eq!(consecutive_all_failed, 0);
+    }
+
+    #[test]
+    fn pre_fix_error_status_would_have_counted_as_hard_failure() {
+        // Documents the regression guard: had the block kept `Error`, it would
+        // be a hard failure and three of them would trip the exit.
+        let mut consecutive_all_failed = 0u32;
+        for _ in 0..3 {
+            let summary =
+                ToolResultOutcomeSummary::from_blocks(&[block_result(ToolExecutionStatus::Error)]);
+            update_consecutive_hard_failures(&mut consecutive_all_failed, summary);
+        }
+        assert_eq!(consecutive_all_failed, 3);
+    }
 }
