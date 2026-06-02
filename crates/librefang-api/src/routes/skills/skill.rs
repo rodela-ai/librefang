@@ -354,6 +354,12 @@ pub async fn approve_pending_candidate(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     let skills_root = state.kernel.home_dir().join("skills");
+    // Read the candidate's agent_id before approval so we can auto-assign
+    // the promoted skill to the creating agent's allowlist.
+    let creator_agent_id =
+        librefang_kernel::skill_workshop::storage::load_candidate(&skills_root, &id)
+            .ok()
+            .map(|c| c.agent_id);
     match librefang_kernel::skill_workshop::storage::approve_candidate(
         &skills_root,
         &skills_root,
@@ -364,6 +370,23 @@ pub async fn approve_pending_candidate(
             // `skills_root`; refresh the in-memory registry so the next
             // turn's prompt build sees the new skill.
             state.kernel.reload_skills();
+            // Auto-assign the new skill to the creator agent's allowlist so
+            // the agent that taught the behaviour can actually use it.
+            if let Some(ref agent_id) = creator_agent_id {
+                if !agent_id.is_empty() {
+                    if let Err(e) = state
+                        .kernel
+                        .add_skill_to_agent(agent_id, &result.skill_name)
+                    {
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            skill = %result.skill_name,
+                            error = %e,
+                            "Failed to auto-assign approved skill to creator agent"
+                        );
+                    }
+                }
+            }
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -372,6 +395,7 @@ pub async fn approve_pending_candidate(
                     "skill_name": result.skill_name,
                     "version": result.version,
                     "message": result.message,
+                    "auto_assigned_to": creator_agent_id,
                 })),
             )
         }
